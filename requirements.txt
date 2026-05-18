@@ -1,0 +1,43 @@
+# Companion code for Agentic AI in Production:
+# Scaling and Applying Autonomous Systems (Book 3)
+# Python 3.11+ recommended
+
+# LLM SDKs
+anthropic>=0.40.0
+openai>=1.30.0
+tiktoken>=0.6.0
+
+# Web framework and HTTP
+fastapi>=0.110.0
+httpx>=0.27.0
+
+# Databases (relational, async + sync)
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.5
+
+# Caching and messaging
+redis>=5.0.0
+pika>=1.3.2                 # RabbitMQ client
+
+# Vector databases and search
+faiss-cpu>=1.7.4
+pinecone-client>=3.0.0
+qdrant-client>=1.7.0
+weaviate-client>=4.4.0
+
+# Embeddings
+sentence-transformers>=2.5.0
+InstructorEmbedding>=1.0.1
+numpy>=1.26.0
+
+# AWS
+boto3>=1.34.0
+botocore>=1.34.0
+
+# Scheduling
+schedule>=1.2.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
