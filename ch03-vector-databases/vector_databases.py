@@ -834,7 +834,7 @@ class VectorRetriever(Retriever):
 
 
 class BM25Retriever(Retriever):
-    """Keyword retrieval using BM25 algorithm~\cite{robertson-bm25}.
+    """Keyword retrieval using the BM25 ranking function.
 
     BM25 score for document D and query Q:
 
@@ -982,7 +982,7 @@ class HybridRetriever(Retriever):
         keyword_results: List[RetrievalResult],
         k: int = 60
     ) -> List[RetrievalResult]:
-        """Combine results using Reciprocal Rank Fusion~\cite{cormack-rrf}."""
+        """Combine results using Reciprocal Rank Fusion (RRF)."""
         scores = defaultdict(float)
         result_map = {}
         

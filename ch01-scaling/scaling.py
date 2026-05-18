@@ -1680,8 +1680,8 @@ class ShardedStateManager:
         Determine which shard a key belongs to.
         
         This uses simple modulo hashing for clarity. For production systems
-        where shards may be added/removed, use consistent hashing~\cite{karger-consistent}
-        (e.g., hash ring with virtual nodes) to minimize data migration.
+        where shards may be added/removed, use consistent hashing
+        (hash ring with virtual nodes) to minimize data migration.
         Libraries: uhashring, hash_ring, or ketama.
         """
         hash_value = int(hashlib.md5(key.encode()).hexdigest(), 16)
