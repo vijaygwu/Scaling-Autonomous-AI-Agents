@@ -1553,8 +1553,9 @@ class SemanticCache:
                 )
             
             # Find most similar entry. Cosine similarity ranges [-1, 1];
-            # initialize below the floor so the first comparison always
-            # populates best_entry, even for negative-similarity matches.
+            # initialize at the floor so the first comparison populates
+            # best_entry even when every cached vector is anti-correlated
+            # with the query.
             best_entry = None
             best_similarity = -1.0
 

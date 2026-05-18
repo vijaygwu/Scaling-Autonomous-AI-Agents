@@ -246,13 +246,18 @@ try:
     from opentelemetry import trace  # noqa: F401
 except ImportError:
     # Provide a minimal tracer stub so examples can run without OTel installed.
+    # Mirrors the surface used by the orchestrator: get_tracer + both
+    # start_as_current_span and start_span.
     class _NoOpSpan:
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def set_attribute(self, *a, **k): pass
+        def set_attributes(self, *a, **k): pass
         def record_exception(self, *a, **k): pass
+        def add_event(self, *a, **k): pass
     class _NoOpTracer:
         def start_as_current_span(self, *a, **k): return _NoOpSpan()
+        def start_span(self, *a, **k): return _NoOpSpan()
     class _NoOpTraceModule:
         def get_tracer(self, *a, **k): return _NoOpTracer()
     trace = _NoOpTraceModule()
@@ -314,6 +319,15 @@ class IntakeResult:
     enrichments: dict[str, Any] = field(default_factory=dict)
     processing_time: float = 0.0
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+            "enrichments": dict(self.enrichments),
+            "processing_time": self.processing_time,
+        }
+
 
 @dataclass
 class ItemAnalysis:
@@ -356,6 +370,31 @@ class AnalysisResult:
     compliance_issues: list[ComplianceIssue] = field(default_factory=list)
     risk_level: str = "low"
     risk_factors: list[str] = field(default_factory=list)
+    recommendations: list[str] = field(default_factory=list)
+    processing_time: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "item_analyses": [
+                {
+                    "item_name": a.item_name,
+                    "alternative_vendors": list(a.alternative_vendors),
+                    "estimated_savings": a.estimated_savings,
+                    "risk_flags": list(a.risk_flags),
+                    "notes": a.notes,
+                }
+                for a in self.item_analyses
+            ],
+            "total_potential_savings": self.total_potential_savings,
+            "compliance_issues": [
+                {"severity": c.severity, "rule": c.rule, "message": c.message}
+                for c in self.compliance_issues
+            ],
+            "risk_level": self.risk_level,
+            "risk_factors": list(self.risk_factors),
+            "recommendations": list(self.recommendations),
+            "processing_time": self.processing_time,
+        }
 
 
 @dataclass
@@ -368,14 +407,31 @@ class Approver:
 
 @dataclass
 class ApprovalTask:
-    """A pending approval routed to a specific approver."""
-    task_id: str
+    """A pending approval task surfaced to a human approver.
+
+    The dashboard / approval-interface builds these from a request and
+    its analysis; the orchestrator builds them from the approval chain.
+    All fields beyond ``request_id`` are optional so both construction
+    sites work with the same dataclass.
+    """
     request_id: str
-    approver: Approver
-    created_at: datetime
-    timeout_at: datetime
+    task_id: str = ""
+    approver: Optional[Approver] = None
+    created_at: Optional[datetime] = None
+    timeout_at: Optional[datetime] = None
     status: str = "pending"
     decision_notes: str = ""
+    # Fields populated by the dashboard view:
+    requester: str = ""
+    department: str = ""
+    amount: float = 0.0
+    urgency: str = ""
+    categories: list[str] = field(default_factory=list)
+    risk_level: str = ""
+    recommendations: list[str] = field(default_factory=list)
+    compliance_issues: list[Any] = field(default_factory=list)
+    submitted_at: Optional[datetime] = None
+    waiting_time: float = 0.0
 
 
 @dataclass
@@ -385,6 +441,7 @@ class ApprovalRoutingResult:
     reason: str = ""
     required_level: Any = None
     approval_chain: list[Any] = field(default_factory=list)
+    estimated_time: float = 0.0      # seconds until expected resolution
 
     def to_dict(self) -> dict:
         return {
@@ -396,16 +453,32 @@ class ApprovalRoutingResult:
                 getattr(a, "approver_id", a)
                 for a in self.approval_chain
             ],
+            "estimated_time": self.estimated_time,
         }
 
 
 @dataclass
 class ApprovalDecisionResult:
-    """Final approval verdict."""
-    status: str = "pending"          # 'fully_approved', 'partially_approved', 'rejected'
+    """Final approval verdict.
+
+    ``order`` is populated once fulfillment has emitted the PO; consumers
+    that only need the verdict can ignore it.
+    """
+    status: str = "pending"          # 'fully_approved', 'partially_approved', 'rejected', 'fulfilled'
     next_step: str = ""
     next_approver: Any = None
     reason: str = ""
+    order: Optional[dict[str, Any]] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "next_step": self.next_step,
+            "next_approver": getattr(self.next_approver, "approver_id",
+                                     self.next_approver),
+            "reason": self.reason,
+            "order": self.order,
+        }
 
 
 @dataclass
@@ -764,6 +837,23 @@ class ProcessingContext:
 # FulfillmentAgent
 # ------------------------------------------------------------
 
+@dataclass
+class FulfillmentResult:
+    """Outcome of the fulfillment stage."""
+    order_id: str
+    items: list[dict[str, Any]] = field(default_factory=list)
+    submitted_at: str = ""
+    status: str = "submitted"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "order_id": self.order_id,
+            "items": list(self.items),
+            "submitted_at": self.submitted_at,
+            "status": self.status,
+        }
+
+
 class FulfillmentAgent:
     """Final stage: emits the purchase order to the vendor system.
 
@@ -784,18 +874,22 @@ class FulfillmentAgent:
         self.bus = bus or EventBus()
         self.metrics = metrics or AgentMetrics(agent_id)
 
-    async def fulfill(
+    async def process(
         self,
         request: Any,
-        approval: ApprovalDecisionResult,
-        ctx: ProcessingContext,
-    ) -> dict:
-        if approval.status not in ("fully_approved", "partially_approved"):
-            raise ProcurementError("Cannot fulfill an unapproved request.")
-        self.metrics.increment("fulfilled")
-        po = {
-            "po_id": f"PO-{getattr(request, 'id', getattr(request, 'request_id', ''))}",
-            "items": [
+        context: Optional[ProcessingContext] = None,
+    ) -> FulfillmentResult:
+        """Orchestrator-facing entry point.
+
+        Builds the PO, emits the fulfillment event, and returns a
+        ``FulfillmentResult`` (which has ``order_id`` and ``to_dict()``
+        for the orchestrator to use).
+        """
+        ctx = context or ProcessingContext()
+        rid = getattr(request, "id", getattr(request, "request_id", ""))
+        result = FulfillmentResult(
+            order_id=f"PO-{rid}",
+            items=[
                 {
                     "name": getattr(it, "name", str(it)),
                     "qty": getattr(it, "quantity", 1),
@@ -803,15 +897,27 @@ class FulfillmentAgent:
                 }
                 for it in getattr(request, "items", [])
             ],
-            "submitted_at": datetime.now(timezone.utc).isoformat(),
-        }
+            submitted_at=datetime.now(timezone.utc).isoformat(),
+            status="submitted",
+        )
+        self.metrics.increment("fulfilled")
         await self.bus.emit("procurement.fulfilled", {
-            "request_id": getattr(request, "id",
-                                  getattr(request, "request_id", "")),
-            "po": po,
+            "request_id": rid,
+            "order_id": result.order_id,
             "correlation_id": ctx.correlation_id,
         })
-        return po
+        return result
+
+    # Alias retained for callers that prefer the more descriptive name.
+    async def fulfill(
+        self,
+        request: Any,
+        approval: ApprovalDecisionResult,
+        ctx: ProcessingContext,
+    ) -> FulfillmentResult:
+        if approval.status not in ("fully_approved", "partially_approved"):
+            raise ProcurementError("Cannot fulfill an unapproved request.")
+        return await self.process(request, ctx)
 
 # ============================================================================
 # Block 5 (chapter listing #5)
