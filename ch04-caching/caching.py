@@ -628,7 +628,7 @@ class SemanticKeyGenerator(CacheKeyGenerator):
 # Block 8 (chapter listing #8)
 # ============================================================================
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import NamedTuple
 import time
 
@@ -2268,7 +2268,6 @@ class CacheMetrics:
         # does not grow unboundedly. Percentile estimates remain
         # accurate so long as the buffer is large compared to the
         # serving timescale.
-        from collections import deque
         MAX_LATENCY_SAMPLES = 10_000
         self._cache_latencies: deque[float] = deque(maxlen=MAX_LATENCY_SAMPLES)
         self._llm_latencies: deque[float] = deque(maxlen=MAX_LATENCY_SAMPLES)

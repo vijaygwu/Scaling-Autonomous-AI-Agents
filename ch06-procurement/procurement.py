@@ -237,7 +237,7 @@ extend the orchestrator, keep these shapes or update the call sites.
 
 import asyncio
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Awaitable, Callable, Optional
@@ -689,14 +689,21 @@ class EventBus:
 class AgentMetrics:
     """Per-agent counters and histograms.
 
-    For production, replace with the OpenTelemetry / Prometheus
-    instrumentation from Book 2, Chapter 6.
+    ``timings`` is a bounded ring buffer per metric name (last
+    ``MAX_TIMING_SAMPLES`` measurements) so percentile estimates stay
+    accurate while memory cannot grow unboundedly. For production,
+    replace with the OpenTelemetry / Prometheus instrumentation from
+    Book 2, Chapter 6.
     """
+
+    MAX_TIMING_SAMPLES = 10_000
 
     def __init__(self, agent_id: str = "anonymous"):
         self.agent_id = agent_id
         self.counters: dict[str, int] = defaultdict(int)
-        self.timings: dict[str, list[float]] = defaultdict(list)
+        self.timings: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=self.MAX_TIMING_SAMPLES)
+        )
 
     def increment(self, name: str, by: int = 1) -> None:
         self.counters[name] += by
@@ -1879,15 +1886,28 @@ if __name__ == "__main__":
 #
 # In your project, the imports below resolve from your own
 # src/procurement/... package. We guard them with try/except so this
-# book listing parses cleanly when extracted as a single module.
+# book listing parses cleanly when extracted as a single module; the
+# pytestmark skips the test bodies when the layout is not present so
+# pytest does not NameError on collection.
 import pytest
 from unittest.mock import AsyncMock
 try:
     from src.procurement.agents import AnalysisAgent
     from src.procurement.models import PurchaseRequest, PurchaseItem
     from src.testing.mock_llm import MockLLM, MockResponse
+    _SRC_PROC_AVAILABLE = True
 except ImportError:
-    pass  # Layout placeholder; replace with your project's imports.
+    AnalysisAgent = None  # type: ignore
+    PurchaseRequest = None  # type: ignore
+    PurchaseItem = None  # type: ignore
+    MockLLM = None  # type: ignore
+    MockResponse = None  # type: ignore
+    _SRC_PROC_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not _SRC_PROC_AVAILABLE,
+    reason="src/procurement/ layout not available in this environment",
+)
 
 
 @pytest.fixture
@@ -1956,8 +1976,18 @@ try:
     from src.procurement.models import (
         PurchaseRequest, RequestStatus, ApprovalLevel
     )
+    _SRC_PROC_ORCH_AVAILABLE = True
 except ImportError:
-    pass  # Layout placeholder.
+    ProcurementOrchestrator = None  # type: ignore
+    PurchaseRequest = None  # type: ignore
+    RequestStatus = None  # type: ignore
+    ApprovalLevel = None  # type: ignore
+    _SRC_PROC_ORCH_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not _SRC_PROC_ORCH_AVAILABLE,
+    reason="src/procurement/ orchestrator not available in this environment",
+)
 
 
 @pytest.fixture

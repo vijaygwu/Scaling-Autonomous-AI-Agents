@@ -2106,6 +2106,7 @@ A specialist will have full context of our conversation and the steps we've alre
 """
 Conversation manager - orchestrates the multi-agent system.
 """
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -2145,7 +2146,6 @@ class ConversationManager:
     MAX_ACTIVE_CONVERSATIONS = 10_000
 
     def __init__(self, config: PlatformConfig, agents: dict[AgentType, BaseAgent]):
-        from collections import OrderedDict
         self.config = config
         self.agents = agents
         self.active_conversations: "OrderedDict[str, Conversation]" = OrderedDict()
@@ -2561,10 +2561,10 @@ class FeedbackCollector:
 """
 Metrics collection and reporting for customer service platform.
 """
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from collections import defaultdict
 import asyncio
 
 
@@ -2627,7 +2627,6 @@ class MetricsCollector:
     MAX_TIMING_SAMPLES = 10_000
 
     def __init__(self, storage_client):
-        from collections import deque
         self.storage = storage_client
         self._current_metrics = defaultdict(lambda: defaultdict(int))
         # Use bounded deques instead of unbounded lists.
@@ -2956,7 +2955,6 @@ class InMemoryMetricsStorage:
     """
 
     def __init__(self, capacity: int = 10_000):
-        from collections import deque
         self._buffer = deque(maxlen=capacity)
 
     async def record(self, metric: dict) -> None:
