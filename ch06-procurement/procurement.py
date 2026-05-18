@@ -1048,7 +1048,12 @@ class AnalysisAgent:
             
             # Estimate savings from preferred vendor pricing
             if best.id != item.vendor_id:
-                analysis.potential_savings = item.total_price * 0.05  # 5% estimated
+                # Placeholder savings estimate. A production version would
+                # query ContractService.find_contract(vendor, item) for each
+                # alternative vendor, compute price deltas against the
+                # incumbent, and report the realized minimum. The 5%
+                # multiplier here is illustrative only.
+                analysis.potential_savings = item.total_price * 0.05
                 analysis.savings_reason = f"Switch to preferred vendor {best.name}"
         
         # Check compliance

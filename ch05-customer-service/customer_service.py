@@ -2833,7 +2833,19 @@ async def create_platform() -> tuple[ConversationManager, MetricsCollector]:
             GetPaymentHistoryTool(billing_client),
             ProcessRefundTool(billing_client)
         ]
-        
+
+        # Technical and escalation tools live in the knowledge base /
+        # diagnostics path the chapter introduced earlier.
+        technical_tools = [
+            SearchKnowledgeBaseTool(llm_client),
+            RunDiagnosticTool(orders_client),
+        ]
+        escalation_tools = [
+            # Re-use customer-lookup so an escalation agent can hand off
+            # with full context; teams typically add a paging tool here.
+            IdentifyCustomerTool(crm_client),
+        ]
+
         # Create agents
         agents = {
             AgentType.TRIAGE: TriageAgent(
@@ -2843,23 +2855,50 @@ async def create_platform() -> tuple[ConversationManager, MetricsCollector]:
                 config.agents["order"], order_tools, llm_client
             ),
             AgentType.TECHNICAL: TechnicalSupportAgent(
-                config.agents["technical"], [], llm_client
+                config.agents["technical"], technical_tools, llm_client
             ),
             AgentType.BILLING: BillingAgent(
                 config.agents["billing"], billing_tools, llm_client
             ),
             AgentType.ESCALATION: EscalationAgent(
-                config.agents["escalation"], [], llm_client
+                config.agents["escalation"], escalation_tools, llm_client
             )
         }
-        
+
         # Create manager
         manager = ConversationManager(config, agents)
-        
-        # Create metrics collector
-        metrics_collector = MetricsCollector(storage_client=None)  # Use real storage
-        
+
+        # Create metrics collector. InMemoryMetricsStorage is fine for
+        # examples and tests; swap in your real time-series backend
+        # (Prometheus pushgateway, CloudWatch, etc.) for production.
+        metrics_collector = MetricsCollector(
+            storage_client=InMemoryMetricsStorage()
+        )
+
         return manager, metrics_collector
+
+
+class InMemoryMetricsStorage:
+    """Trivial in-process metrics backend for examples and tests.
+
+    Records every recorded event in a bounded ring buffer; flush() is a
+    no-op. Swap for your production backend (Prometheus pushgateway,
+    CloudWatch, OpenTelemetry collector) when deploying.
+    """
+
+    def __init__(self, capacity: int = 10_000):
+        from collections import deque
+        self._buffer = deque(maxlen=capacity)
+
+    async def record(self, metric: dict) -> None:
+        self._buffer.append(metric)
+
+    async def flush(self) -> None:
+        # Real backends drain to remote storage here.
+        return None
+
+    def recent(self, n: int = 100) -> list:
+        return list(self._buffer)[-n:]
 
 
 async def handle_customer_message(manager: ConversationManager,
