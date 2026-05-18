@@ -2263,9 +2263,15 @@ class CacheMetrics:
         self._cost_saved = 0.0
         self._cost_incurred = 0.0
         
-        # Track latencies
-        self._cache_latencies: List[float] = []
-        self._llm_latencies: List[float] = []
+        # Track latencies. Bounded ring buffers keep the last
+        # MAX_LATENCY_SAMPLES measurements per category so memory
+        # does not grow unboundedly. Percentile estimates remain
+        # accurate so long as the buffer is large compared to the
+        # serving timescale.
+        from collections import deque
+        MAX_LATENCY_SAMPLES = 10_000
+        self._cache_latencies: deque[float] = deque(maxlen=MAX_LATENCY_SAMPLES)
+        self._llm_latencies: deque[float] = deque(maxlen=MAX_LATENCY_SAMPLES)
     
     def record_cache_hit(
         self,

@@ -400,11 +400,18 @@ from decimal import Decimal
 class DynamoDBStateStore(StateStore[dict[str, Any]]):
     """
     DynamoDB-backed state store for serverless environments.
-    
+
     Provides automatic scaling and pay-per-request pricing,
     suitable for variable workloads.
+
+    Implementation note: the official ``boto3`` client is synchronous.
+    Calling it directly from an ``async def`` would block the event
+    loop. We wrap each boto3 call with ``asyncio.to_thread(...)`` so
+    the synchronous I/O runs on the default thread pool. For
+    throughput-critical workloads, switch to ``aioboto3`` (or
+    ``aiobotocore``) which provides native async clients.
     """
-    
+
     def __init__(
         self,
         table_name: str,
@@ -418,10 +425,12 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
             endpoint_url=endpoint_url
         )
         self._table = self._dynamodb.Table(table_name)
-    
+
     async def get(self, key: str) -> Optional[dict[str, Any]]:
         try:
-            response = self._table.get_item(Key={"pk": key})
+            response = await asyncio.to_thread(
+                self._table.get_item, Key={"pk": key}
+            )
             item = response.get("Item")
             if item is None:
                 return None
@@ -429,7 +438,7 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
             return self._deserialize(item.get("data", {}))
         except ClientError:
             return None
-    
+
     async def set(
         self,
         key: str,
@@ -441,44 +450,47 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
             "data": self._serialize(value),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        
+
         # Get existing item for version tracking
         existing = await self.get_metadata(key)
         item["version"] = (existing.version + 1) if existing else 1
         item["created_at"] = (
-            existing.created_at.isoformat() 
-            if existing 
+            existing.created_at.isoformat()
+            if existing
             else datetime.now(timezone.utc).isoformat()
         )
-        
+
         if ttl_seconds:
             item["ttl"] = int(datetime.now(timezone.utc).timestamp()) + ttl_seconds
-        
-        self._table.put_item(Item=item)
-    
+
+        await asyncio.to_thread(self._table.put_item, Item=item)
+
     async def delete(self, key: str) -> bool:
         try:
-            self._table.delete_item(
+            await asyncio.to_thread(
+                self._table.delete_item,
                 Key={"pk": key},
-                ConditionExpression=Attr("pk").exists()
+                ConditionExpression=Attr("pk").exists(),
             )
             return True
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return False
             raise
-    
+
     async def exists(self, key: str) -> bool:
-        response = self._table.get_item(
+        response = await asyncio.to_thread(
+            self._table.get_item,
             Key={"pk": key},
-            ProjectionExpression="pk"
+            ProjectionExpression="pk",
         )
         return "Item" in response
-    
+
     async def get_metadata(self, key: str) -> Optional[StateMetadata]:
-        response = self._table.get_item(
+        response = await asyncio.to_thread(
+            self._table.get_item,
             Key={"pk": key},
-            ProjectionExpression="created_at, updated_at, version, ttl"
+            ProjectionExpression="created_at, updated_at, version, ttl",
         )
         item = response.get("Item")
         if not item:

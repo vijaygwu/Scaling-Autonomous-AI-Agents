@@ -2139,19 +2139,38 @@ class ConversationManager:
     Handles routing, context preservation, and handoffs.
     """
     
+    # Default cap on in-memory active conversations. Older entries are
+    # evicted in LRU order. For production, externalize state to Redis
+    # (Chapter 2) and treat this dict as a hot cache.
+    MAX_ACTIVE_CONVERSATIONS = 10_000
+
     def __init__(self, config: PlatformConfig, agents: dict[AgentType, BaseAgent]):
+        from collections import OrderedDict
         self.config = config
         self.agents = agents
-        self.active_conversations: dict[str, Conversation] = {}
-        self.conversation_metrics: dict[str, ConversationMetrics] = {}
+        self.active_conversations: "OrderedDict[str, Conversation]" = OrderedDict()
+        self.conversation_metrics: "OrderedDict[str, ConversationMetrics]" = (
+            OrderedDict()
+        )
+
+    def _record_active(self, conv_id: str, conversation, metrics) -> None:
+        """Insert (or refresh LRU position for) a conversation."""
+        self.active_conversations[conv_id] = conversation
+        self.active_conversations.move_to_end(conv_id)
+        self.conversation_metrics[conv_id] = metrics
+        self.conversation_metrics.move_to_end(conv_id)
+        while len(self.active_conversations) > self.MAX_ACTIVE_CONVERSATIONS:
+            self.active_conversations.popitem(last=False)
+            self.conversation_metrics.popitem(last=False)
     
     async def start_conversation(self, customer: Customer,
                                 channel: ConversationChannel) -> Conversation:
         """Start a new conversation."""
         conversation = Conversation.create(customer, channel)
-        self.active_conversations[conversation.conversation_id] = conversation
-        self.conversation_metrics[conversation.conversation_id] = ConversationMetrics(
-            start_time=datetime.now(timezone.utc)
+        self._record_active(
+            conversation.conversation_id,
+            conversation,
+            ConversationMetrics(start_time=datetime.now(timezone.utc)),
         )
         
         logger.info(f"Started conversation {conversation.conversation_id} "
@@ -2593,12 +2612,40 @@ class PlatformMetrics:
 class MetricsCollector:
     """
     Collects and aggregates metrics from the customer service platform.
+
+    Keeps the last 24 hourly buckets in memory; older buckets are
+    flushed to long-term storage and dropped. Each timing sample queue
+    is bounded to the last 10,000 measurements (running percentiles
+    rather than full histograms). For production, swap to Prometheus
+    / OpenTelemetry exporters (Book 2, Chapter 6).
     """
-    
+
+    MAX_HOURLY_BUCKETS = 24
+    MAX_TIMING_SAMPLES = 10_000
+
     def __init__(self, storage_client):
+        from collections import deque
         self.storage = storage_client
         self._current_metrics = defaultdict(lambda: defaultdict(int))
-        self._timing_samples = defaultdict(list)
+        # Use bounded deques instead of unbounded lists.
+        self._timing_samples = defaultdict(
+            lambda: deque(maxlen=self.MAX_TIMING_SAMPLES)
+        )
+
+    def _evict_old_buckets(self) -> None:
+        """Drop the oldest hourly buckets once we exceed the cap."""
+        if len(self._current_metrics) > self.MAX_HOURLY_BUCKETS:
+            # Buckets are keyed by ISO hour string, so lexicographic
+            # ordering matches chronological ordering.
+            stale = sorted(self._current_metrics.keys())[
+                :-self.MAX_HOURLY_BUCKETS
+            ]
+            for k in stale:
+                self._current_metrics.pop(k, None)
+                # Drop the matching timing samples too.
+                for tk in list(self._timing_samples):
+                    if tk.startswith(k):
+                        self._timing_samples.pop(tk, None)
     
     async def record_conversation_start(self, conversation: Conversation):
         """Record a new conversation."""
@@ -2802,15 +2849,27 @@ import anthropic
 import httpx
 
 
-async def create_platform() -> tuple[ConversationManager, MetricsCollector]:
-    """Initialize the complete platform."""
-    
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def create_platform():
+    """Initialize the complete platform as an async context manager.
+
+    Yields ``(manager, metrics_collector)``. The httpx clients live for
+    the duration of the ``async with`` block; the manager's tools hold
+    references to them and will fail if used after the block exits.
+    Earlier drafts of this function returned the tuple from inside the
+    ``async with`` -- which closed the clients immediately. This
+    context-manager form fixes that lifecycle bug.
+    """
+
     # Load configuration
     config = PlatformConfig.load()
-    
+
     # Initialize clients
     llm_client = anthropic.AsyncAnthropic()
-    
+
     async with httpx.AsyncClient(base_url=config.integrations.crm_base_url) as crm_client, \
                httpx.AsyncClient(base_url=config.integrations.orders_base_url) as orders_client, \
                httpx.AsyncClient(base_url=config.integrations.payments_base_url) as billing_client:
@@ -2875,7 +2934,12 @@ async def create_platform() -> tuple[ConversationManager, MetricsCollector]:
             storage_client=InMemoryMetricsStorage()
         )
 
-        return manager, metrics_collector
+        try:
+            yield manager, metrics_collector
+        finally:
+            # Anything platform-wide to flush goes here. The httpx
+            # clients are closed automatically when this block exits.
+            await metrics_collector.storage.flush()
 
 
 class InMemoryMetricsStorage:
