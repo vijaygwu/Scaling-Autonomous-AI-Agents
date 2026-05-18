@@ -222,17 +222,40 @@ class Vendor:
 
 """
 Supporting services for the procurement system.
-Minimal but runnable; intended as integration points for the
-production-grade services from Book 2.
+
+Minimal but importable implementations of the services and result
+types that the agents and orchestrator reference. Each class is
+either a thin in-process stand-in (IdentityService, BudgetService,
+EventBus, AgentMetrics, MockLLM, etc.) or a result/error dataclass.
+
+For production, swap in the equivalents from Book 2 (Chapter 1 for
+identity, Chapter 3 for cost control, Chapter 6 for observability).
+The shapes in this section match what the orchestrator and agent
+code in the rest of this chapter passes at the call sites; if you
+extend the orchestrator, keep these shapes or update the call sites.
 """
 
 import asyncio
-import json
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Awaitable, Callable, Optional
+
+try:
+    from opentelemetry import trace  # noqa: F401
+except ImportError:
+    # Provide a minimal tracer stub so examples can run without OTel installed.
+    class _NoOpSpan:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def set_attribute(self, *a, **k): pass
+        def record_exception(self, *a, **k): pass
+    class _NoOpTracer:
+        def start_as_current_span(self, *a, **k): return _NoOpSpan()
+    class _NoOpTraceModule:
+        def get_tracer(self, *a, **k): return _NoOpTracer()
+    trace = _NoOpTraceModule()
 
 
 # ------------------------------------------------------------
@@ -248,87 +271,99 @@ class ApprovalError(ProcurementError): pass
 
 
 # ------------------------------------------------------------
-# Result types for each workflow stage
+# Stage-result and routing dataclasses
+#
+# These match the shapes the orchestrator and agent code pass
+# at construction; do not rename fields without updating the
+# call sites.
 # ------------------------------------------------------------
 
 @dataclass
 class ValidationResult:
-    """Outcome of a single ValidationRule check."""
-    passed: bool
-    rule_id: str
-    message: str = ""
-    severity: str = "warning"  # 'warning' or 'error'
+    """Outcome of intake-stage validation."""
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return len(self.errors) == 0
 
 
 @dataclass
 class ValidationRule:
-    """A declarative rule the intake agent applies to a request."""
     rule_id: str
     description: str
-    check: Callable[["PurchaseRequest"], ValidationResult]
+    check: Optional[Callable[[Any], ValidationResult]] = None
+
+
+@dataclass
+class AuthResult:
+    """Outcome of an authorization check."""
+    authorized: bool = False
+    reason: str = ""
+    agent_id: str = ""
+    scopes: list[str] = field(default_factory=list)
 
 
 @dataclass
 class IntakeResult:
     """Outcome of the intake stage."""
-    request: "PurchaseRequest"
-    validations: list[ValidationResult] = field(default_factory=list)
-    ready_for_analysis: bool = False
-    notes: str = ""
+    valid: bool = True
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    enrichments: dict[str, Any] = field(default_factory=dict)
+    processing_time: float = 0.0
 
 
 @dataclass
 class ItemAnalysis:
-    """Per-item analysis result."""
+    """Per-item analysis result, mutated by the AnalysisAgent."""
     item_name: str
-    estimated_unit_price: float
-    estimated_total: float
-    confidence: float  # 0.0 - 1.0
+    alternative_vendors: list[Any] = field(default_factory=list)
+    estimated_savings: float = 0.0
     risk_flags: list[str] = field(default_factory=list)
+    notes: str = ""
 
 
 @dataclass
 class RiskAssessment:
     """Aggregate risk view for a purchase request."""
-    overall_score: float  # 0-100, lower is safer
-    flags: list[str] = field(default_factory=list)
-    rationale: str = ""
+    level: str = "low"          # 'low', 'medium', 'high'
+    score: float = 0.0          # 0-100, lower is safer
+    factors: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ComplianceIssue:
-    """A specific compliance concern found by ComplianceRule."""
-    rule_id: str
-    severity: str  # 'low', 'medium', 'high'
-    description: str
+    """A specific compliance concern."""
+    severity: str = "low"
+    rule: str = ""
+    message: str = ""
 
 
 @dataclass
 class ComplianceRule:
-    """Declarative compliance rule."""
     rule_id: str
     description: str
-    check: Callable[["PurchaseRequest"], list[ComplianceIssue]]
+    check: Optional[Callable[[Any], list[ComplianceIssue]]] = None
 
 
 @dataclass
 class AnalysisResult:
     """Output of the AnalysisAgent."""
-    request_id: str
-    item_analyses: list[ItemAnalysis]
-    risk: RiskAssessment
+    item_analyses: list[ItemAnalysis] = field(default_factory=list)
+    total_potential_savings: float = 0.0
     compliance_issues: list[ComplianceIssue] = field(default_factory=list)
-    estimated_total: float = 0.0
-    recommended_action: str = "approve"  # 'approve', 'review', 'reject'
+    risk_level: str = "low"
+    risk_factors: list[str] = field(default_factory=list)
 
 
 @dataclass
 class Approver:
-    """Reference to a human or systemic approver."""
     approver_id: str
     name: str
-    role: str
-    max_approval_amount: float
+    role: str = ""
+    max_approval_amount: float = 0.0
 
 
 @dataclass
@@ -339,112 +374,135 @@ class ApprovalTask:
     approver: Approver
     created_at: datetime
     timeout_at: datetime
-    status: str = "pending"  # 'pending', 'approved', 'rejected', 'expired'
+    status: str = "pending"
     decision_notes: str = ""
 
 
 @dataclass
 class ApprovalRoutingResult:
     """Routing decision from the ApprovalAgent."""
-    request_id: str
-    requires_approval: bool
-    tasks: list[ApprovalTask] = field(default_factory=list)
-    auto_approved: bool = False
+    status: str = "pending"          # 'auto_approved', 'pending_approval', 'rejected'
     reason: str = ""
+    required_level: Any = None
+    approval_chain: list[Any] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "required_level": str(self.required_level)
+                if self.required_level is not None else None,
+            "approval_chain": [
+                getattr(a, "approver_id", a)
+                for a in self.approval_chain
+            ],
+        }
 
 
 @dataclass
 class ApprovalDecisionResult:
-    """Final approval verdict after routing + responses."""
-    request_id: str
-    approved: bool
-    decided_at: datetime
-    approver_chain: list[str] = field(default_factory=list)
-    notes: str = ""
+    """Final approval verdict."""
+    status: str = "pending"          # 'fully_approved', 'partially_approved', 'rejected'
+    next_step: str = ""
+    next_approver: Any = None
+    reason: str = ""
 
 
 @dataclass
 class AutoApprovalResult:
     """Outcome of the auto-approval fast path."""
-    eligible: bool
+    eligible: bool = False
     reason: str = ""
 
 
 @dataclass
 class DelegationRule:
-    """When primary approver is unavailable, who can decide?"""
     primary_approver_id: str
     delegate_approver_id: str
     valid_until: Optional[datetime] = None
 
 
 @dataclass
-class AuthResult:
-    """Result of authenticating an agent against the IdentityService."""
-    success: bool
-    agent_id: str
-    scopes: list[str] = field(default_factory=list)
-    error: str = ""
-
-
-@dataclass
 class SubmissionResult:
-    """Result of submitting a request to the system."""
-    success: bool
-    request_id: str
-    message: str = ""
+    """Result of submitting a request to the orchestrator."""
+    status: str = ""                 # 'completed', 'validation_failed', 'pending_approval', etc.
+    request_id: str = ""
+    errors: list[str] = field(default_factory=list)
+    auto_approved: bool = False
+    approval_info: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class ProcessingContext:
-    """Runtime context that flows through the orchestrator stages."""
-    request_id: str
-    correlation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    actor_agent_id: str = ""
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    attributes: dict[str, Any] = field(default_factory=dict)
+class RequestDetails:
+    """Hydrated view of a request returned by the dashboard."""
+    request: Any
+    items: list[dict] = field(default_factory=list)
+    validation: Optional[ValidationResult] = None
+    analysis: Optional[AnalysisResult] = None
+    approval_history: list[Any] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    status_history: list[dict] = field(default_factory=list)
 
 
 # ------------------------------------------------------------
-# IdentityService -- agent authentication and scope checks
+# IdentityService
 # ------------------------------------------------------------
+
+@dataclass
+class _User:
+    user_id: str
+    permissions: list[str] = field(default_factory=list)
+    spending_limit: float = 0.0
+
+    def has_permission(self, perm: str) -> bool:
+        return perm in self.permissions
+
 
 class IdentityService:
-    """Minimal in-process identity service.
+    """In-process identity service.
 
-    For production, replace with the X.509 / OIDC implementation from
-    Book 2 (Chapter 1).
+    For production, swap in the X.509 / OIDC implementation from
+    Book 2, Chapter 1.
     """
 
     def __init__(self):
         self._agents: dict[str, dict[str, Any]] = {}
+        self._users: dict[str, _User] = {}
 
     def register_agent(self, agent_id: str, scopes: list[str]) -> None:
-        self._agents[agent_id] = {
-            "scopes": list(scopes),
-            "registered_at": datetime.now(timezone.utc),
-        }
+        self._agents[agent_id] = {"scopes": list(scopes)}
+
+    def register_user(
+        self,
+        user_id: str,
+        permissions: list[str],
+        spending_limit: float = 0.0,
+    ) -> None:
+        self._users[user_id] = _User(user_id, list(permissions), spending_limit)
+
+    async def get_user(self, user_id: str) -> Optional[_User]:
+        return self._users.get(user_id)
 
     async def authenticate(self, agent_id: str, token: str) -> AuthResult:
-        # Demo-only token convention: token == "valid-token-for-<id>"
+        # Demo-only token convention: valid-token-for-<id>
         if agent_id not in self._agents:
-            return AuthResult(False, agent_id, [], "unknown agent")
+            return AuthResult(authorized=False, reason="unknown agent",
+                              agent_id=agent_id)
         if token != f"valid-token-for-{agent_id}":
-            return AuthResult(False, agent_id, [], "invalid token")
-        return AuthResult(True, agent_id, self._agents[agent_id]["scopes"])
-
-    def has_scope(self, agent_id: str, scope: str) -> bool:
-        return scope in self._agents.get(agent_id, {}).get("scopes", [])
+            return AuthResult(authorized=False, reason="invalid token",
+                              agent_id=agent_id)
+        return AuthResult(authorized=True, agent_id=agent_id,
+                          scopes=self._agents[agent_id]["scopes"])
 
 
 # ------------------------------------------------------------
-# BudgetService -- spend limit checks
+# BudgetService
 # ------------------------------------------------------------
 
 class BudgetService:
-    """Tracks daily / monthly spend caps per cost center.
+    """Tracks daily and monthly spend caps per cost center.
 
-    For production, replace with the BudgetManager from Book 2, Ch 3.
+    For production, swap in the BudgetManager from Book 2, Chapter 3.
     """
 
     def __init__(self):
@@ -460,27 +518,42 @@ class BudgetService:
         cap = self._caps.get(cost_center)
         if not cap:
             return False
-        spent = self._spent[cost_center]
-        return (spent["daily"] + amount <= cap["daily"] and
-                spent["monthly"] + amount <= cap["monthly"])
+        s = self._spent[cost_center]
+        return (s["daily"] + amount <= cap["daily"]
+                and s["monthly"] + amount <= cap["monthly"])
 
     def record_spend(self, cost_center: str, amount: float) -> None:
         self._spent[cost_center]["daily"] += amount
         self._spent[cost_center]["monthly"] += amount
 
+    async def get_remaining(
+        self,
+        cost_center: str,
+        period: str = "monthly",
+    ) -> float:
+        cap = self._caps.get(cost_center)
+        if not cap:
+            return 0.0
+        return max(0.0, cap[period] - self._spent[cost_center][period])
+
 
 # ------------------------------------------------------------
-# EventBus -- coordination between agents
+# EventBus
 # ------------------------------------------------------------
 
 class EventBus:
     """In-process pub/sub bus.
 
-    For production, replace with Kafka, NATS, or Redis Streams.
+    Supports exact-topic subscriptions and ``prefix.*`` wildcards
+    (e.g., subscribe to ``request.*`` to receive every
+    ``request.something`` event).
     """
 
     def __init__(self):
-        self._subscribers: dict[str, list[Callable[[dict], Awaitable[None]]]] = (
+        self._exact: dict[str, list[Callable[[dict], Awaitable[None]]]] = (
+            defaultdict(list)
+        )
+        self._wildcards: dict[str, list[Callable[[dict], Awaitable[None]]]] = (
             defaultdict(list)
         )
 
@@ -489,35 +562,51 @@ class EventBus:
         topic: str,
         handler: Callable[[dict], Awaitable[None]],
     ) -> None:
-        self._subscribers[topic].append(handler)
+        if topic.endswith(".*"):
+            self._wildcards[topic[:-2]].append(handler)
+        else:
+            self._exact[topic].append(handler)
 
-    async def publish(self, topic: str, event: dict) -> None:
+    async def emit(self, topic: str, event: dict) -> None:
         envelope = {
             "topic": topic,
             "ts": datetime.now(timezone.utc).isoformat(),
             "event": event,
         }
-        for h in self._subscribers.get(topic, []):
+        # Exact-match subscribers
+        for h in self._exact.get(topic, []):
             try:
                 await h(envelope)
             except Exception:
-                # Production: log + send to DLQ; never let one subscriber
-                # block others.
+                # Never let one subscriber block others.
+                # Production: log + send to a DLQ.
                 pass
+        # Wildcard subscribers: walk every prefix of topic
+        parts = topic.split(".")
+        for i in range(1, len(parts) + 1):
+            prefix = ".".join(parts[:i])
+            for h in self._wildcards.get(prefix, []):
+                try:
+                    await h(envelope)
+                except Exception:
+                    pass
+
+    # Backward-compatible alias
+    publish = emit
 
 
 # ------------------------------------------------------------
-# Metrics collectors
+# Metrics
 # ------------------------------------------------------------
 
 class AgentMetrics:
     """Per-agent counters and histograms.
 
-    For production, replace with the OpenTelemetry/Prometheus
+    For production, replace with the OpenTelemetry / Prometheus
     instrumentation from Book 2, Chapter 6.
     """
 
-    def __init__(self, agent_id: str):
+    def __init__(self, agent_id: str = "anonymous"):
         self.agent_id = agent_id
         self.counters: dict[str, int] = defaultdict(int)
         self.timings: dict[str, list[float]] = defaultdict(list)
@@ -530,7 +619,10 @@ class AgentMetrics:
 
 
 class OrchestratorMetrics(AgentMetrics):
-    """Orchestrator-level metrics including stage durations and routing."""
+    """Orchestrator-level metrics with stage durations and routing."""
+
+    def __init__(self, agent_id: str = "orchestrator"):
+        super().__init__(agent_id)
 
     def record_stage(self, stage: str, seconds: float, success: bool) -> None:
         self.record_timing(f"stage.{stage}.seconds", seconds)
@@ -538,56 +630,52 @@ class OrchestratorMetrics(AgentMetrics):
 
 
 # ------------------------------------------------------------
-# ApproverRegistry -- look up who can approve what
+# Approver registry
 # ------------------------------------------------------------
 
 class ApproverRegistry:
     """Maps approval levels to eligible approvers."""
 
     def __init__(self):
-        self._approvers: dict[ApprovalLevel, list[Approver]] = defaultdict(list)
+        self._by_level: dict[Any, list[Approver]] = defaultdict(list)
         self._delegations: list[DelegationRule] = []
 
-    def register(self, level: "ApprovalLevel", approver: Approver) -> None:
-        self._approvers[level].append(approver)
+    def register(self, level: Any, approver: Approver) -> None:
+        self._by_level[level].append(approver)
 
     def add_delegation(self, rule: DelegationRule) -> None:
         self._delegations.append(rule)
 
-    def approvers_for(self, level: "ApprovalLevel") -> list[Approver]:
-        return list(self._approvers.get(level, []))
+    def approvers_for(self, level: Any) -> list[Approver]:
+        return list(self._by_level.get(level, []))
 
 
 # ------------------------------------------------------------
-# VendorDatabase -- supplier catalog
+# Vendor and contract services
 # ------------------------------------------------------------
 
 class VendorDatabase:
-    """In-memory vendor catalog. Replace with a real CRM/ERP integration."""
+    """In-memory vendor catalog.
+
+    For production, replace with a real CRM/ERP integration.
+    """
 
     def __init__(self):
-        self._vendors: dict[str, "Vendor"] = {}
+        self._vendors: dict[str, Any] = {}
 
-    def add(self, vendor: "Vendor") -> None:
-        self._vendors[vendor.vendor_id] = vendor
+    def add(self, vendor: Any) -> None:
+        self._vendors[vendor.id] = vendor
 
-    def get(self, vendor_id: str) -> Optional["Vendor"]:
+    async def get(self, vendor_id: str) -> Optional[Any]:
         return self._vendors.get(vendor_id)
 
-    def list_by_category(self, category: str) -> list["Vendor"]:
-        return [v for v in self._vendors.values() if category in v.categories]
+    async def find_by_category(self, category: Any) -> list[Any]:
+        return [v for v in self._vendors.values()
+                if category in getattr(v, "categories", [])]
 
-
-# ------------------------------------------------------------
-# ContractService -- pricing and contract terms lookup
-# ------------------------------------------------------------
 
 class ContractService:
-    """Looks up negotiated pricing for a vendor and item.
-
-    Production version queries the contract-management system; this
-    in-memory implementation is for examples and tests.
-    """
+    """Looks up negotiated pricing for a vendor and item."""
 
     def __init__(self):
         self._contracts: dict[tuple[str, str], dict[str, Any]] = {}
@@ -604,40 +692,42 @@ class ContractService:
             "valid_until": valid_until,
         }
 
-    def get_unit_price(self, vendor_id: str, item_name: str) -> Optional[float]:
+    async def find_contract(
+        self,
+        vendor_id: str,
+        item_name: str,
+    ) -> Optional[dict[str, Any]]:
         c = self._contracts.get((vendor_id, item_name))
         if not c:
             return None
         if c["valid_until"] and c["valid_until"] < datetime.now(timezone.utc):
             return None
-        return c["unit_price"]
+        return c
 
 
 # ------------------------------------------------------------
-# MockLLM -- deterministic stand-in for unit tests
+# MockLLM for tests
 # ------------------------------------------------------------
 
 @dataclass
 class MockResponse:
-    """Stand-in for an LLM response. Mirrors the shape the agent code expects."""
     content: str
     tool_calls: list[dict] = field(default_factory=list)
 
 
 class MockLLM:
-    """A deterministic LLM stand-in for unit tests.
-
-    Returns canned responses in order, falling back to a default if the
-    queue is exhausted. For production, replace with the real
-    Anthropic / OpenAI client.
-    """
+    """Deterministic stand-in for an LLM, useful in tests."""
 
     def __init__(self, responses: Optional[list[MockResponse]] = None):
         self._responses = list(responses or [])
         self._default = MockResponse(content="(mock default response)")
         self.calls: list[dict] = []
 
-    async def complete(self, messages: list[dict], **kwargs: Any) -> MockResponse:
+    async def complete(
+        self,
+        messages: list[dict],
+        **kwargs: Any,
+    ) -> MockResponse:
         self.calls.append({"messages": messages, "kwargs": kwargs})
         if self._responses:
             return self._responses.pop(0)
@@ -645,47 +735,79 @@ class MockLLM:
 
 
 # ------------------------------------------------------------
-# FulfillmentAgent -- closes out an approved request
+# Processing context shared across stages
+# ------------------------------------------------------------
+
+@dataclass
+class ProcessingContext:
+    """Runtime context flowing through the orchestrator stages.
+
+    Construct with the services and registries the agents need.
+    Agents read from these via attribute access; tests substitute
+    fakes by setting different services on the context.
+    """
+    request_id: str = ""
+    correlation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    actor_agent_id: str = ""
+    started_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    identity_service: IdentityService = field(default_factory=IdentityService)
+    budget_service: BudgetService = field(default_factory=BudgetService)
+    vendor_db: VendorDatabase = field(default_factory=VendorDatabase)
+    contract_service: ContractService = field(default_factory=ContractService)
+    approver_registry: ApproverRegistry = field(default_factory=ApproverRegistry)
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+
+# ------------------------------------------------------------
+# FulfillmentAgent
 # ------------------------------------------------------------
 
 class FulfillmentAgent:
     """Final stage: emits the purchase order to the vendor system.
 
-    Production version integrates with your ERP / supplier portals.
+    Constructible with no arguments for parity with the other agents
+    in this chapter; lazily creates default in-process services if
+    none are passed.
     """
 
     def __init__(
         self,
-        agent_id: str,
-        identity: IdentityService,
-        bus: EventBus,
-        metrics: AgentMetrics,
+        agent_id: str = "fulfillment",
+        identity: Optional[IdentityService] = None,
+        bus: Optional[EventBus] = None,
+        metrics: Optional[AgentMetrics] = None,
     ):
         self.agent_id = agent_id
-        self.identity = identity
-        self.bus = bus
-        self.metrics = metrics
+        self.identity = identity or IdentityService()
+        self.bus = bus or EventBus()
+        self.metrics = metrics or AgentMetrics(agent_id)
 
     async def fulfill(
         self,
-        request: "PurchaseRequest",
+        request: Any,
         approval: ApprovalDecisionResult,
         ctx: ProcessingContext,
     ) -> dict:
-        if not approval.approved:
+        if approval.status not in ("fully_approved", "partially_approved"):
             raise ProcurementError("Cannot fulfill an unapproved request.")
         self.metrics.increment("fulfilled")
         po = {
-            "po_id": f"PO-{request.request_id}",
-            "vendor_id": getattr(request, "preferred_vendor_id", None),
+            "po_id": f"PO-{getattr(request, 'id', getattr(request, 'request_id', ''))}",
             "items": [
-                {"name": it.name, "qty": it.quantity, "unit_price": it.unit_price}
-                for it in request.items
+                {
+                    "name": getattr(it, "name", str(it)),
+                    "qty": getattr(it, "quantity", 1),
+                    "unit_price": getattr(it, "unit_price", 0.0),
+                }
+                for it in getattr(request, "items", [])
             ],
             "submitted_at": datetime.now(timezone.utc).isoformat(),
         }
-        await self.bus.publish("procurement.fulfilled", {
-            "request_id": request.request_id,
+        await self.bus.emit("procurement.fulfilled", {
+            "request_id": getattr(request, "id",
+                                  getattr(request, "request_id", "")),
             "po": po,
             "correlation_id": ctx.correlation_id,
         })
