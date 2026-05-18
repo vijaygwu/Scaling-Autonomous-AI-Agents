@@ -148,8 +148,8 @@ class Conversation:
     status: ConversationStatus
     context: ConversationContext
     messages: list[Message] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     resolved_at: Optional[datetime] = None
     quality_score: Optional[float] = None
     
@@ -192,7 +192,7 @@ class EscalationRequest:
     context_summary: str
     attempted_resolutions: list[str]
     customer_sentiment: float
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
     @classmethod
     def create(cls, conversation: Conversation, reason: str,
@@ -538,11 +538,13 @@ class OrderStatusTool(Tool):
             audit_level="standard"
         )
     
-    @with_timeout(10.0)
+    # Retry outer, timeout per-attempt: each retry gets a fresh 10 s budget
+    # rather than sharing one budget across all attempts.
     @with_retry(max_attempts=3)
+    @with_timeout(10.0)
     async def execute(self, order_id: str) -> ToolResult:
         start = datetime.now(timezone.utc)
-        
+
         validation_error = self.validate_params(order_id=order_id)
         if validation_error:
             return ToolResult(success=False, data=None, error=validation_error)
@@ -804,8 +806,8 @@ class TrackShipmentTool(Tool):
             audit_level="minimal"
         )
     
-    @with_timeout(10.0)
     @with_retry(max_attempts=2)
+    @with_timeout(10.0)
     async def execute(self, tracking_number: str, carrier: str = None) -> ToolResult:
         start = datetime.now(timezone.utc)
         

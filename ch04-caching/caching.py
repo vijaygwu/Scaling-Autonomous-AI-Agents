@@ -25,8 +25,8 @@ _block_1_listing = r"""
 Daily requests: 10,000
 Average tokens per request: 2,000 input + 500 output
 Daily token usage: 25 million tokens
-Daily cost (at $15/$45 per million): ~$52
-Monthly cost: ~$1,560
+Daily cost (at $15/$45 per million): ~$525
+Monthly cost: ~$15,750
 """
 
 # ============================================================================
@@ -37,9 +37,9 @@ Monthly cost: ~$1,560
 _block_2_listing = r"""
 Cache hits: 6,000 (served from cache)
 Cache misses: 4,000 (require LLM calls)
-Daily cost: ~$21 (60% reduction)
-Monthly cost: ~$624
-Monthly savings: ~$936
+Daily cost: ~$210 (60% reduction)
+Monthly cost: ~$6,300
+Monthly savings: ~$9,450
 """
 
 # ============================================================================
@@ -1042,9 +1042,10 @@ class InMemoryBackend(CacheBackend):
     
     def set(self, key: str, value: Any, ttl: Optional[timedelta] = None) -> bool:
         with self._lock:
-            # Simple LRU eviction if at capacity
+            # Simple FIFO eviction if at capacity (insertion order)
+            # For true LRU, see the section on production caches below.
             if len(self._cache) >= self._max_size and key not in self._cache:
-                # Remove oldest entry
+                # Remove oldest-inserted entry
                 oldest = next(iter(self._cache))
                 del self._cache[oldest]
             
@@ -1551,10 +1552,12 @@ class SemanticCache:
                     original_query=None
                 )
             
-            # Find most similar entry
+            # Find most similar entry. Cosine similarity ranges [-1, 1];
+            # initialize below the floor so the first comparison always
+            # populates best_entry, even for negative-similarity matches.
             best_entry = None
-            best_similarity = 0.0
-            
+            best_similarity = -1.0
+
             for entry in self._entries:
                 similarity = entry.similarity(query_embedding)
                 if similarity > best_similarity:
@@ -1622,7 +1625,7 @@ class SemanticCache:
             
             # Evict if at capacity
             if len(self._entries) >= self.max_entries:
-                self._evict_lru()
+                self._evict_lfu()
             
             self._entries.append(entry)
     
@@ -1638,19 +1641,24 @@ class SemanticCache:
         
         return original_count - len(self._entries)
     
-    def _evict_lru(self) -> None:
-        """Remove least recently used entries to make room."""
+    def _evict_lfu(self) -> None:
+        """Remove least frequently used entries to make room.
+
+        Sorts by access_count (ascending) with age as tie-breaker.
+        For strict LRU (last-access timestamp), track an updated_at
+        field and sort by that instead.
+        """
         if not self._entries:
             return
-        
+
         # Remove 10% of entries, preferring low access count
         remove_count = max(1, len(self._entries) // 10)
-        
+
         # Sort by access count (ascending) and age (oldest first)
         self._entries.sort(
             key=lambda e: (e.access_count, -e.created_at)
         )
-        
+
         self._entries = self._entries[remove_count:]
     
     @property
@@ -2136,14 +2144,20 @@ class ScheduledCacheWarmer:
         self._running = False
     
     def start(self) -> None:
-        """Start the scheduled warmer."""
-        # In production, use a proper scheduler like APScheduler
-        # This is a simplified example
+        """Start the scheduled warmer.
+
+        Blocking call -- run this in a dedicated worker thread or a
+        sidecar process. Do NOT call from an asyncio event loop;
+        ``time.sleep`` here would block all coroutines.
+
+        In production, prefer a proper scheduler (APScheduler, Celery beat,
+        or a Kubernetes CronJob) instead of an in-process loop.
+        """
         import schedule as sched
-        
+
         sched.every().day.at("03:00").do(self._run_warming)
         self._running = True
-        
+
         while self._running:
             sched.run_pending()
             time.sleep(60)

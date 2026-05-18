@@ -571,10 +571,13 @@ class RedisTaskQueue:
             task_key = f"task:{task.task_id}"
             self.redis.setex(task_key, 86400, task.to_json())
             
-            # Remove from processing, add back to main queue
+            # Remove from processing; requeue at the TAIL so retries
+            # wait behind fresh tasks instead of jumping ahead of them
+            # (workers BRPOP from the head, so rpush sits behind the new arrivals
+            # pushed there by lpush in submit()).
             self.redis.lrem(self.processing_queue, 1, task.task_id)
-            self.redis.lpush(self.queue_name, task.task_id)
-            
+            self.redis.rpush(self.queue_name, task.task_id)
+
             self.logger.warning(
                 f"Task {task.task_id} failed, requeueing "
                 f"(attempt {task.attempt}/{task.max_attempts})"
@@ -1783,11 +1786,26 @@ class ConnectionPool:
             if conn is None:
                 raise RuntimeError("Connection pool exhausted")
         
+        broken = False
         try:
             yield conn
+        except Exception:
+            # Caller hit an error using this connection; assume it is
+            # in an indeterminate state. Close and replace instead of
+            # returning to the pool.
+            broken = True
+            raise
         finally:
-            # Return connection to pool
-            if conn is not None:
+            if conn is None:
+                pass
+            elif broken:
+                try:
+                    conn.close()
+                finally:
+                    with self.lock:
+                        self.size -= 1
+            else:
+                # Caller exited cleanly; safe to recycle.
                 self.pool.put(conn)
     
     def close_all(self) -> None:

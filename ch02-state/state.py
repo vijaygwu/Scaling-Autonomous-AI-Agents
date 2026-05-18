@@ -20,11 +20,13 @@ provide the surrounding context (imports, dependencies) as needed.
 # Block 1 (chapter listing #1)
 # ============================================================================
 
+import json
+import re
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, TypeVar, Generic
-import json
 import redis
 from redis.asyncio import Redis as AsyncRedis
 

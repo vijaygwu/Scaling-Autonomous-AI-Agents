@@ -22,7 +22,7 @@ pika>=1.3.2                 # RabbitMQ client
 
 # Vector databases and search
 faiss-cpu>=1.7.4
-pinecone-client>=3.0.0
+pinecone>=5.0.0           # Renamed from `pinecone-client` in late 2024
 qdrant-client>=1.7.0
 weaviate-client>=4.4.0
 
