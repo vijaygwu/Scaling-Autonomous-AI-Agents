@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Complete Example: Procurement Automation
 
@@ -218,6 +220,481 @@ class Vendor:
 # Block 4 (chapter listing #4)
 # ============================================================================
 
+"""
+Supporting services for the procurement system.
+Minimal but runnable; intended as integration points for the
+production-grade services from Book 2.
+"""
+
+import asyncio
+import json
+import uuid
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from typing import Any, Awaitable, Callable, Optional
+
+
+# ------------------------------------------------------------
+# Error hierarchy
+# ------------------------------------------------------------
+
+class ProcurementError(Exception):
+    """Base class for procurement-flow errors."""
+
+class IntakeError(ProcurementError): pass
+class AnalysisError(ProcurementError): pass
+class ApprovalError(ProcurementError): pass
+
+
+# ------------------------------------------------------------
+# Result types for each workflow stage
+# ------------------------------------------------------------
+
+@dataclass
+class ValidationResult:
+    """Outcome of a single ValidationRule check."""
+    passed: bool
+    rule_id: str
+    message: str = ""
+    severity: str = "warning"  # 'warning' or 'error'
+
+
+@dataclass
+class ValidationRule:
+    """A declarative rule the intake agent applies to a request."""
+    rule_id: str
+    description: str
+    check: Callable[["PurchaseRequest"], ValidationResult]
+
+
+@dataclass
+class IntakeResult:
+    """Outcome of the intake stage."""
+    request: "PurchaseRequest"
+    validations: list[ValidationResult] = field(default_factory=list)
+    ready_for_analysis: bool = False
+    notes: str = ""
+
+
+@dataclass
+class ItemAnalysis:
+    """Per-item analysis result."""
+    item_name: str
+    estimated_unit_price: float
+    estimated_total: float
+    confidence: float  # 0.0 - 1.0
+    risk_flags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RiskAssessment:
+    """Aggregate risk view for a purchase request."""
+    overall_score: float  # 0-100, lower is safer
+    flags: list[str] = field(default_factory=list)
+    rationale: str = ""
+
+
+@dataclass
+class ComplianceIssue:
+    """A specific compliance concern found by ComplianceRule."""
+    rule_id: str
+    severity: str  # 'low', 'medium', 'high'
+    description: str
+
+
+@dataclass
+class ComplianceRule:
+    """Declarative compliance rule."""
+    rule_id: str
+    description: str
+    check: Callable[["PurchaseRequest"], list[ComplianceIssue]]
+
+
+@dataclass
+class AnalysisResult:
+    """Output of the AnalysisAgent."""
+    request_id: str
+    item_analyses: list[ItemAnalysis]
+    risk: RiskAssessment
+    compliance_issues: list[ComplianceIssue] = field(default_factory=list)
+    estimated_total: float = 0.0
+    recommended_action: str = "approve"  # 'approve', 'review', 'reject'
+
+
+@dataclass
+class Approver:
+    """Reference to a human or systemic approver."""
+    approver_id: str
+    name: str
+    role: str
+    max_approval_amount: float
+
+
+@dataclass
+class ApprovalTask:
+    """A pending approval routed to a specific approver."""
+    task_id: str
+    request_id: str
+    approver: Approver
+    created_at: datetime
+    timeout_at: datetime
+    status: str = "pending"  # 'pending', 'approved', 'rejected', 'expired'
+    decision_notes: str = ""
+
+
+@dataclass
+class ApprovalRoutingResult:
+    """Routing decision from the ApprovalAgent."""
+    request_id: str
+    requires_approval: bool
+    tasks: list[ApprovalTask] = field(default_factory=list)
+    auto_approved: bool = False
+    reason: str = ""
+
+
+@dataclass
+class ApprovalDecisionResult:
+    """Final approval verdict after routing + responses."""
+    request_id: str
+    approved: bool
+    decided_at: datetime
+    approver_chain: list[str] = field(default_factory=list)
+    notes: str = ""
+
+
+@dataclass
+class AutoApprovalResult:
+    """Outcome of the auto-approval fast path."""
+    eligible: bool
+    reason: str = ""
+
+
+@dataclass
+class DelegationRule:
+    """When primary approver is unavailable, who can decide?"""
+    primary_approver_id: str
+    delegate_approver_id: str
+    valid_until: Optional[datetime] = None
+
+
+@dataclass
+class AuthResult:
+    """Result of authenticating an agent against the IdentityService."""
+    success: bool
+    agent_id: str
+    scopes: list[str] = field(default_factory=list)
+    error: str = ""
+
+
+@dataclass
+class SubmissionResult:
+    """Result of submitting a request to the system."""
+    success: bool
+    request_id: str
+    message: str = ""
+
+
+@dataclass
+class ProcessingContext:
+    """Runtime context that flows through the orchestrator stages."""
+    request_id: str
+    correlation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    actor_agent_id: str = ""
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+
+# ------------------------------------------------------------
+# IdentityService -- agent authentication and scope checks
+# ------------------------------------------------------------
+
+class IdentityService:
+    """Minimal in-process identity service.
+
+    For production, replace with the X.509 / OIDC implementation from
+    Book 2 (Chapter 1).
+    """
+
+    def __init__(self):
+        self._agents: dict[str, dict[str, Any]] = {}
+
+    def register_agent(self, agent_id: str, scopes: list[str]) -> None:
+        self._agents[agent_id] = {
+            "scopes": list(scopes),
+            "registered_at": datetime.now(timezone.utc),
+        }
+
+    async def authenticate(self, agent_id: str, token: str) -> AuthResult:
+        # Demo-only token convention: token == "valid-token-for-<id>"
+        if agent_id not in self._agents:
+            return AuthResult(False, agent_id, [], "unknown agent")
+        if token != f"valid-token-for-{agent_id}":
+            return AuthResult(False, agent_id, [], "invalid token")
+        return AuthResult(True, agent_id, self._agents[agent_id]["scopes"])
+
+    def has_scope(self, agent_id: str, scope: str) -> bool:
+        return scope in self._agents.get(agent_id, {}).get("scopes", [])
+
+
+# ------------------------------------------------------------
+# BudgetService -- spend limit checks
+# ------------------------------------------------------------
+
+class BudgetService:
+    """Tracks daily / monthly spend caps per cost center.
+
+    For production, replace with the BudgetManager from Book 2, Ch 3.
+    """
+
+    def __init__(self):
+        self._caps: dict[str, dict[str, float]] = {}
+        self._spent: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"daily": 0.0, "monthly": 0.0}
+        )
+
+    def set_cap(self, cost_center: str, daily: float, monthly: float) -> None:
+        self._caps[cost_center] = {"daily": daily, "monthly": monthly}
+
+    def can_spend(self, cost_center: str, amount: float) -> bool:
+        cap = self._caps.get(cost_center)
+        if not cap:
+            return False
+        spent = self._spent[cost_center]
+        return (spent["daily"] + amount <= cap["daily"] and
+                spent["monthly"] + amount <= cap["monthly"])
+
+    def record_spend(self, cost_center: str, amount: float) -> None:
+        self._spent[cost_center]["daily"] += amount
+        self._spent[cost_center]["monthly"] += amount
+
+
+# ------------------------------------------------------------
+# EventBus -- coordination between agents
+# ------------------------------------------------------------
+
+class EventBus:
+    """In-process pub/sub bus.
+
+    For production, replace with Kafka, NATS, or Redis Streams.
+    """
+
+    def __init__(self):
+        self._subscribers: dict[str, list[Callable[[dict], Awaitable[None]]]] = (
+            defaultdict(list)
+        )
+
+    def subscribe(
+        self,
+        topic: str,
+        handler: Callable[[dict], Awaitable[None]],
+    ) -> None:
+        self._subscribers[topic].append(handler)
+
+    async def publish(self, topic: str, event: dict) -> None:
+        envelope = {
+            "topic": topic,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+        }
+        for h in self._subscribers.get(topic, []):
+            try:
+                await h(envelope)
+            except Exception:
+                # Production: log + send to DLQ; never let one subscriber
+                # block others.
+                pass
+
+
+# ------------------------------------------------------------
+# Metrics collectors
+# ------------------------------------------------------------
+
+class AgentMetrics:
+    """Per-agent counters and histograms.
+
+    For production, replace with the OpenTelemetry/Prometheus
+    instrumentation from Book 2, Chapter 6.
+    """
+
+    def __init__(self, agent_id: str):
+        self.agent_id = agent_id
+        self.counters: dict[str, int] = defaultdict(int)
+        self.timings: dict[str, list[float]] = defaultdict(list)
+
+    def increment(self, name: str, by: int = 1) -> None:
+        self.counters[name] += by
+
+    def record_timing(self, name: str, seconds: float) -> None:
+        self.timings[name].append(seconds)
+
+
+class OrchestratorMetrics(AgentMetrics):
+    """Orchestrator-level metrics including stage durations and routing."""
+
+    def record_stage(self, stage: str, seconds: float, success: bool) -> None:
+        self.record_timing(f"stage.{stage}.seconds", seconds)
+        self.increment(f"stage.{stage}.{'success' if success else 'failure'}")
+
+
+# ------------------------------------------------------------
+# ApproverRegistry -- look up who can approve what
+# ------------------------------------------------------------
+
+class ApproverRegistry:
+    """Maps approval levels to eligible approvers."""
+
+    def __init__(self):
+        self._approvers: dict[ApprovalLevel, list[Approver]] = defaultdict(list)
+        self._delegations: list[DelegationRule] = []
+
+    def register(self, level: "ApprovalLevel", approver: Approver) -> None:
+        self._approvers[level].append(approver)
+
+    def add_delegation(self, rule: DelegationRule) -> None:
+        self._delegations.append(rule)
+
+    def approvers_for(self, level: "ApprovalLevel") -> list[Approver]:
+        return list(self._approvers.get(level, []))
+
+
+# ------------------------------------------------------------
+# VendorDatabase -- supplier catalog
+# ------------------------------------------------------------
+
+class VendorDatabase:
+    """In-memory vendor catalog. Replace with a real CRM/ERP integration."""
+
+    def __init__(self):
+        self._vendors: dict[str, "Vendor"] = {}
+
+    def add(self, vendor: "Vendor") -> None:
+        self._vendors[vendor.vendor_id] = vendor
+
+    def get(self, vendor_id: str) -> Optional["Vendor"]:
+        return self._vendors.get(vendor_id)
+
+    def list_by_category(self, category: str) -> list["Vendor"]:
+        return [v for v in self._vendors.values() if category in v.categories]
+
+
+# ------------------------------------------------------------
+# ContractService -- pricing and contract terms lookup
+# ------------------------------------------------------------
+
+class ContractService:
+    """Looks up negotiated pricing for a vendor and item.
+
+    Production version queries the contract-management system; this
+    in-memory implementation is for examples and tests.
+    """
+
+    def __init__(self):
+        self._contracts: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def set_contract(
+        self,
+        vendor_id: str,
+        item_name: str,
+        unit_price: float,
+        valid_until: Optional[datetime] = None,
+    ) -> None:
+        self._contracts[(vendor_id, item_name)] = {
+            "unit_price": unit_price,
+            "valid_until": valid_until,
+        }
+
+    def get_unit_price(self, vendor_id: str, item_name: str) -> Optional[float]:
+        c = self._contracts.get((vendor_id, item_name))
+        if not c:
+            return None
+        if c["valid_until"] and c["valid_until"] < datetime.now(timezone.utc):
+            return None
+        return c["unit_price"]
+
+
+# ------------------------------------------------------------
+# MockLLM -- deterministic stand-in for unit tests
+# ------------------------------------------------------------
+
+@dataclass
+class MockResponse:
+    """Stand-in for an LLM response. Mirrors the shape the agent code expects."""
+    content: str
+    tool_calls: list[dict] = field(default_factory=list)
+
+
+class MockLLM:
+    """A deterministic LLM stand-in for unit tests.
+
+    Returns canned responses in order, falling back to a default if the
+    queue is exhausted. For production, replace with the real
+    Anthropic / OpenAI client.
+    """
+
+    def __init__(self, responses: Optional[list[MockResponse]] = None):
+        self._responses = list(responses or [])
+        self._default = MockResponse(content="(mock default response)")
+        self.calls: list[dict] = []
+
+    async def complete(self, messages: list[dict], **kwargs: Any) -> MockResponse:
+        self.calls.append({"messages": messages, "kwargs": kwargs})
+        if self._responses:
+            return self._responses.pop(0)
+        return self._default
+
+
+# ------------------------------------------------------------
+# FulfillmentAgent -- closes out an approved request
+# ------------------------------------------------------------
+
+class FulfillmentAgent:
+    """Final stage: emits the purchase order to the vendor system.
+
+    Production version integrates with your ERP / supplier portals.
+    """
+
+    def __init__(
+        self,
+        agent_id: str,
+        identity: IdentityService,
+        bus: EventBus,
+        metrics: AgentMetrics,
+    ):
+        self.agent_id = agent_id
+        self.identity = identity
+        self.bus = bus
+        self.metrics = metrics
+
+    async def fulfill(
+        self,
+        request: "PurchaseRequest",
+        approval: ApprovalDecisionResult,
+        ctx: ProcessingContext,
+    ) -> dict:
+        if not approval.approved:
+            raise ProcurementError("Cannot fulfill an unapproved request.")
+        self.metrics.increment("fulfilled")
+        po = {
+            "po_id": f"PO-{request.request_id}",
+            "vendor_id": getattr(request, "preferred_vendor_id", None),
+            "items": [
+                {"name": it.name, "qty": it.quantity, "unit_price": it.unit_price}
+                for it in request.items
+            ],
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await self.bus.publish("procurement.fulfilled", {
+            "request_id": request.request_id,
+            "po": po,
+            "correlation_id": ctx.correlation_id,
+        })
+        return po
+
+# ============================================================================
+# Block 5 (chapter listing #5)
+# ============================================================================
+
 class IntakeAgent:
     """
     Validates and prepares purchase requests for processing.
@@ -361,7 +838,7 @@ class IntakeAgent:
         return AuthResult(authorized=True)
 
 # ============================================================================
-# Block 5 (chapter listing #5)
+# Block 6 (chapter listing #6)
 # ============================================================================
 
 class AnalysisAgent:
@@ -562,7 +1039,7 @@ class AnalysisAgent:
         return recommendations
 
 # ============================================================================
-# Block 6 (chapter listing #6)
+# Block 7 (chapter listing #7)
 # ============================================================================
 
 class ApprovalAgent:
@@ -741,7 +1218,7 @@ class ApprovalAgent:
         return AutoApprovalResult(eligible=False)
 
 # ============================================================================
-# Block 7 (chapter listing #7)
+# Block 8 (chapter listing #8)
 # ============================================================================
 
 class ProcurementOrchestrator:
@@ -930,7 +1407,7 @@ class ProcurementOrchestrator:
             return result
 
 # ============================================================================
-# Block 8 (chapter listing #8)
+# Block 9 (chapter listing #9)
 # ============================================================================
 
 class ApprovalInterface:
@@ -1006,7 +1483,7 @@ class ApprovalInterface:
         )
 
 # ============================================================================
-# Block 9 (chapter listing #9)
+# Block 10 (chapter listing #10)
 # ============================================================================
 
 class ProcurementDashboard:
@@ -1059,7 +1536,7 @@ class ProcurementDashboard:
         }
 
 # ============================================================================
-# Block 10 (chapter listing #10)
+# Block 11 (chapter listing #11)
 # ============================================================================
 
 async def main():
@@ -1148,7 +1625,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 
 # ============================================================================
-# Block 11 (chapter listing #11)
+# Block 12 (chapter listing #12)
 # ============================================================================
 
 # tests/unit/test_analysis_agent.py
@@ -1212,7 +1689,7 @@ async def test_analysis_agent_flags_compliance_issues(mock_llm):
     assert len(result.compliance_issues) > 0
 
 # ============================================================================
-# Block 12 (chapter listing #12)
+# Block 13 (chapter listing #13)
 # ============================================================================
 
 # tests/integration/test_orchestrator.py
@@ -1273,7 +1750,7 @@ async def test_restricted_category_requires_review(orchestrator):
     assert result.approval_level != ApprovalLevel.AUTO
 
 # ============================================================================
-# Block 13 (chapter listing #13)
+# Block 14 (chapter listing #14)
 # ============================================================================
 
 # tests/scenarios/test_approval_routing.py
