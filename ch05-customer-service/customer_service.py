@@ -489,18 +489,17 @@ def with_retry(max_attempts: int = 3, backoff_seconds: float = 1.0):
 
 
 def with_timeout(seconds: float):
-    """Decorator for adding timeout to tool executions."""
+    """Decorator for adding a timeout to tool executions.
+
+    Raises ``asyncio.TimeoutError`` on expiry so that an outer
+    ``@with_retry`` can observe and retry. Callers who want a
+    ToolResult-on-timeout instead of an exception should wrap the
+    decorated function and convert.
+    """
     def decorator(func: Callable):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            try:
-                return await asyncio.wait_for(func(*args, **kwargs), timeout=seconds)
-            except asyncio.TimeoutError:
-                return ToolResult(
-                    success=False,
-                    data=None,
-                    error=f"Tool execution timed out after {seconds} seconds"
-                )
+            return await asyncio.wait_for(func(*args, **kwargs), timeout=seconds)
         return wrapper
     return decorator
 

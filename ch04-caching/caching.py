@@ -1644,9 +1644,10 @@ class SemanticCache:
     def _evict_lfu(self) -> None:
         """Remove least frequently used entries to make room.
 
-        Sorts by access_count (ascending) with age as tie-breaker.
-        For strict LRU (last-access timestamp), track an updated_at
-        field and sort by that instead.
+        Sorts by access_count (ascending); among entries with the same
+        access count, the oldest are evicted first. For strict LRU
+        (last-access timestamp), track an ``updated_at`` field and sort
+        by that instead.
         """
         if not self._entries:
             return
@@ -1654,9 +1655,10 @@ class SemanticCache:
         # Remove 10% of entries, preferring low access count
         remove_count = max(1, len(self._entries) // 10)
 
-        # Sort by access count (ascending) and age (oldest first)
+        # Sort by access count (low first); within ties, oldest first
+        # (smaller created_at). The front of the list is what we evict.
         self._entries.sort(
-            key=lambda e: (e.access_count, -e.created_at)
+            key=lambda e: (e.access_count, e.created_at)
         )
 
         self._entries = self._entries[remove_count:]

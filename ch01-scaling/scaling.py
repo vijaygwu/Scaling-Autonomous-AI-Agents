@@ -571,12 +571,13 @@ class RedisTaskQueue:
             task_key = f"task:{task.task_id}"
             self.redis.setex(task_key, 86400, task.to_json())
             
-            # Remove from processing; requeue at the TAIL so retries
-            # wait behind fresh tasks instead of jumping ahead of them
-            # (workers BRPOP from the head, so rpush sits behind the new arrivals
-            # pushed there by lpush in submit()).
+            # Remove from processing and re-enqueue. The submit path uses
+            # lpush + a right-side dequeue (BLMOVE from RIGHT), giving FIFO
+            # order with the oldest task at the right end. Match that
+            # convention here so retries are treated like fresh arrivals
+            # rather than jumping the queue.
             self.redis.lrem(self.processing_queue, 1, task.task_id)
-            self.redis.rpush(self.queue_name, task.task_id)
+            self.redis.lpush(self.queue_name, task.task_id)
 
             self.logger.warning(
                 f"Task {task.task_id} failed, requeueing "
