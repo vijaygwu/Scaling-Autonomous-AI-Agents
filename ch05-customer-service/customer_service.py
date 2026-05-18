@@ -1425,7 +1425,7 @@ Respond with JSON only:
 # ============================================================================
 
 """
-Base agent implementation providing common functionality.
+Base agent implementation providing common capabilities.
 All specialized agents inherit from this class.
 """
 from abc import ABC, abstractmethod
@@ -2184,6 +2184,9 @@ class ConversationManager:
         conversation = self.active_conversations.get(conversation_id)
         if not conversation:
             raise ValueError(f"Conversation {conversation_id} not found")
+        # Mark recently used so the LRU cap evicts cold conversations first.
+        self.active_conversations.move_to_end(conversation_id)
+        self.conversation_metrics.move_to_end(conversation_id)
         
         metrics = self.conversation_metrics[conversation_id]
         metrics.message_count += 1
@@ -2650,9 +2653,11 @@ class MetricsCollector:
     async def record_conversation_start(self, conversation: Conversation):
         """Record a new conversation."""
         hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
-        
+
         self._current_metrics[hour_key]["total_conversations"] += 1
         self._current_metrics[hour_key][f"channel_{conversation.channel.value}"] += 1
+        # Enforce the bucket retention cap on every new-hour write.
+        self._evict_old_buckets()
     
     async def record_first_response(self, conversation_id: str, 
                                     latency_ms: float):
@@ -2991,52 +2996,58 @@ async def handle_customer_message(manager: ConversationManager,
 
 
 async def example_conversation():
-    """Demonstrate a complete conversation flow."""
-    
-    manager, metrics = await create_platform()
-    
-    # Create a test customer
-    customer = Customer(
-        customer_id="CUST-12345",
-        email="jane.doe@example.com",
-        name="Jane Doe",
-        tier="premium",
-        lifetime_value=5000
-    )
-    
-    # Start conversation
-    conversation = await manager.start_conversation(
-        customer, ConversationChannel.WEB_CHAT
-    )
-    
-    await metrics.record_conversation_start(conversation)
-    
-    # Simulate conversation
-    messages = [
-        "Hi, I need help with my recent order",
-        "jane.doe@example.com",
-        "Order ORD-98765, it was supposed to arrive yesterday",
-        "Yes, please check the tracking",
-        "That's helpful, thanks!"
-    ]
-    
-    for msg in messages:
-        response = await handle_customer_message(
-            manager, metrics, conversation.conversation_id, msg
+    """Demonstrate a complete conversation flow.
+
+    ``create_platform`` is an ``@asynccontextmanager`` (it yields
+    ``(manager, metrics)`` for the lifetime of an ``async with``
+    block); using ``await create_platform()`` would TypeError. The
+    block scoping also ensures the httpx clients inside the platform
+    stay open while the conversation runs and are closed cleanly when
+    the block exits.
+    """
+    async with create_platform() as (manager, metrics):
+        # Create a test customer
+        customer = Customer(
+            customer_id="CUST-12345",
+            email="jane.doe@example.com",
+            name="Jane Doe",
+            tier="premium",
+            lifetime_value=5000
         )
-        print(f"Customer: {msg}")
-        print(f"Agent: {response}")
-        print("---")
-    
-    # Resolve conversation
-    await manager.resolve_conversation(conversation.conversation_id)
-    
-    conv_metrics = manager.conversation_metrics[conversation.conversation_id]
-    await metrics.record_conversation_end(conversation, conv_metrics)
-    
-    # Get summary
-    summary = manager.get_conversation_summary(conversation.conversation_id)
-    print(f"\nConversation Summary: {summary}")
+
+        # Start conversation
+        conversation = await manager.start_conversation(
+            customer, ConversationChannel.WEB_CHAT
+        )
+
+        await metrics.record_conversation_start(conversation)
+
+        # Simulate conversation
+        messages = [
+            "Hi, I need help with my recent order",
+            "jane.doe@example.com",
+            "Order ORD-98765, it was supposed to arrive yesterday",
+            "Yes, please check the tracking",
+            "That's helpful, thanks!"
+        ]
+
+        for msg in messages:
+            response = await handle_customer_message(
+                manager, metrics, conversation.conversation_id, msg
+            )
+            print(f"Customer: {msg}")
+            print(f"Agent: {response}")
+            print("---")
+
+        # Resolve conversation
+        await manager.resolve_conversation(conversation.conversation_id)
+
+        conv_metrics = manager.conversation_metrics[conversation.conversation_id]
+        await metrics.record_conversation_end(conversation, conv_metrics)
+
+        # Get summary
+        summary = manager.get_conversation_summary(conversation.conversation_id)
+        print(f"\nConversation Summary: {summary}")
 
 
 if __name__ == "__main__":

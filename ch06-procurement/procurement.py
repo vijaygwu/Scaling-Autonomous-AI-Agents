@@ -331,10 +331,16 @@ class IntakeResult:
 
 @dataclass
 class ItemAnalysis:
-    """Per-item analysis result, mutated by the AnalysisAgent."""
+    """Per-item analysis result, mutated by the AnalysisAgent.
+
+    Field names match the attributes the AnalysisAgent writes to at
+    runtime: ``potential_savings`` (set from ContractService comparison)
+    and ``alternative_vendors`` (populated from VendorDatabase.find_by_category).
+    """
     item_name: str
     alternative_vendors: list[Any] = field(default_factory=list)
-    estimated_savings: float = 0.0
+    potential_savings: float = 0.0          # matches AnalysisAgent's write
+    estimated_savings: float = 0.0          # legacy alias retained for older callers
     risk_flags: list[str] = field(default_factory=list)
     notes: str = ""
 
@@ -379,7 +385,7 @@ class AnalysisResult:
                 {
                     "item_name": a.item_name,
                     "alternative_vendors": list(a.alternative_vendors),
-                    "estimated_savings": a.estimated_savings,
+                    "potential_savings": a.potential_savings,
                     "risk_flags": list(a.risk_flags),
                     "notes": a.notes,
                 }
@@ -497,12 +503,20 @@ class DelegationRule:
 
 @dataclass
 class SubmissionResult:
-    """Result of submitting a request to the orchestrator."""
+    """Result of submitting a request to the orchestrator.
+
+    The orchestrator constructs this at three call sites with slightly
+    different kwarg sets (validation_failed, completed, pending_approval),
+    so warnings, order, and analysis_summary are all optional.
+    """
     status: str = ""                 # 'completed', 'validation_failed', 'pending_approval', etc.
     request_id: str = ""
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     auto_approved: bool = False
     approval_info: dict[str, Any] = field(default_factory=dict)
+    analysis_summary: dict[str, Any] = field(default_factory=dict)
+    order: Optional[dict[str, Any]] = None
 
 
 @dataclass
