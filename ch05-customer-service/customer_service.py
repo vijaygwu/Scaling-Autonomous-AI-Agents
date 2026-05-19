@@ -25,6 +25,7 @@ Core data models for the customer service platform.
 These models define the contract between components.
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -85,7 +86,12 @@ class Customer:
     lifetime_value: float = 0.0
     account_age_days: int = 0
     open_tickets: int = 0
-    recent_orders: list = field(default_factory=list)
+    # Cap in-memory recent-order summary; full history lives in the
+    # orders service. Callers should treat ``recent_orders`` as a
+    # display window, not a complete audit log.
+    recent_orders: deque = field(
+        default_factory=lambda: deque(maxlen=20)
+    )
     preferences: dict = field(default_factory=dict)
 
     @property
@@ -139,8 +145,16 @@ class ConversationContext:
     intent_confidence: float = 0.0
     extracted_entities: dict = field(default_factory=dict)
     current_agent: Optional[AgentType] = None
-    previous_agents: list = field(default_factory=list)
-    tool_results: list = field(default_factory=list)
+    # Bound both lists so a long-running conversation cannot exhaust
+    # memory. Per-conversation handoffs and tool calls rarely exceed
+    # these caps; if you need full history, persist to the conversation
+    # store rather than holding it in process.
+    previous_agents: deque = field(
+        default_factory=lambda: deque(maxlen=10)
+    )
+    tool_results: deque = field(
+        default_factory=lambda: deque(maxlen=50)
+    )
     escalation_reason: Optional[str] = None
     sentiment_score: float = 0.0  # -1 to 1
 

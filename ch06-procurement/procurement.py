@@ -22,6 +22,7 @@ provide the surrounding context (imports, dependencies) as needed.
 # Block 1 (chapter listing #1)
 # ============================================================================
 
+from collections import deque
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
@@ -131,9 +132,16 @@ class PurchaseRequest:
     analysis_result: Optional[dict] = None
     approval_chain: list[dict] = field(default_factory=list)
 
-    # Audit trail
-    status_history: list[dict] = field(default_factory=list)
-    notes: list[dict] = field(default_factory=list)
+    # Audit trail. Bounded in-memory ring; production deployments
+    # MUST also persist each transition to a durable audit log
+    # (database, write-once event store) for compliance retention.
+    # The 1000-entry cap protects long-running processes from OOM.
+    status_history: deque = field(
+        default_factory=lambda: deque(maxlen=1000)
+    )
+    notes: deque = field(
+        default_factory=lambda: deque(maxlen=1000)
+    )
 
     @property
     def total_amount(self) -> float:

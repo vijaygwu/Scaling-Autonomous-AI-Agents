@@ -27,219 +27,235 @@ provide the surrounding context (imports, dependencies) as needed.
 embedding_vector = [0.0] * 1536  # placeholder: replace with real embedding
 query_embedding = [0.0] * 1536  # placeholder: replace with real embedding
 
-import pinecone
-from pinecone import Pinecone, ServerlessSpec
+# Guarded so import-time code does not require the Pinecone SDK,
+# credentials, or a live network. Reading the block teaches the API;
+# to run it, install ``pinecone-client`` and replace api_key.
+if False:  # pragma: no cover -- illustrative; install SDK + set api_key
+    import pinecone
+    from pinecone import Pinecone, ServerlessSpec
 
-pc = Pinecone(api_key="your-api-key")
+    pc = Pinecone(api_key="your-api-key")
 
-# Create index for 1536-dimension OpenAI embeddings
-pc.create_index(
-    name="knowledge-base",
-    dimension=1536,
-    metric="cosine",
-    spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-)
+    # Create index for 1536-dimension OpenAI embeddings
+    pc.create_index(
+        name="knowledge-base",
+        dimension=1536,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    )
 
-index = pc.Index("knowledge-base")
+    index = pc.Index("knowledge-base")
 
-index.upsert(
-    vectors=[
-        {
-            "id": "doc-001",
-            "values": embedding_vector,  # 1536-dim list
-            "metadata": {
-                "source": "internal-docs",
-                "category": "authentication",
-                "last_updated": "2025-03-15",
-            },
-        }
-    ],
-    namespace="production",
-)
+    index.upsert(
+        vectors=[
+            {
+                "id": "doc-001",
+                "values": embedding_vector,  # 1536-dim list
+                "metadata": {
+                    "source": "internal-docs",
+                    "category": "authentication",
+                    "last_updated": "2025-03-15",
+                },
+            }
+        ],
+        namespace="production",
+    )
 
-results = index.query(
-    vector=query_embedding,
-    top_k=5,
-    include_metadata=True,
-    filter={
-        "category": {"$eq": "authentication"},
-        "last_updated": {"$gte": "2025-01-01"},
-    },
-    namespace="production",
-)
+    results = index.query(
+        vector=query_embedding,
+        top_k=5,
+        include_metadata=True,
+        filter={
+            "category": {"$eq": "authentication"},
+            "last_updated": {"$gte": "2025-01-01"},
+        },
+        namespace="production",
+    )
 
 # ============================================================================
 # Block 2 (chapter listing #2)
 # ============================================================================
 
-import weaviate
-from weaviate.classes.config import Configure, Property, DataType
-from weaviate.classes.query import MetadataQuery
+# Guarded so importing this module does not require the Weaviate SDK
+# or a running instance. Install ``weaviate-client`` and remove the
+# ``if False`` to run.
+if False:  # pragma: no cover -- illustrative; requires local Weaviate
+    import weaviate
+    from weaviate.classes.config import Configure, Property, DataType
+    from weaviate.classes.query import MetadataQuery
 
-client = weaviate.connect_to_local()
+    client = weaviate.connect_to_local()
 
-client.collections.create(
-    name="Document",
-    vectorizer_config=Configure.Vectorizer.text2vec_openai(
-        model="text-embedding-3-small"
-    ),
-    properties=[
-        Property(name="content", data_type=DataType.TEXT),
-        Property(name="title", data_type=DataType.TEXT),
-        Property(name="category", data_type=DataType.TEXT),
-        Property(name="source_url", data_type=DataType.TEXT),
-    ],
-)
+    client.collections.create(
+        name="Document",
+        vectorizer_config=Configure.Vectorizer.text2vec_openai(
+            model="text-embedding-3-small"
+        ),
+        properties=[
+            Property(name="content", data_type=DataType.TEXT),
+            Property(name="title", data_type=DataType.TEXT),
+            Property(name="category", data_type=DataType.TEXT),
+            Property(name="source_url", data_type=DataType.TEXT),
+        ],
+    )
 
-documents = client.collections.get("Document")
+    documents = client.collections.get("Document")
 
-# Add documents (vectorization happens automatically)
-documents.data.insert(
-    {
-        "content": "To reset your password, navigate to Settings > Security...",
-        "title": "Password Reset Guide",
-        "category": "authentication",
-        "source_url": "https://docs.example.com/auth/password-reset",
-    }
-)
+    # Add documents (vectorization happens automatically)
+    documents.data.insert(
+        {
+            "content": "To reset your password, navigate to Settings > Security...",
+            "title": "Password Reset Guide",
+            "category": "authentication",
+            "source_url": "https://docs.example.com/auth/password-reset",
+        }
+    )
 
-results = documents.query.hybrid(
-    query="forgot my password",
-    alpha=0.7,  # Weight toward vector search (0=keyword, 1=vector)
-    limit=5,
-    return_metadata=MetadataQuery(score=True),
-)
+    results = documents.query.hybrid(
+        query="forgot my password",
+        alpha=0.7,  # Weight toward vector search (0=keyword, 1=vector)
+        limit=5,
+        return_metadata=MetadataQuery(score=True),
+    )
 
-for result in results.objects:
-    print(f"Title: {result.properties['title']}")
-    print(f"Score: {result.metadata.score}")
+    for result in results.objects:
+        print(f"Title: {result.properties['title']}")
+        print(f"Score: {result.metadata.score}")
 
 # ============================================================================
 # Block 3 (chapter listing #3)
 # ============================================================================
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
-    OptimizersConfigDiff,
-    HnswConfigDiff,
-)
+# Guarded: importing this module does not require the Qdrant SDK or
+# a running instance. Install ``qdrant-client`` and remove the
+# ``if False`` to run.
+if False:  # pragma: no cover -- illustrative; requires local Qdrant
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import (
+        Distance,
+        VectorParams,
+        PointStruct,
+        Filter,
+        FieldCondition,
+        MatchValue,
+        OptimizersConfigDiff,
+        HnswConfigDiff,
+    )
 
-client = QdrantClient(host="localhost", port=6333)
+    client = QdrantClient(host="localhost", port=6333)
 
-client.create_collection(
-    collection_name="knowledge_base",
-    vectors_config=VectorParams(
-        size=1536,
-        distance=Distance.COSINE,
-        on_disk=True,  # Memory-map vectors for large datasets
-    ),
-    hnsw_config=HnswConfigDiff(
-        m=16,  # Number of connections per layer
-        ef_construct=100,  # Search depth during indexing
-        full_scan_threshold=10000,
-    ),
-    optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
-)
+    client.create_collection(
+        collection_name="knowledge_base",
+        vectors_config=VectorParams(
+            size=1536,
+            distance=Distance.COSINE,
+            on_disk=True,  # Memory-map vectors for large datasets
+        ),
+        hnsw_config=HnswConfigDiff(
+            m=16,  # Number of connections per layer
+            ef_construct=100,  # Search depth during indexing
+            full_scan_threshold=10000,
+        ),
+        optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
+    )
 
-client.upsert(
-    collection_name="knowledge_base",
-    points=[
-        PointStruct(
-            id=1,
-            vector=embedding_vector,
-            payload={
-                "content": "Authentication uses OAuth 2.0...",
-                "category": "security",
-                "access_level": "internal",
-                "version": "2.1",
-            },
-        )
-    ],
-)
-
-results = client.search(
-    collection_name="knowledge_base",
-    query_vector=query_embedding,
-    limit=5,
-    query_filter=Filter(
-        must=[
-            FieldCondition(
-                key="access_level", match=MatchValue(value="internal")
+    client.upsert(
+        collection_name="knowledge_base",
+        points=[
+            PointStruct(
+                id=1,
+                vector=embedding_vector,
+                payload={
+                    "content": "Authentication uses OAuth 2.0...",
+                    "category": "security",
+                    "access_level": "internal",
+                    "version": "2.1",
+                },
             )
-        ]
-    ),
-    with_payload=True,
-)
+        ],
+    )
+
+    results = client.search(
+        collection_name="knowledge_base",
+        query_vector=query_embedding,
+        limit=5,
+        query_filter=Filter(
+            must=[
+                FieldCondition(
+                    key="access_level", match=MatchValue(value="internal")
+                )
+            ]
+        ),
+        with_payload=True,
+    )
 
 # ============================================================================
 # Block 4 (chapter listing #4)
 # ============================================================================
 
-import psycopg2
-from pgvector.psycopg2 import register_vector
+# Guarded: importing this module does not require the psycopg2 SDK or
+# a running Postgres. Install ``psycopg2-binary`` and ``pgvector`` and
+# substitute real credentials from your secrets store to run.
+if False:  # pragma: no cover -- illustrative; requires pgvector-enabled Postgres
+    import psycopg2
+    from pgvector.psycopg2 import register_vector
 
-conn = psycopg2.connect(
-    host="localhost",
-    database="knowledge_db",
-    user="postgres",
-    password="password",
-)
-register_vector(conn)
+    conn = psycopg2.connect(
+        host="localhost",
+        database="knowledge_db",
+        user="postgres",
+        password="password",
+    )
+    register_vector(conn)
 
-with conn.cursor() as cur:
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS documents (
-            id SERIAL PRIMARY KEY,
-            content TEXT NOT NULL,
-            embedding vector(1536),
-            metadata JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id SERIAL PRIMARY KEY,
+                content TEXT NOT NULL,
+                embedding vector(1536),
+                metadata JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create HNSW index for fast similarity search
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS documents_embedding_idx
+            ON documents
+            USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
+        """)
+
+        conn.commit()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO documents (content, embedding, metadata)
+            VALUES (%s, %s, %s)
+            """,
+            (
+                "Password reset requires email verification...",
+                embedding_vector,
+                '{"category": "auth", "source": "wiki"}',
+            ),
         )
-    """)
+        conn.commit()
 
-    # Create HNSW index for fast similarity search
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS documents_embedding_idx 
-        ON documents 
-        USING hnsw (embedding vector_cosine_ops)
-        WITH (m = 16, ef_construction = 64)
-    """)
-
-    conn.commit()
-
-with conn.cursor() as cur:
-    cur.execute(
-        """
-        INSERT INTO documents (content, embedding, metadata)
-        VALUES (%s, %s, %s)
-        """,
-        (
-            "Password reset requires email verification...",
-            embedding_vector,
-            '{"category": "auth", "source": "wiki"}',
-        ),
-    )
-    conn.commit()
-
-with conn.cursor() as cur:
-    cur.execute(
-        """
-        SELECT content, metadata, 
-               1 - (embedding <=> %s::vector) as similarity
-        FROM documents
-        WHERE metadata->>'category' = 'auth'
-        ORDER BY embedding <=> %s::vector
-        LIMIT 5
-        """,
-        (query_embedding, query_embedding),
-    )
-    results = cur.fetchall()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT content, metadata,
+                   1 - (embedding <=> %s::vector) as similarity
+            FROM documents
+            WHERE metadata->>'category' = 'auth'
+            ORDER BY embedding <=> %s::vector
+            LIMIT 5
+            """,
+            (query_embedding, query_embedding),
+        )
+        results = cur.fetchall()
 
 # ============================================================================
 # Block 5 (chapter listing #5)

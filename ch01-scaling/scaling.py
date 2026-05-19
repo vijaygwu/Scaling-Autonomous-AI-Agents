@@ -357,7 +357,10 @@ class WeightedBalancer:
         self.latency_history: dict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=self.history_window)
         )
-        self.lock = threading.Lock()
+        # RLock (reentrant) because ``select_worker`` holds the lock and
+        # then calls ``get_average_latency``, which also takes it. A
+        # plain ``Lock`` would deadlock on that second acquire.
+        self.lock = threading.RLock()
 
     def record_latency(self, worker_id: str, latency_ms: float) -> None:
         """Record request latency for a worker."""
