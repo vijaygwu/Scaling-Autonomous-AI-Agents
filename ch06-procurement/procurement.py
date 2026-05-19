@@ -2064,30 +2064,37 @@ if __name__ == "__main__":
 #
 # In your project, the imports below resolve from your own
 # src/procurement/... package. We guard them with try/except so this
-# book listing parses cleanly when extracted as a single module; the
-# pytestmark skips the test bodies when the layout is not present so
-# pytest does not NameError on collection.
+# book listing parses cleanly when extracted as a single module: the
+# ``as Name`` form rebinds successfully when the production layout is
+# on the path; otherwise the except branch leaves the in-module class
+# definitions (Mock LLM, PurchaseRequest, etc.) intact for tests to
+# collect against.
 import pytest
 from unittest.mock import AsyncMock
 
 try:
-    from src.procurement.agents import AnalysisAgent
-    from src.procurement.models import PurchaseRequest, PurchaseItem
-    from src.testing.mock_llm import MockLLM, MockResponse
-
+    # In a real project this imports from your src/procurement/ tree.
+    # When the book listing is extracted as a single module these names
+    # already exist (AnalysisAgent, PurchaseRequest, PurchaseItem, MockLLM,
+    # MockResponse are defined elsewhere in the same module). We rebind
+    # them through this import only if the real package is on the path;
+    # the except branch leaves the in-module definitions intact rather
+    # than shadowing them with None.
+    from src.procurement.agents import AnalysisAgent as AnalysisAgent
+    from src.procurement.models import (
+        PurchaseRequest as PurchaseRequest,
+        PurchaseItem as PurchaseItem,
+    )
+    from src.testing.mock_llm import (
+        MockLLM as MockLLM,
+        MockResponse as MockResponse,
+    )
     _SRC_PROC_AVAILABLE = True
 except ImportError:
-    AnalysisAgent = None  # type: ignore
-    PurchaseRequest = None  # type: ignore
-    PurchaseItem = None  # type: ignore
-    MockLLM = None  # type: ignore
-    MockResponse = None  # type: ignore
+    # Fall back to the in-module definitions above. Tests still collect
+    # and run (no NameError); they exercise the in-module classes
+    # instead of the production-layout ones.
     _SRC_PROC_AVAILABLE = False
-
-pytestmark = pytest.mark.skipif(
-    not _SRC_PROC_AVAILABLE,
-    reason="src/procurement/ layout not available in this environment",
-)
 
 
 @pytest.fixture
@@ -2159,25 +2166,19 @@ async def test_analysis_agent_flags_compliance_issues(mock_llm):
 import pytest
 
 try:
-    from src.procurement.orchestrator import ProcurementOrchestrator
-    from src.procurement.models import (
-        PurchaseRequest,
-        RequestStatus,
-        ApprovalLevel,
+    # See the unit-test block above for the rebind-via-``as`` rationale.
+    # In-module fallbacks keep tests collectable in either layout.
+    from src.procurement.orchestrator import (
+        ProcurementOrchestrator as ProcurementOrchestrator,
     )
-
+    from src.procurement.models import (
+        PurchaseRequest as PurchaseRequest,
+        RequestStatus as RequestStatus,
+        ApprovalLevel as ApprovalLevel,
+    )
     _SRC_PROC_ORCH_AVAILABLE = True
 except ImportError:
-    ProcurementOrchestrator = None  # type: ignore
-    PurchaseRequest = None  # type: ignore
-    RequestStatus = None  # type: ignore
-    ApprovalLevel = None  # type: ignore
     _SRC_PROC_ORCH_AVAILABLE = False
-
-pytestmark = pytest.mark.skipif(
-    not _SRC_PROC_ORCH_AVAILABLE,
-    reason="src/procurement/ orchestrator not available in this environment",
-)
 
 
 @pytest.fixture

@@ -1302,17 +1302,29 @@ from typing import List, Optional, Dict, Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
-class LLMClient(Protocol):
-    """Structural type for an LLM provider client.
+class _ChatCompletionsResource(Protocol):
+    def create(self, *, model: str, messages: list[dict],
+               **kwargs: Any) -> Any: ...
 
-    The RAG pipelines below call ``complete`` or ``complete_async`` and
-    expect a response object with a ``content`` attribute. Real provider
-    clients (Anthropic ``messages.create``, OpenAI ``chat.completions.
-    create``) do not match this surface exactly; wrap them in a thin
-    adapter class that exposes ``complete`` to satisfy the protocol.
+
+@runtime_checkable
+class _ChatNamespace(Protocol):
+    completions: _ChatCompletionsResource
+
+
+@runtime_checkable
+class LLMClient(Protocol):
+    """Structural type for the OpenAI-style chat client this chapter uses.
+
+    The RAG pipelines below call ``self.llm_client.chat.completions.
+    create(model=..., messages=...)`` synchronously. The Protocol
+    captures that nested surface so static checkers verify the contract.
+    Anthropic-style clients (``messages.create``) and async chat APIs do
+    not satisfy this Protocol directly; wrap them in a thin adapter
+    exposing ``.chat.completions.create``.
     """
 
-    async def complete(self, messages: list[dict], **kwargs: Any) -> Any: ...
+    chat: _ChatNamespace
 
 
 @dataclass
