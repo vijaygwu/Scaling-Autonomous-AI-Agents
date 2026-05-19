@@ -268,6 +268,12 @@ from typing import Any, Awaitable, Callable, Optional
 try:
     from opentelemetry import trace  # noqa: F401
 except ImportError:
+    # PRODUCTION NOTE: the NoOp stub below lets the chapter examples
+    # run without an OpenTelemetry install. In a real deployment,
+    # OpenTelemetry should be a hard dependency: a missing tracer
+    # means missing audit traces, which silently hides where
+    # approvals stalled or which agent dropped a request. Fail fast
+    # in production builds and keep this stub only for unit tests.
     # Provide a minimal tracer stub so examples can run without OTel installed.
     # Mirrors the surface used by the orchestrator: get_tracer + both
     # start_as_current_span and start_span.
