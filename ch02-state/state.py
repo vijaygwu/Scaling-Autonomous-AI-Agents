@@ -23,6 +23,7 @@ provide the surrounding context (imports, dependencies) as needed.
 import json
 import re
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -173,6 +174,28 @@ class RedisStateStore(StateStore[dict[str, Any]]):
             version=parsed["version"],
             ttl_seconds=parsed.get("ttl_seconds"),
         )
+
+    # ----- Low-level helpers used by coordination primitives -----
+    # These public methods give cooperating components (e.g. lock
+    # coordinators) controlled access to the underlying client without
+    # reaching into the private ``_redis`` attribute.
+    async def set_raw(
+        self,
+        key: str,
+        value: str,
+        nx: bool = False,
+        ex: Optional[int] = None,
+    ) -> bool:
+        return bool(
+            await self._redis.set(key, value, nx=nx, ex=ex)
+        )
+
+    async def get_raw(self, key: str) -> Optional[str]:
+        return await self._redis.get(key)
+
+    async def delete_raw(self, key: str) -> int:
+        return await self._redis.delete(key)
+
 
 # ============================================================================
 # Block 2 (chapter listing #2)
@@ -1084,13 +1107,12 @@ class AdaptiveStrategy(CheckpointStrategy):
         self._min = timedelta(seconds=min_interval)
         self._max = timedelta(seconds=max_interval)
         self._threshold = cost_threshold
-        self._recent_costs: list[float] = []
+        # Bounded deque keeps the last 100 costs without manual trimming.
+        self._recent_costs: deque[float] = deque(maxlen=100)
 
     def record_operation_cost(self, cost: float) -> None:
         """Record the cost of a recent operation."""
         self._recent_costs.append(cost)
-        if len(self._recent_costs) > 100:
-            self._recent_costs = self._recent_costs[-100:]
 
     def should_checkpoint(
         self,
@@ -1496,7 +1518,7 @@ class SharedStateCoordinator:
                 }
             )
 
-            acquired = await self._store._redis.set(
+            acquired = await self._store.set_raw(
                 lock_key, lock_value, nx=True, ex=timeout
             )
 
@@ -1509,7 +1531,7 @@ class SharedStateCoordinator:
                 )
 
             # Check if existing lock is expired
-            existing = await self._store._redis.get(lock_key)
+            existing = await self._store.get_raw(lock_key)
             if existing:
                 lock_data = json.loads(existing)
                 existing_expires = datetime.fromisoformat(
@@ -1517,7 +1539,7 @@ class SharedStateCoordinator:
                 )
                 if datetime.now(timezone.utc) > existing_expires:
                     # Lock expired, try to take over
-                    await self._store._redis.delete(lock_key)
+                    await self._store.delete_raw(lock_key)
                     continue
 
             # Check timeout

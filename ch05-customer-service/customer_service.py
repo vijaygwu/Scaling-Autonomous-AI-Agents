@@ -1098,7 +1098,12 @@ class ProcessRefundTool(Tool):
 
     @with_timeout(30.0)
     async def execute(
-        self, customer_id: str, order_id: str, amount: int, reason: str
+        self,
+        customer_id: str,
+        order_id: str,
+        amount: int,
+        reason: str,
+        idempotency_key: Optional[str] = None,
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
 
@@ -1119,13 +1124,22 @@ class ProcessRefundTool(Tool):
                 error=f"Refund amount ({amount}) exceeds maximum refundable ({max_refundable})",
             )
 
+        # Idempotency key must be unique per logical refund operation. Two
+        # legitimate partial refunds of the same amount and reason for the
+        # same order must NOT collide; callers supply their own key or we
+        # generate a fresh uuid-bearing one.
+        if not idempotency_key:
+            idempotency_key = (
+                f"{order_id}-{amount}-{reason}-{uuid.uuid4()}"
+            )
+
         try:
             refund_request = {
                 "customer_id": customer_id,
                 "order_id": order_id,
                 "amount": amount,
                 "reason": reason,
-                "idempotency_key": f"{order_id}-{amount}-{reason}",
+                "idempotency_key": idempotency_key,
             }
 
             response = await self.client.post("/refunds", json=refund_request)
@@ -1592,9 +1606,21 @@ Respond with JSON only:
                 messages=[{"role": "user", "content": classification_prompt}],
             )
 
-            import json
+            import json as _json
+            import logging as _logging
 
-            result = json.loads(response.content[0].text)
+            raw_text = response.content[0].text
+            try:
+                result = _json.loads(raw_text)
+            except _json.JSONDecodeError as parse_err:
+                _logging.getLogger(__name__).warning(
+                    "Intent classifier returned non-JSON: %s", raw_text
+                )
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=f"Intent parsing failed: {parse_err}",
+                )
 
             # Map intent to agent type
             intent_to_agent = {
@@ -1748,13 +1774,42 @@ class BaseAgent(ABC):
     def _build_messages(
         self, conversation: Conversation, user_message: str
     ) -> list[dict]:
-        """Build message history for LLM."""
+        """Build message history for LLM.
+
+        Production deployments should plug in the ``ConversationManager``
+        from Chapter 2 here (token-aware truncation plus rolling summary)
+        so that long conversations do not lose critical early context
+        such as the customer identification turn or escalation notes.
+        When a ``conversation_manager`` is attached we delegate to its
+        ``get_context_window`` so the LLM sees a summary + the recent
+        window instead of a hard slice of the last N messages.
+        """
         messages = []
 
-        # Add conversation history
-        for msg in conversation.messages[-10:]:  # Last 10 messages
-            role = "user" if msg.role == "customer" else "assistant"
-            messages.append({"role": role, "content": msg.content})
+        # Prefer the Ch02 ConversationManager when available, so the LLM
+        # sees a summary plus a recent window rather than a blind slice.
+        cm = getattr(self, "conversation_manager", None)
+        if cm is not None and hasattr(cm, "get_context_window"):
+            window = cm.get_context_window(conversation.conversation_id)
+            if getattr(window, "summary", None):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Earlier conversation summary: "
+                            f"{window.summary}"
+                        ),
+                    }
+                )
+            for msg in getattr(window, "messages", []):
+                role = "user" if msg.role == "customer" else "assistant"
+                messages.append({"role": role, "content": msg.content})
+        else:
+            # Fallback: last 10 turns. Documented limitation -- long
+            # conversations will lose context before the window.
+            for msg in conversation.messages[-10:]:
+                role = "user" if msg.role == "customer" else "assistant"
+                messages.append({"role": role, "content": msg.content})
 
         # Add current message
         messages.append({"role": "user", "content": user_message})

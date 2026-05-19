@@ -62,6 +62,7 @@ class StatefulAgent:
 
 import json
 import redis
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 import hashlib
@@ -113,8 +114,6 @@ class StateManager:
 
     def save_state(self, state: ConversationState) -> None:
         """Persist conversation state to Redis."""
-        import time
-
         state.updated_at = time.time()
         if state.created_at == 0.0:
             state.created_at = state.updated_at
@@ -248,6 +247,7 @@ Worker B: Still processing request 2, request 4 waiting
 # Block 6 (chapter listing #6)
 # ============================================================================
 
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import threading
 import time
@@ -351,29 +351,23 @@ class WeightedBalancer:
 
     def __init__(self):
         self.workers: dict[str, WorkerInfo] = {}
-        self.latency_history: dict[str, list[float]] = {}
-        self.lock = threading.Lock()
         self.history_window = 100  # Keep last 100 latencies
+        # ``deque(maxlen=...)`` makes the bound automatic and avoids an
+        # O(n) slice copy on every overflow append.
+        self.latency_history: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=self.history_window)
+        )
+        self.lock = threading.Lock()
 
     def record_latency(self, worker_id: str, latency_ms: float) -> None:
         """Record request latency for a worker."""
         with self.lock:
-            if worker_id not in self.latency_history:
-                self.latency_history[worker_id] = []
-
-            history = self.latency_history[worker_id]
-            history.append(latency_ms)
-
-            # Keep bounded history
-            if len(history) > self.history_window:
-                self.latency_history[worker_id] = history[
-                    -self.history_window :
-                ]
+            self.latency_history[worker_id].append(latency_ms)
 
     def get_average_latency(self, worker_id: str) -> float:
         """Get average latency for a worker."""
         with self.lock:
-            history = self.latency_history.get(worker_id, [])
+            history = self.latency_history.get(worker_id)
             if not history:
                 return 0.0
             return sum(history) / len(history)

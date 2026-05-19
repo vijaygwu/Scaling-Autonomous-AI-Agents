@@ -390,6 +390,11 @@ class ItemAnalysis:
     estimated_savings: float = 0.0  # legacy alias retained for older callers
     risk_flags: list[str] = field(default_factory=list)
     notes: str = ""
+    # Fields written by AnalysisAgent._analyze_item; declared explicitly so
+    # @dataclass(slots=True) compatibility and serialization both see them.
+    recommended_vendor: Optional[Any] = None
+    savings_reason: str = ""
+    compliance_issues: list["ComplianceIssue"] = field(default_factory=list)
 
 
 @dataclass
@@ -438,6 +443,18 @@ class AnalysisResult:
                     "potential_savings": a.potential_savings,
                     "risk_flags": list(a.risk_flags),
                     "notes": a.notes,
+                    "recommended_vendor": getattr(
+                        a.recommended_vendor, "id", a.recommended_vendor
+                    ),
+                    "savings_reason": a.savings_reason,
+                    "compliance_issues": [
+                        {
+                            "severity": ci.severity,
+                            "rule": ci.rule,
+                            "message": ci.message,
+                        }
+                        for ci in a.compliance_issues
+                    ],
                 }
                 for a in self.item_analyses
             ],
@@ -455,10 +472,22 @@ class AnalysisResult:
 
 @dataclass
 class Approver:
-    approver_id: str
-    name: str
+    approver_id: str = ""
+    name: str = ""
     role: str = ""
     max_approval_amount: float = 0.0
+    email: str = ""
+    level: Optional["ApprovalLevel"] = None
+    departments: list[str] = field(default_factory=list)
+    # Accept ``id`` as an alias for ``approver_id`` so that demo construction
+    # sites that pass ``id=`` continue to work.
+    id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.id and not self.approver_id:
+            self.approver_id = self.id
+        elif self.approver_id and not self.id:
+            self.id = self.approver_id
 
 
 @dataclass
@@ -756,7 +785,7 @@ class EventBus:
                     # ops can see the dropped delivery.
                     logging.getLogger(__name__).warning(
                         "wildcard handler failed for %s: %s",
-                        envelope.topic if hasattr(envelope, "topic") else "?",
+                        envelope.get("topic", "?"),
                         exc,
                     )
 
@@ -816,16 +845,27 @@ class ApproverRegistry:
 
     def __init__(self):
         self._by_level: dict[Any, list[Approver]] = defaultdict(list)
+        self._by_id: dict[str, Approver] = {}
         self._delegations: list[DelegationRule] = []
 
-    def register(self, level: Any, approver: Approver) -> None:
+    def register(self, level: Any, approver: Optional[Approver] = None) -> None:
+        # Allow ``register(approver)`` shorthand by reading level off the
+        # approver itself.
+        if approver is None and isinstance(level, Approver):
+            approver = level
+            level = approver.level
         self._by_level[level].append(approver)
+        self._by_id[approver.approver_id] = approver
 
     def add_delegation(self, rule: DelegationRule) -> None:
         self._delegations.append(rule)
 
     def approvers_for(self, level: Any) -> list[Approver]:
         return list(self._by_level.get(level, []))
+
+    async def get(self, approver_id: str) -> Optional[Approver]:
+        """Look up an approver by id (O(1))."""
+        return self._by_id.get(approver_id)
 
 
 # ------------------------------------------------------------
@@ -1096,12 +1136,11 @@ class IntakeAgent:
 
             # Apply custom rules
             for rule in self.validation_rules:
-                rule_result = await rule.evaluate(request, context)
-                if not rule_result.passed:
-                    if rule.severity == "error":
-                        errors.append(rule_result.message)
-                    else:
-                        warnings.append(rule_result.message)
+                if rule.check is None:
+                    continue
+                rule_result = rule.check(request)
+                errors.extend(rule_result.errors)
+                warnings.extend(rule_result.warnings)
 
             # Check for duplicates
             duplicate = await self._check_duplicates(request, context)
@@ -1313,11 +1352,13 @@ class AnalysisAgent:
         contract = await context.contract_service.find_contract(
             item.vendor_id, item.category
         )
-        if contract and item.unit_price > contract.unit_price:
-            savings = (item.unit_price - contract.unit_price) * item.quantity
+        if contract and item.unit_price > contract["unit_price"]:
+            savings = (
+                item.unit_price - contract["unit_price"]
+            ) * item.quantity
             analysis.potential_savings += savings
             analysis.savings_reason = (
-                f"Contract pricing available: ${contract.unit_price:.2f} "
+                f"Contract pricing available: ${contract['unit_price']:.2f} "
                 f"vs ${item.unit_price:.2f}"
             )
 
@@ -1561,7 +1602,7 @@ class ApprovalAgent:
                 "info_request",
             )
             return ApprovalDecisionResult(
-                status="info_requested", message=notes
+                status="info_requested", reason=notes
             )
 
     async def _check_auto_approval(

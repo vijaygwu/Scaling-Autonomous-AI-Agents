@@ -19,6 +19,13 @@ provide the surrounding context (imports, dependencies) as needed.
 # ============================================================================
 # Block 1 (chapter listing #1)
 # ============================================================================
+#
+# These first blocks call into third-party SDKs (Pinecone, Weaviate, Qdrant,
+# pgvector) and reference placeholder vectors. Real callers should supply an
+# embedding model output; for syntactic completeness we define stand-in
+# vectors here so the module is importable without external services.
+embedding_vector = [0.0] * 1536  # placeholder: replace with real embedding
+query_embedding = [0.0] * 1536  # placeholder: replace with real embedding
 
 import pinecone
 from pinecone import Pinecone, ServerlessSpec
@@ -429,6 +436,11 @@ class FixedSizeChunker(DocumentChunker):
     """Chunk documents by fixed character count with overlap."""
 
     def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
+        if chunk_overlap >= chunk_size:
+            raise ValueError(
+                "chunk_overlap must be strictly less than chunk_size "
+                f"(got chunk_size={chunk_size}, chunk_overlap={chunk_overlap})"
+            )
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
 
@@ -464,7 +476,13 @@ class FixedSizeChunker(DocumentChunker):
                 )
             )
 
-            start = end - self.chunk_overlap
+            next_start = end - self.chunk_overlap
+            # Guarantee forward progress: if the word-boundary adjustment
+            # made ``end`` small enough that ``next_start <= start``, advance
+            # by at least one character to avoid an infinite loop.
+            if next_start <= start:
+                next_start = start + 1
+            start = next_start
             chunk_index += 1
 
         return chunks
@@ -1523,7 +1541,15 @@ class MultiQueryRAG(RAGPipeline):
         results = self._truncate_context(all_results[: top_k * 2])
         context = self._format_context(results)
 
-        # ... rest of generation logic
+        # The rest of the generation logic mirrors the base RAGPipeline.query
+        # (build prompt, call the LLM, package the RAGResponse). We surface
+        # a clear error here instead of silently returning ``None`` so that
+        # callers know this listing is illustrative rather than complete.
+        raise NotImplementedError(
+            "MultiQueryRAG.query: generation step omitted from the chapter "
+            "listing -- complete by delegating to the base RAGPipeline."
+        )
+
 
 # ============================================================================
 # Block 15 (chapter listing #15)
@@ -1662,7 +1688,12 @@ Respond with only a number between 0.0 and 1.0."""
                 )
 
         # Generate answer with context
-        # ... standard RAG generation
+        # ... standard RAG generation (omitted in the chapter listing).
+        raise NotImplementedError(
+            "SelfRAGPipeline.query: generation step omitted from the chapter "
+            "listing -- complete using the RAGPipeline pattern shown earlier."
+        )
+
 
 # ============================================================================
 # Block 17 (chapter listing #17)

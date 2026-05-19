@@ -983,11 +983,14 @@ Code Navigation (line numbers are approximate):
 from abc import ABC, abstractmethod
 from typing import Optional, Any, Dict, List, Union
 from datetime import timedelta
+import logging
 import redis
 from redis.cluster import RedisCluster
 import json
 import threading
 from functools import lru_cache
+
+_redis_logger = logging.getLogger("agent.cache.redis")
 
 
 class CacheBackend(ABC):
@@ -1043,7 +1046,11 @@ class InMemoryBackend(CacheBackend):
     """
 
     def __init__(self, max_size: int = 10000):
-        self._cache: Dict[str, tuple[Any, float]] = {}  # (value, expires_at)
+        # OrderedDict gives us O(1) LRU: ``move_to_end`` on access,
+        # ``popitem(last=False)`` to evict the least recently used entry.
+        from collections import OrderedDict
+
+        self._cache: "OrderedDict[str, tuple[Any, float]]" = OrderedDict()
         self._max_size = max_size
         self._lock = threading.RLock()
 
@@ -1057,21 +1064,23 @@ class InMemoryBackend(CacheBackend):
                 del self._cache[key]
                 return None
 
+            # Mark this key as most recently used.
+            self._cache.move_to_end(key)
             return value
 
     def set(
         self, key: str, value: Any, ttl: Optional[timedelta] = None
     ) -> bool:
         with self._lock:
-            # Simple FIFO eviction if at capacity (insertion order)
-            # For true LRU, see the section on production caches below.
+            # True LRU eviction: drop the least recently used entry once
+            # capacity is reached.
             if len(self._cache) >= self._max_size and key not in self._cache:
-                # Remove oldest-inserted entry
-                oldest = next(iter(self._cache))
-                del self._cache[oldest]
+                self._cache.popitem(last=False)
 
             expires_at = time.time() + ttl.total_seconds() if ttl else None
             self._cache[key] = (value, expires_at)
+            # Touch on insert so an update keeps the entry "hot".
+            self._cache.move_to_end(key)
             return True
 
     def delete(self, key: str) -> bool:
@@ -1149,7 +1158,11 @@ class RedisBackend(CacheBackend):
         return json.loads(data.decode("utf-8"))
 
     def get(self, key: str) -> Optional[Any]:
-        data = self._client.get(self._prefixed_key(key))
+        try:
+            data = self._client.get(self._prefixed_key(key))
+        except redis.RedisError as exc:
+            _redis_logger.warning("Redis GET failed for %s: %s", key, exc)
+            return None
         if data is None:
             return None
         return self._deserialize(data)
@@ -1159,16 +1172,31 @@ class RedisBackend(CacheBackend):
     ) -> bool:
         serialized = self._serialize(value)
         prefixed = self._prefixed_key(key)
+        ttl_seconds = int(ttl.total_seconds()) if ttl else None
 
-        if ttl:
-            return bool(self._client.setex(prefixed, ttl, serialized))
-        return bool(self._client.set(prefixed, serialized))
+        try:
+            if ttl_seconds:
+                return bool(
+                    self._client.setex(prefixed, ttl_seconds, serialized)
+                )
+            return bool(self._client.set(prefixed, serialized))
+        except redis.RedisError as exc:
+            _redis_logger.warning("Redis SET failed for %s: %s", key, exc)
+            return False
 
     def delete(self, key: str) -> bool:
-        return bool(self._client.delete(self._prefixed_key(key)))
+        try:
+            return bool(self._client.delete(self._prefixed_key(key)))
+        except redis.RedisError as exc:
+            _redis_logger.warning("Redis DELETE failed for %s: %s", key, exc)
+            return False
 
     def exists(self, key: str) -> bool:
-        return bool(self._client.exists(self._prefixed_key(key)))
+        try:
+            return bool(self._client.exists(self._prefixed_key(key)))
+        except redis.RedisError as exc:
+            _redis_logger.warning("Redis EXISTS failed for %s: %s", key, exc)
+            return False
 
     def get_many(self, keys: List[str]) -> Dict[str, Any]:
         if not keys:
@@ -1190,19 +1218,24 @@ class RedisBackend(CacheBackend):
         if not items:
             return True
 
-        pipe = self._client.pipeline()
+        ttl_seconds = int(ttl.total_seconds()) if ttl else None
+        try:
+            pipe = self._client.pipeline()
 
-        for key, value in items.items():
-            prefixed = self._prefixed_key(key)
-            serialized = self._serialize(value)
+            for key, value in items.items():
+                prefixed = self._prefixed_key(key)
+                serialized = self._serialize(value)
 
-            if ttl:
-                pipe.setex(prefixed, ttl, serialized)
-            else:
-                pipe.set(prefixed, serialized)
+                if ttl_seconds:
+                    pipe.setex(prefixed, ttl_seconds, serialized)
+                else:
+                    pipe.set(prefixed, serialized)
 
-        results = pipe.execute()
-        return all(results)
+            results = pipe.execute()
+            return all(results)
+        except redis.RedisError as exc:
+            _redis_logger.warning("Redis pipeline SET failed: %s", exc)
+            return False
 
     def delete_pattern(self, pattern: str) -> int:
         """
@@ -1684,22 +1717,33 @@ class SemanticCache:
     def _evict_lfu(self) -> None:
         """Remove least frequently used entries to make room.
 
-        Sorts by access_count (ascending); among entries with the same
-        access count, the oldest are evicted first. For strict LRU
-        (last-access timestamp), track an ``updated_at`` field and sort
-        by that instead.
+        Uses ``heapq.nsmallest`` to pick the evictees in O(n log k) where
+        ``k`` is the (small) number of entries we plan to evict, instead
+        of sorting the entire entry list each time.
         """
         if not self._entries:
             return
 
         # Remove 10% of entries, preferring low access count
         remove_count = max(1, len(self._entries) // 10)
+        if remove_count >= len(self._entries):
+            self._entries = []
+            return
 
-        # Sort by access count (low first); within ties, oldest first
-        # (smaller created_at). The front of the list is what we evict.
-        self._entries.sort(key=lambda e: (e.access_count, e.created_at))
+        # Select the evictees by (access_count, created_at) ascending.
+        import heapq as _heapq
 
-        self._entries = self._entries[remove_count:]
+        evict_set = set(
+            id(e)
+            for e in _heapq.nsmallest(
+                remove_count,
+                self._entries,
+                key=lambda e: (e.access_count, e.created_at),
+            )
+        )
+        self._entries = [
+            e for e in self._entries if id(e) not in evict_set
+        ]
 
     @property
     def stats(self) -> dict:
