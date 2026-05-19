@@ -66,6 +66,27 @@ class CachedResponse:
     def is_expired(self, ttl: timedelta) -> bool:
         return datetime.now(timezone.utc) - self.created_at > ttl
 
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-safe dict (datetime → ISO 8601 string)."""
+        return {
+            "response": self.response,
+            "model": self.model,
+            "created_at": self.created_at.isoformat(),
+            "token_count": self.token_count,
+            "cache_key": self.cache_key,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CachedResponse":
+        """Inverse of ``to_dict``; restores datetime from ISO 8601."""
+        return cls(
+            response=data["response"],
+            model=data["model"],
+            created_at=datetime.fromisoformat(data["created_at"]),
+            token_count=data["token_count"],
+            cache_key=data["cache_key"],
+        )
+
 
 class LLMResponseCache:
     """
@@ -127,7 +148,7 @@ class LLMResponseCache:
             self._misses += 1
             return None
 
-        cached = CachedResponse(**data)
+        cached = CachedResponse.from_dict(data)
         if cached.is_expired(self.default_ttl):
             self.backend.delete(key)
             self._misses += 1
@@ -160,7 +181,7 @@ class LLMResponseCache:
         )
 
         effective_ttl = ttl or self.default_ttl
-        self.backend.set(key, cached.__dict__, ttl=effective_ttl)
+        self.backend.set(key, cached.to_dict(), ttl=effective_ttl)
 
         return key
 
@@ -182,9 +203,9 @@ class EmbeddingCache:
     """
     Cache for embedding vectors.
 
-    Embeddings are deterministic and never change for a given model,
-    making them perfect cache candidates. The only reason to expire
-    cached embeddings is when the embedding model itself changes.
+    Embeddings are deterministic for a given provider and model version,
+    making them excellent cache candidates. Include the model identifier
+    in the cache key, and invalidate when the provider rolls out a new model version.
     """
 
     def __init__(
@@ -584,7 +605,7 @@ class SemanticKeyGenerator(CacheKeyGenerator):
         """
         # Combine query and context for embedding
         text = f"{query}\n{context}" if context else query
-        embedding = self.embedding_model.embed(text)
+        embedding = self.embedding_model.embed_text(text)
 
         # Quantize embedding to create bucket key
         # This is a simplified approach - production systems
@@ -1447,11 +1468,28 @@ class CacheManager:
 # Block 11 (chapter listing #11)
 # ============================================================================
 
-from typing import Optional, Tuple, List, NamedTuple
+from typing import Optional, Tuple, List, NamedTuple, Protocol, runtime_checkable
 import numpy as np
 from dataclasses import dataclass, field
 import threading
 import heapq
+
+
+@runtime_checkable
+class EmbeddingModel(Protocol):
+    """Structural type for embedding providers.
+
+    Matches the ``EmbeddingModel`` ABC defined in Chapter 3's
+    ``vector_databases`` module so the two chapters interoperate. Any
+    object with these two methods (a concrete OpenAI/local backend, a
+    test double, etc.) is accepted by the caches in this chapter.
+    """
+
+    def embed_text(self, text: str) -> List[float]:
+        ...
+
+    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        ...
 
 
 @dataclass
@@ -1539,7 +1577,7 @@ class SemanticCache:
         """
         # Compute embedding for the query
         text = f"{query}\n{context}" if context else query
-        query_embedding = self.embedding_model.embed(text)
+        query_embedding = self.embedding_model.embed_text(text)
 
         with self._lock:
             # Remove expired entries
@@ -1608,7 +1646,7 @@ class SemanticCache:
             metadata: Optional metadata to store
         """
         text = f"{query}\n{context}" if context else query
-        embedding = self.embedding_model.embed(text)
+        embedding = self.embedding_model.embed_text(text)
 
         entry = SemanticCacheEntry(
             query=query,
@@ -1725,7 +1763,7 @@ class ProductionSemanticCache(SemanticCache):
         Look up query using efficient ANN search.
         """
         text = f"{query}\n{context}" if context else query
-        query_embedding = self.embedding_model.embed(text)
+        query_embedding = self.embedding_model.embed_text(text)
 
         # Normalize for cosine similarity
         query_embedding = query_embedding / np.linalg.norm(query_embedding)
@@ -1787,7 +1825,7 @@ class ProductionSemanticCache(SemanticCache):
     ) -> None:
         """Add entry to cache and index."""
         text = f"{query}\n{context}" if context else query
-        embedding = self.embedding_model.embed(text)
+        embedding = self.embedding_model.embed_text(text)
 
         # Initialize index on first entry
         if self._embedding_dim is None:
@@ -1940,18 +1978,26 @@ class QualityAwareSemanticCacheEntry:
     created_at: float = field(default_factory=time.time)
 
 
-async def semantic_lookup_with_quality(
-    query: str, cache: SemanticCache, min_quality: float = 0.8
-) -> Optional[str]:
-    """Only return cached responses that meet quality threshold."""
-    result = await cache.get(query)
+import logging as _quality_logging
 
-    if result.hit and result.entry.quality_score >= min_quality:
+_quality_logger = _quality_logging.getLogger(__name__)
+
+
+def semantic_lookup_with_quality(
+    query: str, cache: SemanticCache, min_quality: float = 0.95
+) -> Optional[str]:
+    """Only return cached responses whose similarity meets the threshold.
+
+    Higher ``min_quality`` rejects looser matches: 0.95 is a common
+    production floor for paraphrase-grade reuse.
+    """
+    result = cache.get(query)
+
+    if result.hit and result.similarity >= min_quality:
         return result.response
-    elif result.hit and result.entry.quality_score < min_quality:
-        # Log for analysis: we had a hit but quality was too low
-        logger.info(
-            f"Semantic cache hit rejected: quality={result.entry.quality_score}"
+    if result.hit:
+        _quality_logger.info(
+            "Semantic cache hit rejected: similarity=%.3f", result.similarity
         )
     return None
 

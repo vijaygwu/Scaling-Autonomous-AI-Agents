@@ -397,6 +397,8 @@ class PostgresTaskStore:
 # Block 3 (chapter listing #3)
 # ============================================================================
 
+import asyncio
+
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 from botocore.exceptions import ClientError
@@ -1347,9 +1349,9 @@ class CorruptionHandler:
         """Salvage valid portions of corrupted state."""
         recovered = {}
 
-        for field, value in corrupted.items():
-            if self._is_valid_field(field, value):
-                recovered[field] = value
+        for field_name, value in corrupted.items():
+            if self._is_valid_field(field_name, value):
+                recovered[field_name] = value
 
         if recovered:
             # Mark as partially recovered
@@ -1405,6 +1407,7 @@ class CorruptionHandler:
 # Block 10 (chapter listing #10)
 # ============================================================================
 
+import random
 import uuid
 from contextlib import asynccontextmanager
 
@@ -1613,8 +1616,6 @@ class LockTimeout(Exception):
 
     pass
 
-
-import random
 
 # ============================================================================
 # Block 11 (chapter listing #11)
