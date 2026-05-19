@@ -2,7 +2,7 @@
 Complete Example: Customer Service Platform
 
 Code listings from Chapter 05, Book 3:
-"Agentic AI in Production: Scaling and Applying Autonomous Systems"
+"Scaling Autonomous AI Agents: Engineering for Production at Real-World Scale"
 by Dr. Vijay Raghavan
 
 This file faithfully reproduces every code listing from the chapter, in book

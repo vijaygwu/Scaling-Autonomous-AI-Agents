@@ -1,4 +1,4 @@
-# Agentic AI in Production: Scaling and Applying Autonomous Systems
+# Scaling Autonomous AI Agents: Engineering for Production at Real-World Scale
 
 **Companion Code Repository**
 
@@ -10,7 +10,7 @@ by Dr. Vijay Raghavan
 
 ## About This Repository
 
-This repository contains the code listings from *Agentic AI in Production: Scaling and Applying Autonomous Systems* (Book 3). Each chapter has its own directory; inside is a single Python module that reproduces every code listing from that chapter in book order, with section banners showing the block number.
+This repository contains the code listings from *Scaling Autonomous AI Agents: Engineering for Production at Real-World Scale* (Book 3 of the Agentic AI Series). Each chapter has its own directory; inside is a single Python module that reproduces every code listing from that chapter in book order, with section banners showing the block number.
 
 The code is a **faithful extraction** of the in-book listings. Some listings define classes and functions that build incrementally across the chapter; others are illustrative fragments (log output, file trees, Dockerfile snippets, JSON examples) that have been preserved as docstrings so the chapter file always remains valid Python. To run a particular component, copy the relevant class or function into your own project and provide surrounding context (imports, dependencies, configuration) as needed.
 

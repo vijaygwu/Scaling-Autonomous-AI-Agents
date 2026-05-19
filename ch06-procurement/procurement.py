@@ -4,7 +4,7 @@ from __future__ import annotations
 Complete Example: Procurement Automation
 
 Code listings from Chapter 06, Book 3:
-"Agentic AI in Production: Scaling and Applying Autonomous Systems"
+"Scaling Autonomous AI Agents: Engineering for Production at Real-World Scale"
 by Dr. Vijay Raghavan
 
 This file faithfully reproduces every code listing from the chapter, in book

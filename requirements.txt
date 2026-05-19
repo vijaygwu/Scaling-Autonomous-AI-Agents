@@ -1,5 +1,5 @@
-# Companion code for Agentic AI in Production:
-# Scaling and Applying Autonomous Systems (Book 3)
+# Companion code for Scaling Autonomous AI Agents:
+# Engineering for Production at Real-World Scale (Book 3)
 # Python 3.11+ recommended
 
 # LLM SDKs
