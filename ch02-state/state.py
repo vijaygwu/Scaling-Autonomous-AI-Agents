@@ -273,7 +273,16 @@ class PostgresTaskStore:
     @classmethod
     async def create(cls, dsn: str) -> "PostgresTaskStore":
         """Factory method that initializes the schema."""
-        pool = await asyncpg.create_pool(dsn)
+        # Explicit pool sizing + per-command timeout. Defaults give
+        # an unbounded pool with no statement timeout, which can let
+        # a single slow query hold a connection forever and starve
+        # the rest of the agent under load.
+        pool = await asyncpg.create_pool(
+            dsn,
+            min_size=5,
+            max_size=20,
+            command_timeout=10,
+        )
         async with pool.acquire() as conn:
             await conn.execute(cls.SCHEMA)
         return cls(pool)

@@ -99,7 +99,18 @@ class StateManager:
     """Manages externalized agent state in Redis."""
 
     def __init__(self, redis_url: str = "redis://localhost:6379"):
-        self.redis = redis.from_url(redis_url, decode_responses=True)
+        # Explicit timeouts + health-check + bounded pool. The default
+        # ``redis.from_url(...)`` produces a client that blocks
+        # indefinitely on a hung server; in a worker pool that
+        # serializes every state op behind the slowest TCP timeout.
+        self.redis = redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=2,
+            health_check_interval=30,
+            max_connections=50,
+        )
         self.state_ttl = 86400  # 24 hours default
 
     def get_state(self, conversation_id: str) -> Optional[ConversationState]:
@@ -161,10 +172,17 @@ class StatelessAgent:
         return response
 
     def _call_llm(self, messages: list[dict]) -> str:
+        # Anthropic-SDK clients accept ``timeout`` and ``max_retries``
+        # at construction time; surface them here for readers porting
+        # this code so a stalled provider does not block the worker
+        # indefinitely. Production callers should additionally wrap
+        # this in the @with_retry/@with_timeout decorators introduced
+        # in ch05 (customer service) to cap end-to-end latency budgets.
         response = self.llm_client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4096,
             messages=messages,
+            timeout=30.0,  # seconds; aligns with default budget
         )
         return response.content[0].text
 
@@ -464,12 +482,27 @@ class RedisTaskQueue:
         redis_url: str = "redis://localhost:6379",
         queue_name: str = "agent_tasks",
         visibility_timeout: int = 300,  # 5 minutes
+        body_ttl_seconds: int = 7 * 24 * 3600,  # 7 days
     ):
-        self.redis = redis.from_url(redis_url, decode_responses=True)
+        self.redis = redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=2,
+            health_check_interval=30,
+            max_connections=50,
+        )
         self.queue_name = queue_name
         self.processing_queue = f"{queue_name}:processing"
         self.dead_letter_queue = f"{queue_name}:dlq"
         self.visibility_timeout = visibility_timeout
+        # Body TTL must comfortably exceed the worst-case queue
+        # residence (queue depth × visibility timeout + retries).
+        # A 24-hour TTL on the body but multi-day queue residence
+        # causes the id to outlive its body and the dequeue path
+        # returns None silently (work is lost). 7 days is a safer
+        # default; callers with a different SLA should override it.
+        self.body_ttl_seconds = body_ttl_seconds
         self.logger = logging.getLogger(__name__)
 
     def enqueue(self, task: AgentTask) -> str:
@@ -478,7 +511,7 @@ class RedisTaskQueue:
 
         # Store task details
         task_key = f"task:{task.task_id}"
-        self.redis.setex(task_key, 86400, task.to_json())  # 24 hour TTL
+        self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
 
         # Add to queue
         self.redis.lpush(self.queue_name, task.task_id)
@@ -1337,10 +1370,27 @@ class BackpressureQueueConsumer:
                 self.rate_limiter.record_latency(latency_ms)
 
     def _dispatch_task(self, task: AgentTask) -> None:
-        """Dispatch a task to an available worker."""
-        # In a real implementation, this would coordinate with
-        # the worker pool to assign tasks efficiently
-        pass
+        """Re-enqueue the rate-limited task for the worker pool.
+
+        ``WorkerPool`` workers self-pull from ``task_queue``; this
+        consumer's role is to apply backpressure (rate limiting) on
+        top of that. We dequeued the task to check it through the
+        limiter; now we put it back at the head so the next worker
+        picks it up immediately. We also clear its visibility-timeout
+        marker since we never actually started processing it.
+        """
+        q = self.task_queue
+        # Remove from processing list (one occurrence) and clear the
+        # visibility timer.
+        q.redis.lrem(q.processing_queue, 1, task.task_id)
+        q._clear_visibility_timeout(task.task_id)
+        # Re-insert at the head to preserve the rate-limited task's
+        # priority over newer enqueues.
+        q.redis.lpush(q.queue_name, task.task_id)
+        self.logger.debug(
+            "Backpressure dispatch: returned task %s to head of queue",
+            task.task_id,
+        )
 
     def stop(self) -> None:
         """Stop the consumer."""

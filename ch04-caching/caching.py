@@ -1125,27 +1125,36 @@ class RedisBackend(CacheBackend):
     ):
         self.key_prefix = key_prefix
 
+        # Production timeouts: a flaky Redis would otherwise block every
+        # cache lookup behind the default (unbounded) socket timeout.
+        # health_check_interval pings every 30s to evict dead connections
+        # from the pool before they're handed to callers.
+        _common_kw = dict(
+            password=password,
+            decode_responses=False,
+            socket_timeout=1,
+            socket_connect_timeout=1,
+            retry_on_timeout=True,
+            health_check_interval=30,
+        )
         if cluster_mode:
             if cluster_nodes:
                 self._client = RedisCluster(
                     startup_nodes=cluster_nodes,
-                    password=password,
-                    decode_responses=False,
+                    **_common_kw,
                 )
             else:
                 self._client = RedisCluster(
                     host=host,
                     port=port,
-                    password=password,
-                    decode_responses=False,
+                    **_common_kw,
                 )
         else:
             self._client = redis.Redis(
                 host=host,
                 port=port,
                 db=db,
-                password=password,
-                decode_responses=False,
+                **_common_kw,
             )
 
     def _prefixed_key(self, key: str) -> str:

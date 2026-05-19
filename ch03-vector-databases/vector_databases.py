@@ -15,6 +15,8 @@ To use a particular class or function, copy it into your own project and
 provide the surrounding context (imports, dependencies) as needed.
 """
 
+import logging
+
 
 # ============================================================================
 # Block 1 (chapter listing #1)
@@ -294,7 +296,14 @@ class OpenAIEmbedding(EmbeddingModel):
     ):
         from openai import OpenAI
 
-        self.client = OpenAI(api_key=api_key)
+        # Explicit timeout + retries so a stalled provider doesn't hang
+        # embed_text/embed_batch indefinitely; the SDK default is no
+        # bound on the request.
+        self.client = OpenAI(
+            api_key=api_key,
+            timeout=30.0,
+            max_retries=3,
+        )
         self.model = model
         self._dimension = 1536 if "small" in model else 3072
 
@@ -1464,15 +1473,33 @@ Question: {question}
 
 Please answer the question based on the context provided. Cite specific sources when possible."""
 
-        # Generate response
-        response = self.llm_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.1,
-        )
+        # Generate response. We catch provider errors and degrade
+        # rather than letting one transient blip crash the request:
+        # readers building atop this should keep the degraded path so
+        # the agent can return a "retrieval succeeded; generation
+        # failed" response that the caller can inspect.
+        try:
+            response = self.llm_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.1,
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade not crash
+            logging.getLogger(__name__).warning(
+                "RAG generation failed for question=%r: %s", question, exc
+            )
+            return RAGResponse(
+                answer="",
+                sources=results,
+                confidence=0.0,
+                metadata={
+                    "retrieval_count": len(results),
+                    "generation_error": str(exc),
+                },
+            )
 
         answer = response.choices[0].message.content
 
