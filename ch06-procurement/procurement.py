@@ -25,6 +25,7 @@ provide the surrounding context (imports, dependencies) as needed.
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
+import logging
 import time
 
 
@@ -749,8 +750,15 @@ class EventBus:
             for h in self._wildcards.get(prefix, []):
                 try:
                     await h(envelope)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # Wildcard handlers must not break the publish loop;
+                    # surface the failure on the structured logger so
+                    # ops can see the dropped delivery.
+                    logging.getLogger(__name__).warning(
+                        "wildcard handler failed for %s: %s",
+                        envelope.topic if hasattr(envelope, "topic") else "?",
+                        exc,
+                    )
 
     # Backward-compatible alias
     publish = emit

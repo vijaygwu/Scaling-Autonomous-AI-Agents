@@ -1258,14 +1258,23 @@ class IndexMonitor:
             self._query_latencies = self._query_latencies[-1000:]
 
     def get_health(self) -> IndexHealth:
-        """Get current index health metrics."""
+        """Get current index health metrics.
+
+        When no queries have been observed, latency percentiles are
+        reported as NaN rather than 0 so callers can distinguish
+        "no data yet" from "perfectly healthy".
+        """
         stats = self.vector_store.get_stats()
 
-        latencies = (
-            sorted(self._query_latencies) if self._query_latencies else [0]
-        )
-        p50_idx = int(len(latencies) * 0.5)
-        p99_idx = int(len(latencies) * 0.99)
+        if self._query_latencies:
+            latencies = sorted(self._query_latencies)
+            # min() guards against p99 picking an out-of-range index
+            # on small samples (len * 0.99 rounds down).
+            p50 = latencies[min(int(len(latencies) * 0.5), len(latencies) - 1)]
+            p99 = latencies[min(int(len(latencies) * 0.99), len(latencies) - 1)]
+        else:
+            p50 = float("nan")
+            p99 = float("nan")
 
         return IndexHealth(
             total_vectors=stats.get("vector_count", 0),
@@ -1277,8 +1286,8 @@ class IndexMonitor:
                 )
             ),
             fragmentation_ratio=stats.get("fragmentation", 0.0),
-            query_latency_p50_ms=latencies[p50_idx],
-            query_latency_p99_ms=latencies[p99_idx],
+            query_latency_p50_ms=p50,
+            query_latency_p99_ms=p99,
         )
 
     def should_reindex(self) -> Tuple[bool, str]:
@@ -1288,6 +1297,8 @@ class IndexMonitor:
         if health.fragmentation_ratio > 0.3:
             return True, "High fragmentation detected"
 
+        # NaN compares as False in any direction; that's what we want
+        # here ("no data yet" should not trigger a reindex).
         if health.query_latency_p99_ms > 500:
             return True, "Query latency degradation"
 
@@ -1670,7 +1681,7 @@ Code Navigation (line numbers are approximate):
 import os
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 import hashlib
 import json

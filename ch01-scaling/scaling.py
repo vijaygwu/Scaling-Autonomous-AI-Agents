@@ -1691,7 +1691,7 @@ from contextlib import contextmanager
 from typing import Generator
 import threading
 import time
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 
 class ConnectionPool:
@@ -1762,8 +1762,19 @@ class ConnectionPool:
                     with self.lock:
                         self.size -= 1
             else:
-                # Caller exited cleanly; safe to recycle.
-                self.pool.put(conn)
+                # Caller exited cleanly; safe to recycle. Bounded
+                # timeout matches the get path: an indefinitely
+                # blocked put would mask backend regressions.
+                try:
+                    self.pool.put(conn, timeout=self.connection_timeout)
+                except Full:
+                    # Pool already at capacity (shouldn't happen with
+                    # max_connections, but defensive): drop the connection.
+                    try:
+                        conn.close()
+                    finally:
+                        with self.lock:
+                            self.size -= 1
 
     def close_all(self) -> None:
         """Close all connections in the pool."""
