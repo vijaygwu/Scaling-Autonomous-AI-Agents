@@ -1573,6 +1573,15 @@ class SemanticCache:
     Unlike exact-match caching, semantic caching can return cached
     responses for queries that are semantically similar but not
     identical to previously seen queries.
+
+    Production note: ``get`` does a Python-level linear scan over
+    ``_entries`` under a lock. That is fine for the demonstrative
+    sizes used in this chapter (max_entries=10000 by default), but
+    serializes the cache lookup behind one CPU per hot key under
+    real QPS. For deployments above roughly 1k entries or above a
+    few hundred QPS, switch to ``ProductionSemanticCache`` (defined
+    below) which backs the lookup with a FAISS index for O(log n)
+    approximate nearest-neighbor search.
     """
 
     def __init__(

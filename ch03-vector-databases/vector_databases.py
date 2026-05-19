@@ -1289,16 +1289,26 @@ class IndexHealth:
 class IndexMonitor:
     """Monitor vector index health and performance."""
 
+    LATENCY_WINDOW = 1000
+
     def __init__(self, vector_store: "VectorStore"):
+        from collections import deque
+        import threading
+
         self.vector_store = vector_store
-        self._query_latencies: List[float] = []
+        # ``deque(maxlen=N)`` evicts in O(1) and is bounded
+        # automatically; the prior list + slice trim was O(n) per
+        # append past 1000 and not thread-safe under concurrent
+        # ``record_query_latency`` from multiple worker threads.
+        self._query_latencies: deque[float] = deque(
+            maxlen=self.LATENCY_WINDOW
+        )
+        self._latency_lock = threading.Lock()
 
     def record_query_latency(self, latency_ms: float):
         """Record a query latency measurement."""
-        self._query_latencies.append(latency_ms)
-        # Keep last 1000 measurements
-        if len(self._query_latencies) > 1000:
-            self._query_latencies = self._query_latencies[-1000:]
+        with self._latency_lock:
+            self._query_latencies.append(latency_ms)
 
     def get_health(self) -> IndexHealth:
         """Get current index health metrics.
@@ -1309,8 +1319,13 @@ class IndexMonitor:
         """
         stats = self.vector_store.get_stats()
 
-        if self._query_latencies:
-            latencies = sorted(self._query_latencies)
+        # Snapshot under the lock so concurrent record_query_latency
+        # cannot mutate the deque while we sort it.
+        with self._latency_lock:
+            snapshot = list(self._query_latencies)
+
+        if snapshot:
+            latencies = sorted(snapshot)
             # min() guards against p99 picking an out-of-range index
             # on small samples (len * 0.99 rounds down).
             p50 = latencies[min(int(len(latencies) * 0.5), len(latencies) - 1)]
@@ -1890,7 +1905,14 @@ class QdrantVectorStore(VectorStore):
         }
 
     def get_ids_by_metadata(self, filter: Dict[str, Any]) -> set:
-        """Get all IDs matching metadata filter."""
+        """Get all IDs matching metadata filter.
+
+        Pages through Qdrant's scroll cursor until exhausted. The
+        previous implementation passed ``limit=10000`` and read only
+        the first page, which silently truncated large collections
+        and let downstream updates/deletes leak orphaned vectors.
+        Page size 1024 balances round-trip overhead against memory.
+        """
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
         conditions = [
@@ -1898,14 +1920,20 @@ class QdrantVectorStore(VectorStore):
             for k, v in filter.items()
         ]
 
-        results = self.client.scroll(
-            collection_name=self.collection_name,
-            scroll_filter=Filter(must=conditions),
-            limit=10000,
-            with_payload=False,
-        )[0]
-
-        return {str(r.id) for r in results}
+        ids: set[str] = set()
+        next_offset = None
+        while True:
+            points, next_offset = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(must=conditions),
+                limit=1024,
+                offset=next_offset,
+                with_payload=False,
+            )
+            ids.update(str(p.id) for p in points)
+            if next_offset is None:
+                break
+        return ids
 
 
 @dataclass

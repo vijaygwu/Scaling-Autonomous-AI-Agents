@@ -358,23 +358,34 @@ class PostgresTaskStore:
         new_status: TaskStatus,
         error_message: Optional[str] = None,
     ) -> bool:
-        """Transition task to new status."""
+        """Transition task to new status.
+
+        ``completed_at`` is bound as a parameter rather than spliced
+        into the SQL string. The previous f-string variant was safe
+        because ``new_status`` was always an enum value, but a future
+        refactor that lets the status come from outside the enum
+        would turn this into a SQL-injection vector. Parameterizing
+        eliminates the class of bug entirely.
+        """
+        completed_at = (
+            datetime.now(timezone.utc)
+            if new_status == TaskStatus.COMPLETED
+            else None
+        )
         async with self._pool.acquire() as conn:
-            completed_at = (
-                "NOW()" if new_status == TaskStatus.COMPLETED else "NULL"
-            )
             result = await conn.execute(
-                f"""
-                UPDATE task_state 
+                """
+                UPDATE task_state
                 SET status = $2,
                     updated_at = NOW(),
-                    completed_at = {completed_at},
+                    completed_at = $4,
                     error_message = $3
                 WHERE task_id = $1
                 """,
                 task_id,
                 new_status.value,
                 error_message,
+                completed_at,
             )
             return result == "UPDATE 1"
 
