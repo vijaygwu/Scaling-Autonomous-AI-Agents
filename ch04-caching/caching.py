@@ -1129,8 +1129,15 @@ class RedisBackend(CacheBackend):
         cluster_mode: bool = False,
         cluster_nodes: Optional[List[dict]] = None,
         key_prefix: str = "agent:",
+        metrics: Optional[Any] = None,
     ):
         self.key_prefix = key_prefix
+        # Optional metrics sink with an ``increment(name, tags=...)``
+        # method (statsd / OpenTelemetry / Datadog all expose this
+        # shape). If supplied, Redis-error paths bump a counter so
+        # ops dashboards can alert on degraded cache. Without it, the
+        # logger.warning calls below carry the signal alone.
+        self._metrics = metrics
 
         # Production timeouts: a flaky Redis would otherwise block every
         # cache lookup behind the default (unbounded) socket timeout.
@@ -1178,6 +1185,7 @@ class RedisBackend(CacheBackend):
             data = self._client.get(self._prefixed_key(key))
         except redis.RedisError as exc:
             _redis_logger.warning("Redis GET failed for %s: %s", key, exc)
+            self._bump_error_metric("get")
             return None
         if data is None:
             return None
@@ -1198,6 +1206,7 @@ class RedisBackend(CacheBackend):
             return bool(self._client.set(prefixed, serialized))
         except redis.RedisError as exc:
             _redis_logger.warning("Redis SET failed for %s: %s", key, exc)
+            self._bump_error_metric("set")
             return False
 
     def delete(self, key: str) -> bool:
@@ -1205,6 +1214,7 @@ class RedisBackend(CacheBackend):
             return bool(self._client.delete(self._prefixed_key(key)))
         except redis.RedisError as exc:
             _redis_logger.warning("Redis DELETE failed for %s: %s", key, exc)
+            self._bump_error_metric("delete")
             return False
 
     def exists(self, key: str) -> bool:
@@ -1212,7 +1222,24 @@ class RedisBackend(CacheBackend):
             return bool(self._client.exists(self._prefixed_key(key)))
         except redis.RedisError as exc:
             _redis_logger.warning("Redis EXISTS failed for %s: %s", key, exc)
+            self._bump_error_metric("exists")
             return False
+
+    def _bump_error_metric(self, op: str) -> None:
+        """Increment an error counter on the optional metrics sink.
+
+        Distinguishing 'cache miss' from 'cache backend broken' matters
+        for SLO reasoning: a sudden swing in the error rate is a paging
+        signal, while a miss-rate swing is a load-pattern signal.
+        Both currently look the same to callers (get returns None).
+        """
+        if self._metrics is None:
+            return
+        try:
+            self._metrics.increment("cache.redis.error", tags={"op": op})
+        except Exception:  # noqa: BLE001
+            # Metrics sink must not itself fail the cache path.
+            pass
 
     def get_many(self, keys: List[str]) -> Dict[str, Any]:
         if not keys:
@@ -1253,6 +1280,10 @@ class RedisBackend(CacheBackend):
             _redis_logger.warning("Redis pipeline SET failed: %s", exc)
             return False
 
+    # Cap DEL batches so a single SCAN cursor that returns thousands
+    # of matches cannot block Redis with one huge DEL command.
+    DELETE_BATCH_SIZE = 500
+
     def delete_pattern(self, pattern: str) -> int:
         """
         Delete keys matching a pattern.
@@ -1260,6 +1291,11 @@ class RedisBackend(CacheBackend):
         Warning: SCAN can be slow on large datasets.
         Consider using Redis modules or different data structures
         for better pattern-based operations.
+
+        Per-DEL is capped at ``DELETE_BATCH_SIZE`` so a single
+        SCAN-cursor result with thousands of matches is broken into
+        smaller DELs; a single DEL of 100K+ keys blocks Redis enough
+        to fail health checks on a hot path.
         """
         prefixed_pattern = self._prefixed_key(pattern)
         count = 0
@@ -1269,8 +1305,10 @@ class RedisBackend(CacheBackend):
             cursor, keys = self._client.scan(
                 cursor, match=prefixed_pattern, count=100
             )
-            if keys:
-                count += self._client.delete(*keys)
+            for i in range(0, len(keys), self.DELETE_BATCH_SIZE):
+                batch = keys[i : i + self.DELETE_BATCH_SIZE]
+                if batch:
+                    count += self._client.delete(*batch)
             if cursor == 0:
                 break
 
@@ -1591,12 +1629,19 @@ class SemanticCache:
     approximate nearest-neighbor search.
     """
 
+    # Above this size, the Python linear scan in ``get`` becomes a
+    # production hazard: every lookup walks every entry under one lock.
+    # Callers configuring ``max_entries`` beyond this threshold get a
+    # loud warning pointing them at ``ProductionSemanticCache``.
+    LINEAR_SCAN_CUTOVER_ENTRIES = 1000
+
     def __init__(
         self,
         embedding_model: "EmbeddingModel",
         similarity_threshold: float = 0.95,
         max_entries: int = 10000,
         ttl: timedelta = timedelta(hours=24),
+        linear_scan_ok: bool = False,
     ):
         """
         Initialize semantic cache.
@@ -1606,11 +1651,31 @@ class SemanticCache:
             similarity_threshold: Minimum similarity for cache hit (0.0-1.0)
             max_entries: Maximum number of entries to store
             ttl: Time-to-live for cache entries
+            linear_scan_ok: Acknowledge the O(n) lookup cost when
+                ``max_entries`` exceeds the cutover threshold. Subclasses
+                that replace ``get`` with an indexed lookup
+                (``ProductionSemanticCache``) set this to True.
         """
         self.embedding_model = embedding_model
         self.similarity_threshold = similarity_threshold
         self.max_entries = max_entries
         self.ttl = ttl
+
+        if max_entries > self.LINEAR_SCAN_CUTOVER_ENTRIES and not linear_scan_ok:
+            import warnings
+            warnings.warn(
+                f"SemanticCache configured with max_entries={max_entries} "
+                f"exceeds LINEAR_SCAN_CUTOVER_ENTRIES="
+                f"{self.LINEAR_SCAN_CUTOVER_ENTRIES}. "
+                "The base SemanticCache.get does a Python linear scan "
+                "over all entries under a single lock; at this size it "
+                "will serialize lookups behind one CPU per hot key. "
+                "Use ProductionSemanticCache (FAISS-backed, defined "
+                "below) instead, or pass linear_scan_ok=True to "
+                "acknowledge the cost.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         self._entries: List[SemanticCacheEntry] = []
         self._lock = threading.RLock()
@@ -1822,6 +1887,9 @@ class ProductionSemanticCache(SemanticCache):
             similarity_threshold=similarity_threshold,
             max_entries=max_entries,
             ttl=ttl,
+            # FAISS-backed lookup is sublinear, so the parent's
+            # linear-scan warning would be a false alarm here.
+            linear_scan_ok=True,
         )
 
         self.backend = backend
@@ -2309,6 +2377,21 @@ class ScheduledCacheWarmer:
     def stop(self) -> None:
         """Stop the scheduled warmer."""
         self._stop_event.set()
+
+    def start_in_background(self) -> threading.Thread:
+        """Run ``start()`` in a daemon thread; return the thread handle.
+
+        Convenience entry point for single-process agents that want a
+        background warmer without managing the thread themselves.
+        For multi-process deployments prefer APScheduler, Celery beat,
+        or a Kubernetes CronJob (already noted in ``start``).
+        """
+        import threading
+        t = threading.Thread(
+            target=self.start, daemon=True, name="cache-warmer"
+        )
+        t.start()
+        return t
 
     def _run_warming(self) -> None:
         """Execute the warming routine."""
