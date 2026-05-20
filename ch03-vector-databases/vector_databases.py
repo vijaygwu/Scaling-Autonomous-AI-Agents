@@ -264,7 +264,7 @@ if False:  # pragma: no cover -- illustrative; requires pgvector-enabled Postgre
 # ============================================================================
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 import numpy as np
 
 

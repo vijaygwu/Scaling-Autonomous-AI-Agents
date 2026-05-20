@@ -334,9 +334,12 @@ class LeastConnectionsBalancer:
                 return None
 
             # Calculate weighted connection count
-            # Lower is better: connections / weight
+            # Lower is better: connections / weight. ``max(w.weight, 1e-9)``
+            # guards against a caller registering a worker with weight=0,
+            # which would otherwise ZeroDivisionError mid-request.
             return min(
-                healthy_workers, key=lambda w: w.active_connections / w.weight
+                healthy_workers,
+                key=lambda w: w.active_connections / max(w.weight, 1e-9),
             )
 
     def mark_request_start(self, worker_id: str) -> None:
