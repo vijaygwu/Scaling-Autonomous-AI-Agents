@@ -315,12 +315,21 @@ class OpenAIEmbedding(EmbeddingModel):
         response = self.client.embeddings.create(model=self.model, input=text)
         return response.data[0].embedding
 
+    # Conservative per-request batch size. OpenAI accepts up to 2048
+    # inputs but also caps total tokens per batch (~300K), and very large
+    # batches inflate p99 latency. 100 keeps round-trip latency
+    # predictable and stays well inside any per-batch token budget.
+    EMBED_BATCH_SIZE = 100
+
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        # OpenAI supports batching up to 2048 texts
-        response = self.client.embeddings.create(
-            model=self.model, input=texts
-        )
-        return [item.embedding for item in response.data]
+        out: List[List[float]] = []
+        for i in range(0, len(texts), self.EMBED_BATCH_SIZE):
+            chunk = texts[i : i + self.EMBED_BATCH_SIZE]
+            response = self.client.embeddings.create(
+                model=self.model, input=chunk
+            )
+            out.extend(item.embedding for item in response.data)
+        return out
 
 
 class SentenceTransformerEmbedding(EmbeddingModel):
@@ -648,10 +657,17 @@ class SemanticChunker(DocumentChunker):
         the dot product since ||a|| = ||b|| = 1. This measures the angular
         distance between vectors, making it ideal for semantic similarity
         where direction matters more than magnitude.
+
+        Returns 0.0 when either input has effectively-zero norm so a
+        buggy embedding model that emits a zero vector doesn't poison
+        downstream chunking decisions with NaN.
         """
         a = np.array(vec1)
         b = np.array(vec2)
-        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if denom < np.finfo(float).eps:
+            return 0.0
+        return float(np.dot(a, b) / denom)
 
     def chunk(self, document: Document) -> List[DocumentChunk]:
         # First, split into sentences
@@ -1590,6 +1606,21 @@ class MultiQueryRAG(RAGPipeline):
         if not expand_queries:
             return super().query(question, top_k, **kwargs)
 
+        # Fail FAST before spending retrieval tokens. Expansion + per-variant
+        # retrieval are not free: query_expander.expand() issues an LLM call,
+        # and each variant then triggers N embedding + search calls. If the
+        # generation step is not wired up (this listing omits it), we want
+        # the caller to learn that BEFORE paying for retrieval, not after.
+        if not hasattr(self, "_generate_answer"):
+            raise NotImplementedError(
+                "MultiQueryRAG.query is a chapter sketch: the generation "
+                "step is intentionally omitted. To use this class, "
+                "subclass and override ``_generate_answer(results, question)`` "
+                "with your provider's chat-completion call. Refusing to "
+                "expand and retrieve now so we do not burn embedding "
+                "API quota on a path that has no generation wired."
+            )
+
         # Expand query
         queries = self.query_expander.expand(question)
 
@@ -1607,18 +1638,12 @@ class MultiQueryRAG(RAGPipeline):
         # Re-rank combined results
         all_results.sort(key=lambda x: x.score, reverse=True)
 
-        # Continue with standard RAG pipeline
+        # Continue with standard RAG pipeline. ``_generate_answer`` is the
+        # extension point subclasses provide; the hasattr guard above
+        # ensures it exists by the time we reach this point.
         results = self._truncate_context(all_results[: top_k * 2])
         context = self._format_context(results)
-
-        # The rest of the generation logic mirrors the base RAGPipeline.query
-        # (build prompt, call the LLM, package the RAGResponse). We surface
-        # a clear error here instead of silently returning ``None`` so that
-        # callers know this listing is illustrative rather than complete.
-        raise NotImplementedError(
-            "MultiQueryRAG.query: generation step omitted from the chapter "
-            "listing -- complete by delegating to the base RAGPipeline."
-        )
+        return self._generate_answer(results, context, question)
 
 
 # ============================================================================
@@ -1728,6 +1753,23 @@ Respond with only a number between 0.0 and 1.0."""
     def query(self, question: str, top_k: int = 5) -> RAGResponse:
         """Execute self-evaluated RAG query."""
 
+        # Fail FAST before spending decision/retrieval/evaluation tokens.
+        # _needs_retrieval and _evaluate_relevance each issue LLM calls;
+        # the retrieval itself triggers embedding + search. If the
+        # generation step is not wired up (this listing omits it),
+        # learn that BEFORE paying for any of the upstream work.
+        if not hasattr(self, "_generate_answer"):
+            raise NotImplementedError(
+                "SelfRAGPipeline.query is a chapter sketch: the "
+                "generation step is intentionally omitted. To use this "
+                "class, subclass and override "
+                "``_generate_answer(results, question)`` with your "
+                "provider's chat-completion call. Refusing to run the "
+                "needs-retrieval probe + retrieval + relevance probe "
+                "now so we do not burn LLM quota on a path that has "
+                "no final generation wired."
+            )
+
         # Check if retrieval is needed
         if not self._needs_retrieval(question):
             # Answer directly without retrieval
@@ -1757,12 +1799,10 @@ Respond with only a number between 0.0 and 1.0."""
                     query=question, top_k=top_k * 2
                 )
 
-        # Generate answer with context
-        # ... standard RAG generation (omitted in the chapter listing).
-        raise NotImplementedError(
-            "SelfRAGPipeline.query: generation step omitted from the chapter "
-            "listing -- complete using the RAGPipeline pattern shown earlier."
-        )
+        # Generate answer with context using the subclass's hook.
+        # The hasattr guard at function entry ensures _generate_answer
+        # exists by the time we reach this point.
+        return self._generate_answer(results, question)
 
 
 # ============================================================================
@@ -1912,7 +1952,12 @@ class QdrantVectorStore(VectorStore):
         info = self.client.get_collection(self.collection_name)
         return {
             "vector_count": info.points_count,
-            "size_bytes": info.payload_schema,
+            # Qdrant's Python client does not expose disk byte size
+            # directly; the previous version mislabeled payload_schema
+            # (a dict of field types) as size_bytes. Surface both
+            # fields with their real names instead.
+            "payload_schema": info.payload_schema,
+            "size_bytes": None,
             "last_updated": datetime.now(timezone.utc).isoformat(),
         }
 
