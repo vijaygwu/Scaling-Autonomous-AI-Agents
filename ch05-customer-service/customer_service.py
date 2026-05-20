@@ -1791,29 +1791,123 @@ class BaseAgent(ABC):
         # Build messages for LLM
         messages = self._build_messages(conversation, user_message)
 
-        try:
-            response = await self.llm_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=(
-                    self.config.max_tokens
-                    if hasattr(self.config, "max_tokens")
-                    else 2048
-                ),
-                system=self.system_prompt,
-                tools=self.get_tool_schemas(),
-                messages=messages,
-            )
+        # Specific-exception handling: a blanket ``except Exception``
+        # turns every transient provider blip into a wasted human-review
+        # slot. Distinguish (a) transient infrastructure errors that
+        # warrant a single retry within this turn, (b) permanent
+        # caller-side errors (auth, malformed request) that must
+        # escalate without retry, and (c) genuine unknowns.
+        max_transient_retries = 1
+        backoff_seconds = 1.5
+        last_exc: Optional[Exception] = None
 
-            return await self._process_response(response, conversation)
+        for attempt in range(max_transient_retries + 1):
+            try:
+                response = await self.llm_client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=(
+                        self.config.max_tokens
+                        if hasattr(self.config, "max_tokens")
+                        else 2048
+                    ),
+                    system=self.system_prompt,
+                    tools=self.get_tool_schemas(),
+                    messages=messages,
+                )
+                return await self._process_response(response, conversation)
 
-        except Exception as e:
-            logger.error(f"Agent {self.agent_type} error: {e}")
-            return AgentResponse(
-                message="I apologize, but I'm having a technical issue. Let me connect you with someone who can help.",
-                agent_type=self.agent_type,
-                should_escalate=True,
-                escalation_reason=f"Agent error: {str(e)}",
-            )
+            except (
+                anthropic.APITimeoutError,
+                anthropic.RateLimitError,
+                anthropic.APIConnectionError,
+                asyncio.TimeoutError,
+            ) as exc:
+                # Transient infrastructure: one retry, then escalate as
+                # an infra problem so the human reviewer knows it was
+                # not a user-facing failure.
+                last_exc = exc
+                if attempt < max_transient_retries:
+                    logger.warning(
+                        "Transient LLM error in %s (attempt %d/%d): %s",
+                        self.agent_type, attempt + 1,
+                        max_transient_retries + 1, exc,
+                    )
+                    await asyncio.sleep(backoff_seconds * (2 ** attempt))
+                    continue
+                logger.warning(
+                    "Transient retries exhausted for %s: %s",
+                    self.agent_type, exc,
+                )
+                return AgentResponse(
+                    message=(
+                        "Our system is briefly slow. Let me connect you "
+                        "with a colleague who can continue helping."
+                    ),
+                    agent_type=self.agent_type,
+                    should_escalate=True,
+                    escalation_reason=(
+                        f"Infrastructure timeout/rate-limit: "
+                        f"{type(exc).__name__}"
+                    ),
+                )
+
+            except anthropic.AuthenticationError as exc:
+                # Permanent: no point retrying or burning a human slot;
+                # alert ops by re-raising so the surrounding error path
+                # surfaces this as a deployment problem.
+                logger.exception(
+                    "Auth error in %s; surfacing to ops: %s",
+                    self.agent_type, exc,
+                )
+                raise
+
+            except anthropic.BadRequestError as exc:
+                # Permanent 4xx (e.g., context too long after history
+                # append). Escalate with the specific reason rather
+                # than retry the same request.
+                logger.warning(
+                    "Permanent 4xx in %s: %s", self.agent_type, exc,
+                )
+                return AgentResponse(
+                    message=(
+                        "I'm having trouble with this request. "
+                        "Connecting you with a human agent who can help."
+                    ),
+                    agent_type=self.agent_type,
+                    should_escalate=True,
+                    escalation_reason=(
+                        f"Bad request {exc.status_code}: {exc}"
+                    ),
+                )
+
+            except Exception as exc:  # noqa: BLE001
+                # Genuine unknown: log full stack trace and escalate
+                # generically, but don't retry (we don't know if it's
+                # safe to repeat).
+                logger.exception(
+                    "Unhandled error in %s: %s", self.agent_type, exc,
+                )
+                return AgentResponse(
+                    message=(
+                        "I apologize, but I'm having a technical issue. "
+                        "Let me connect you with someone who can help."
+                    ),
+                    agent_type=self.agent_type,
+                    should_escalate=True,
+                    escalation_reason=f"Unhandled: {type(exc).__name__}",
+                )
+
+        # Defensive: loop should always return; surface explicit error.
+        logger.error(
+            "process_message retry loop exited without return for %s: %s",
+            self.agent_type, last_exc,
+        )
+        return AgentResponse(
+            message="Connecting you with a human agent.",
+            agent_type=self.agent_type,
+            should_escalate=True,
+            escalation_reason="Exhausted retries with no result",
+        )
 
     def _build_messages(
         self, conversation: Conversation, user_message: str
