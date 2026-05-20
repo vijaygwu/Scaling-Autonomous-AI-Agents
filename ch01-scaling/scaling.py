@@ -1081,7 +1081,9 @@ class WorkerPool:
             if len(self.workers) >= self.max_workers:
                 return None
 
-            worker_id = f"worker-{len(self.workers) + 1}-{int(time.time())}"
+            # uuid4 (not ``len(workers)``) so removed-then-re-added
+            # workers do not collide with surviving ones.
+            worker_id = f"worker-{uuid.uuid4().hex[:8]}"
             agent = self.agent_factory()
 
             worker = AgentWorker(
@@ -1315,8 +1317,15 @@ class AdaptiveRateLimiter:
                     self.tokens -= 1.0
                     return True
 
-            # Wait a bit before retrying
-            time.sleep(0.01)
+                # Wait at least until the next token would be ready.
+                # Sleeping outside the lock so other threads can refill
+                # in parallel; capped by the remaining timeout.
+                if self.current_rate > 0:
+                    next_token_in = (1.0 - self.tokens) / self.current_rate
+                else:
+                    next_token_in = 0.05
+            wait = max(0.001, min(next_token_in, timeout - (time.time() - start)))
+            time.sleep(wait)
 
         return False
 

@@ -958,8 +958,15 @@ class CacheInvalidator:
                 for listener in self._listeners:
                     try:
                         listener(k)
-                    except Exception:
-                        pass  # Don't let listener errors break invalidation
+                    except Exception as exc:  # noqa: BLE001
+                        # Don't let one bad listener break invalidation
+                        # for the rest, but surface the failure rather
+                        # than silently swallowing it.
+                        _log = __import__("logging").getLogger(__name__)
+                        _log.warning(
+                            "Cache invalidator listener %r failed for key %r: %s",
+                            getattr(listener, "__qualname__", listener), k, exc,
+                        )
 
         return count
 
@@ -2252,16 +2259,21 @@ class ScheduledCacheWarmer:
     def __init__(
         self, warmer: CacheWarmer, schedule: str = "0 3 * * *"  # 3 AM daily
     ):
+        import threading
+
         self.warmer = warmer
         self.schedule = schedule
-        self._running = False
+        # ``threading.Event`` instead of a polled boolean so stop()
+        # interrupts the sleep promptly instead of waiting up to 60s
+        # for the next loop iteration to notice _running=False.
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
         """Start the scheduled warmer.
 
         Blocking call -- run this in a dedicated worker thread or a
         sidecar process. Do NOT call from an asyncio event loop;
-        ``time.sleep`` here would block all coroutines.
+        the Event.wait here would still block all coroutines.
 
         In production, prefer a proper scheduler (APScheduler, Celery beat,
         or a Kubernetes CronJob) instead of an in-process loop.
@@ -2269,15 +2281,17 @@ class ScheduledCacheWarmer:
         import schedule as sched
 
         sched.every().day.at("03:00").do(self._run_warming)
-        self._running = True
+        self._stop_event.clear()
 
-        while self._running:
+        while not self._stop_event.is_set():
             sched.run_pending()
-            time.sleep(60)
+            # Event.wait interrupts cleanly on stop(); plain sleep
+            # would force a full 60s shutdown delay.
+            self._stop_event.wait(timeout=60)
 
     def stop(self) -> None:
         """Stop the scheduled warmer."""
-        self._running = False
+        self._stop_event.set()
 
     def _run_warming(self) -> None:
         """Execute the warming routine."""

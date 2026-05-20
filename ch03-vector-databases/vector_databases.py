@@ -2093,19 +2093,34 @@ class KnowledgeBase:
     def bulk_import(
         self, documents: List[KnowledgeDocument], batch_size: int = 10
     ) -> Dict[str, int]:
-        """Import multiple documents efficiently."""
+        """Import multiple documents efficiently.
+
+        ``add_document`` rebuilds the BM25 index on every call. For
+        bulk import we suppress that rebuild and run it once at the
+        end (O(N) instead of O(N^2)). Failures are logged with stack
+        traces via ``logger.exception`` rather than printed.
+        """
         stats = {"total": len(documents), "chunks": 0, "failed": 0}
 
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i : i + batch_size]
-
-            for doc in batch:
-                try:
-                    chunks_added = self.add_document(doc)
-                    stats["chunks"] += chunks_added
-                except Exception as e:
-                    stats["failed"] += 1
-                    print(f"Failed to import {doc.document_id}: {e}")
+        # Defer keyword-index rebuilds; one rebuild at the end suffices.
+        prior_rebuild = self._rebuild_keyword_index
+        self._rebuild_keyword_index = lambda: None
+        try:
+            for i in range(0, len(documents), batch_size):
+                batch = documents[i : i + batch_size]
+                for doc in batch:
+                    try:
+                        chunks_added = self.add_document(doc)
+                        stats["chunks"] += chunks_added
+                    except Exception:
+                        stats["failed"] += 1
+                        logging.getLogger(__name__).exception(
+                            "Failed to import document %s", doc.document_id
+                        )
+        finally:
+            self._rebuild_keyword_index = prior_rebuild
+        # Single rebuild covering all newly-added chunks.
+        self._rebuild_keyword_index()
 
         return stats
 

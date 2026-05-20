@@ -1597,7 +1597,18 @@ class SharedStateCoordinator:
         """
 
         result = await self._store._redis.eval(script, 1, lock_key, owner_id)
-        return result == 1
+        released = result == 1
+        if not released:
+            # Either the lock had already expired, or another owner is
+            # holding it. Either way, surface it on the structured
+            # logger so ops can see the unexpected release attempt.
+            import logging
+            logging.getLogger(__name__).warning(
+                "release_lock no-op for resource=%s owner=%s "
+                "(lock expired or owned by someone else)",
+                resource_id, owner_id,
+            )
+        return released
 
     async def read(self, resource_id: str) -> Optional[dict[str, Any]]:
         """Read shared state."""

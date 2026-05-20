@@ -66,16 +66,32 @@ class MultiModalAgent:
         self.vision_encoder = vision_encoder
         self.audio_encoder = audio_encoder
 
+    # Size limits to prevent attacker-supplied payloads from OOMing
+    # the encoder. Real deployments should tighten these against
+    # observed traffic profiles.
+    MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
+    MAX_AUDIO_BYTES = 50 * 1024 * 1024  # 50 MiB
+
     def perceive(self, turn: MultiModalInput) -> dict[str, Any]:
         """Convert raw modalities into model-ready representations."""
         perception: dict[str, Any] = {}
         if turn.text:
             perception["text"] = turn.text
         if turn.image_bytes and self.vision_encoder is not None:
+            if len(turn.image_bytes) > self.MAX_IMAGE_BYTES:
+                raise ValueError(
+                    f"image_bytes exceeds MAX_IMAGE_BYTES "
+                    f"({len(turn.image_bytes)} > {self.MAX_IMAGE_BYTES})"
+                )
             perception["image_embedding"] = self.vision_encoder.encode(
                 turn.image_bytes
             )
         if turn.audio_bytes and self.audio_encoder is not None:
+            if len(turn.audio_bytes) > self.MAX_AUDIO_BYTES:
+                raise ValueError(
+                    f"audio_bytes exceeds MAX_AUDIO_BYTES "
+                    f"({len(turn.audio_bytes)} > {self.MAX_AUDIO_BYTES})"
+                )
             perception["audio_embedding"] = self.audio_encoder.encode(
                 turn.audio_bytes
             )

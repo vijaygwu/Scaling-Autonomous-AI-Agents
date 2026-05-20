@@ -446,6 +446,7 @@ import json
 import logging
 import functools
 import asyncio
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -543,7 +544,33 @@ class Tool(ABC):
 
 
 def with_retry(max_attempts: int = 3, backoff_seconds: float = 1.0):
-    """Decorator for retrying failed tool executions."""
+    """Decorator for retrying failed tool executions.
+
+    Only retries on transient failures (timeouts, connection errors,
+    5xx upstream responses). Permanent errors (4xx HTTP statuses,
+    authentication failures, validation errors) are raised
+    immediately so the caller doesn't waste its retry budget on a
+    request the server will never accept.
+    """
+
+    # Errors that are worth retrying. httpx raises ReadTimeout /
+    # ConnectTimeout / ConnectError; non-2xx responses surface as
+    # HTTPStatusError after raise_for_status().
+    _retryable_classes: tuple = (
+        asyncio.TimeoutError,
+        httpx.TimeoutException,
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+    )
+
+    def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, _retryable_classes):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            # 5xx is server-side transient; 4xx is client-side
+            # permanent (auth, validation, rate-limit-shape).
+            return 500 <= exc.response.status_code < 600
+        return False
 
     def decorator(func: Callable):
         @functools.wraps(func)
@@ -554,6 +581,9 @@ def with_retry(max_attempts: int = 3, backoff_seconds: float = 1.0):
                     return await func(*args, **kwargs)
                 except Exception as e:
                     last_error = e
+                    if not _is_retryable(e):
+                        # Permanent: don't waste retries on it.
+                        raise
                     if attempt < max_attempts - 1:
                         await asyncio.sleep(backoff_seconds * (2**attempt))
                         logger.warning(
