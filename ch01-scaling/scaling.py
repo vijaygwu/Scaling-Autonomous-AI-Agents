@@ -1954,14 +1954,24 @@ class PriorityTaskQueue:
     """
     Task queue with priority levels.
 
-    Note: The dequeue loop checking multiple queues is not atomic. Under high
-    concurrency, tasks may be processed slightly out of priority order. For
-    strict priority guarantees, use Redis Streams with consumer groups or a
-    Lua script to atomically pop from the highest-priority non-empty queue.
+    Note: the dequeue loop below checks multiple queues and is
+    not atomic. Under high concurrency, tasks may be processed
+    slightly out of priority order. For strict priority guarantees,
+    use Redis Streams with consumer groups or a Lua script to pop
+    atomically from the highest-priority non-empty queue.
     """
 
     def __init__(self, redis_url: str):
-        self.redis = redis.from_url(redis_url, decode_responses=True)
+        # Same production timeouts as RedisTaskQueue; a flaky Redis
+        # would otherwise hang priority dequeue indefinitely.
+        self.redis = redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=2,
+            health_check_interval=30,
+            max_connections=50,
+        )
         self.queues = {
             "critical": "tasks:critical",
             "high": "tasks:high",
@@ -1969,10 +1979,15 @@ class PriorityTaskQueue:
             "low": "tasks:low",
         }
 
-    def enqueue(self, task: AgentTask, priority: str = "normal") -> None:
-        queue_name = self.queues.get(priority, self.queues["normal"])
+    def enqueue(
+        self, task: AgentTask, priority: str = "normal"
+    ) -> None:
+        queue_name = self.queues.get(
+            priority, self.queues["normal"]
+        )
         self.redis.lpush(queue_name, task.task_id)
-        self.redis.setex(f"task:{task.task_id}", 86400, task.to_json())
+        task_key = f"task:{task.task_id}"
+        self.redis.setex(task_key, 86400, task.to_json())
 
     def dequeue(self, timeout: int = 5) -> Optional[AgentTask]:
         # Check queues in priority order
@@ -1984,7 +1999,8 @@ class PriorityTaskQueue:
                     return AgentTask.from_json(data)
 
         # Fall back to blocking pop on normal queue
-        result = self.redis.brpop(list(self.queues.values()), timeout=timeout)
+        queues = list(self.queues.values())
+        result = self.redis.brpop(queues, timeout=timeout)
 
         if result:
             _, task_id = result
