@@ -1638,8 +1638,19 @@ class SemanticCache:
         query_embedding = self.embedding_model.embed_text(text)
 
         with self._lock:
-            # Remove expired entries
-            self._evict_expired()
+            # Amortize eviction: scanning all entries on every ``get``
+            # turns each lookup into O(n) cleanup. Instead, sweep only
+            # every ``_evict_interval`` calls; expired entries that
+            # remain in the meantime are filtered by ``is_expired``
+            # inside the similarity loop below.
+            self._gets_since_evict = (
+                getattr(self, "_gets_since_evict", 0) + 1
+            )
+            if self._gets_since_evict >= getattr(
+                self, "_evict_interval", 100
+            ):
+                self._evict_expired()
+                self._gets_since_evict = 0
 
             if not self._entries:
                 self._misses += 1
@@ -1657,7 +1668,13 @@ class SemanticCache:
             best_entry = None
             best_similarity = -1.0
 
+            cutoff = time.time() - self.ttl.total_seconds()
             for entry in self._entries:
+                # Skip expired entries inline since we no longer evict
+                # on every get. The next periodic _evict_expired will
+                # actually remove them from _entries.
+                if entry.created_at < cutoff:
+                    continue
                 similarity = entry.similarity(query_embedding)
                 if similarity > best_similarity:
                     best_similarity = similarity

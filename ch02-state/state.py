@@ -902,10 +902,15 @@ class TaskCheckpointer:
         task_store: PostgresTaskStore,
         checkpoint_interval: int = 30,  # seconds
         max_checkpoints_per_task: int = 10,
+        max_pending: int = 1000,
     ):
         self._store = task_store
         self._interval = checkpoint_interval
         self._max_checkpoints = max_checkpoints_per_task
+        # Cap on how many checkpoints _flush_all writes in one batch.
+        # Excess entries stay queued and flush in the next iteration,
+        # so a stalled backend cannot let memory grow without bound.
+        self._max_pending = max_pending
         self._pending_checkpoints: dict[str, Checkpoint] = {}
         self._checkpoint_task: Optional[asyncio.Task] = None
 
@@ -1000,17 +1005,44 @@ class TaskCheckpointer:
         return None
 
     async def _flush_loop(self) -> None:
-        """Background loop to flush pending checkpoints."""
+        """Background loop to flush pending checkpoints.
+
+        Catches per-flush exceptions so one failure doesn't silently
+        kill the loop and stop all subsequent checkpointing. Each
+        failure is logged with a counter; the loop continues until
+        the task is cancelled.
+        """
+        _log = __import__("logging").getLogger(__name__)
         while True:
-            await asyncio.sleep(self._interval)
-            await self._flush_all()
+            try:
+                await asyncio.sleep(self._interval)
+                await self._flush_all()
+            except asyncio.CancelledError:
+                # Cooperative shutdown: re-raise so the caller's
+                # ``stop()`` semantics still work.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                _log.exception(
+                    "Checkpoint flush failed; continuing loop: %s", exc
+                )
 
     async def _flush_all(self) -> None:
-        """Flush all pending checkpoints to storage."""
-        pending = list(self._pending_checkpoints.items())
-        self._pending_checkpoints.clear()
+        """Flush all pending checkpoints to storage.
 
-        for task_id, checkpoint in pending:
+        Caps the in-flight batch at ``_max_pending`` so a long backend
+        stall cannot let pending checkpoints grow without bound between
+        flushes. Excess entries are kept for the next iteration (FIFO
+        by insertion order in the underlying dict).
+        """
+        # Take a bounded slice; leave excess for the next flush.
+        pending_items = list(self._pending_checkpoints.items())
+        batch = pending_items[: self._max_pending]
+        # Remove only what we are about to flush; entries that arrive
+        # mid-flush stay queued for the next interval.
+        for task_id, _ in batch:
+            self._pending_checkpoints.pop(task_id, None)
+
+        for task_id, checkpoint in batch:
             await self._store.update_checkpoint(task_id, checkpoint.state)
 
     async def _flush_task(self, task_id: str) -> None:
@@ -2179,6 +2211,23 @@ class ConversationRecoveryPipeline:
                 return False
 
         return True
+
+    async def _query_audit_events(
+        self, conversation_id: str
+    ) -> list[dict]:
+        """Return ordered audit events for a conversation.
+
+        Default implementation: look up events on the optional
+        ``audit_store`` the pipeline was constructed with. Real
+        deployments inject a store backed by their audit log
+        (Postgres, OpenSearch, etc.); the in-memory fallback below
+        keeps the example runnable without that wiring.
+        """
+        store = getattr(self, "audit_store", None)
+        if store is not None and hasattr(store, "events_for"):
+            events = await store.events_for(conversation_id)
+            return list(events) if events else []
+        return []
 
     async def _reconstruct_from_audit(
         self, conversation_id: str

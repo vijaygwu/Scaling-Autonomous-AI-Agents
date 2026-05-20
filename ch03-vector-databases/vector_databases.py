@@ -324,12 +324,24 @@ class OpenAIEmbedding(EmbeddingModel):
 
 
 class SentenceTransformerEmbedding(EmbeddingModel):
-    """Local embedding using Sentence Transformers."""
+    """Local embedding using Sentence Transformers.
 
-    def __init__(self, model_name: str = "BAAI/bge-large-en-v1.5"):
+    Loads the model in ``__init__``; for ``BAAI/bge-large-en-v1.5`` this
+    is roughly 1.3 GiB of weights resident per process. Run one
+    instance per worker pool, not one per request. Pass ``device='cpu'``
+    on CPU-only hosts, ``'cuda'``/``'cuda:0'``/etc. on GPU hosts, or
+    ``'mps'`` on Apple silicon; on shared-GPU machines pin to a
+    specific index to avoid contention with sibling workers.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-large-en-v1.5",
+        device: Optional[str] = None,
+    ):
         from sentence_transformers import SentenceTransformer
 
-        self.model = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(model_name, device=device)
         self._dimension = self.model.get_sentence_embedding_dimension()
 
     @property

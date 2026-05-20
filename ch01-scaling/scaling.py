@@ -194,7 +194,17 @@ class VersionedStateManager:
     """State manager with optimistic locking for conflict detection."""
 
     def __init__(self, redis_url: str = "redis://localhost:6379"):
-        self.redis = redis.from_url(redis_url, decode_responses=True)
+        # Mirror StateManager's production timeouts/pool; a flaky Redis
+        # would otherwise wedge every version check behind the default
+        # unbounded socket timeout.
+        self.redis = redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=2,
+            health_check_interval=30,
+            max_connections=50,
+        )
 
     def get_state_with_version(
         self, conversation_id: str
@@ -550,7 +560,7 @@ class RedisTaskQueue:
         task.attempt += 1
 
         # Update task status
-        self.redis.setex(task_key, 86400, task.to_json())
+        self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
 
         # Set visibility timeout
         self._set_visibility_timeout(task_id)
@@ -563,7 +573,7 @@ class RedisTaskQueue:
         task.result = result
 
         task_key = f"task:{task.task_id}"
-        self.redis.setex(task_key, 86400, task.to_json())
+        self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
 
         # Remove from processing queue
         self.redis.lrem(self.processing_queue, 1, task.task_id)
@@ -579,7 +589,7 @@ class RedisTaskQueue:
             # Requeue for retry
             task.status = TaskStatus.RETRYING
             task_key = f"task:{task.task_id}"
-            self.redis.setex(task_key, 86400, task.to_json())
+            self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
 
             # Remove from processing and re-enqueue. The submit path uses
             # lpush + a right-side dequeue (BLMOVE from RIGHT), giving FIFO
@@ -597,7 +607,7 @@ class RedisTaskQueue:
             # Move to dead letter queue
             task.status = TaskStatus.FAILED
             task_key = f"task:{task.task_id}"
-            self.redis.setex(task_key, 86400, task.to_json())
+            self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
 
             self.redis.lrem(self.processing_queue, 1, task.task_id)
             self.redis.lpush(self.dead_letter_queue, task.task_id)
@@ -1682,8 +1692,16 @@ class ShardedStateManager:
         # Initialize connections to each shard
         self.redis_clients: dict[int, redis.Redis] = {}
         for shard in shards:
+            # Same production timeouts/pool as StateManager. With
+            # potentially dozens of shards, the default unbounded
+            # client would multiply hang risk across the cluster.
             self.redis_clients[shard.shard_id] = redis.from_url(
-                shard.redis_url, decode_responses=True
+                shard.redis_url,
+                decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=2,
+                health_check_interval=30,
+                max_connections=50,
             )
 
     def _get_shard_id(self, key: str) -> int:
@@ -1859,12 +1877,42 @@ agent = StatelessAgent(state_manager, client)
 
 @app.post("/chat")
 async def chat(conversation_id: str, message: str):
-    response = agent.process_message(conversation_id, message)
+    # ``agent.process_message`` is synchronous (it issues blocking
+    # Redis + Anthropic SDK calls). Calling it directly from an async
+    # endpoint would block the event loop and serialize every concurrent
+    # request through a single thread. ``asyncio.to_thread`` hands it
+    # off to the default ThreadPoolExecutor so the loop can serve other
+    # requests while this one waits on I/O.
+    response = await asyncio.to_thread(
+        agent.process_message, conversation_id, message
+    )
     return {"response": response}
 
 # ============================================================================
 # Block 17 (chapter listing #17)
 # ============================================================================
+
+async def wait_for_result(
+    task_id: str, timeout: float = 60.0, poll_interval: float = 0.5
+) -> Optional[str]:
+    """Poll Redis for a completed task result with bounded waiting.
+
+    Returns the task's ``result`` once it lands or None on timeout.
+    In production prefer pub/sub or webhooks (one round-trip), but
+    polling is the simplest pattern that demonstrates the contract.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        raw = await asyncio.to_thread(task_queue.redis.get, f"task:{task_id}")
+        if raw:
+            task = AgentTask.from_json(raw)
+            if task.status == TaskStatus.COMPLETED:
+                return task.result
+            if task.status == TaskStatus.FAILED:
+                return None
+        await asyncio.sleep(poll_interval)
+    return None
+
 
 @app.post("/chat")
 async def chat(conversation_id: str, message: str):

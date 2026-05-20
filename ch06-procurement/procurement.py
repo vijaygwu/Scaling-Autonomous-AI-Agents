@@ -782,10 +782,16 @@ class EventBus:
         for h in self._exact.get(topic, []):
             try:
                 await h(envelope)
-            except Exception:
-                # Never let one subscriber block others.
-                # Production: log + send to a DLQ.
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Never let one subscriber block others, but surface
+                # the failure on the structured logger so dropped
+                # deliveries are observable. Production: also push
+                # to a DLQ.
+                logging.getLogger(__name__).warning(
+                    "exact-match subscriber failed for %s: %s",
+                    envelope.get("topic", "?"),
+                    exc,
+                )
         # Wildcard subscribers: walk every prefix of topic
         parts = topic.split(".")
         for i in range(1, len(parts) + 1):
@@ -1619,6 +1625,17 @@ class ApprovalAgent:
                 status="info_requested", reason=notes
             )
 
+        # Default: explicit failure on unknown decision strings.
+        # Previously this branch silently returned ``None``, so a
+        # typo'd decision (e.g. "approve" instead of "approved") would
+        # propagate to the orchestrator as a missing result and
+        # crash on attribute access.
+        raise ApprovalError(
+            f"Unknown decision '{decision}' for request "
+            f"{request.id}; expected one of "
+            f"approved/rejected/request_info"
+        )
+
     async def _check_auto_approval(
         self, request: PurchaseRequest, context: ProcessingContext
     ) -> AutoApprovalResult:
@@ -1677,7 +1694,19 @@ class ProcurementOrchestrator:
         self.approval = ApprovalAgent()
         self.fulfillment = FulfillmentAgent()
 
-        self.requests: dict[str, PurchaseRequest] = {}
+        # In-memory hot cache of recent requests. Bounded so a
+        # long-running orchestrator cannot OOM on accumulated state;
+        # the durable copy lives in your purchase-request store
+        # (mentioned in the audit-log note on PurchaseRequest above).
+        self.requests: "OrderedDict[str, PurchaseRequest]" = (
+            __import__("collections").OrderedDict()
+        )
+        self._max_in_memory_requests = 10_000
+        # Per-request context map: submit_request stashes the
+        # ProcessingContext under request.id so handle_approval_decision
+        # can recover the same identity/budget/contract services
+        # instead of constructing an empty ProcessingContext().
+        self._contexts: dict[str, "ProcessingContext"] = {}
         self.event_bus = EventBus()
         self.metrics = OrchestratorMetrics()
 
@@ -1697,9 +1726,18 @@ class ProcurementOrchestrator:
             },
         ) as span:
 
-            # Store request
+            # Store request + processing context for later phases
+            # (approval decisions arrive asynchronously and need the
+            # same identity/budget/contract services that submitted).
             self.requests[request.id] = request
+            self._contexts[request.id] = context
             self.metrics.increment("requests_submitted")
+            # Bound the in-memory hot cache. ``OrderedDict.popitem(
+            # last=False)`` evicts the oldest insertion; the request
+            # itself remains durable in your purchase-request store.
+            while len(self.requests) > self._max_in_memory_requests:
+                evicted_id, _ = self.requests.popitem(last=False)
+                self._contexts.pop(evicted_id, None)
 
             await self.event_bus.emit(
                 "request.submitted",
@@ -1862,8 +1900,17 @@ class ProcurementOrchestrator:
             )
 
             if result.status == "fully_approved":
-                # Proceed to fulfillment
-                context = ProcessingContext()  # Build context
+                # Proceed to fulfillment. Recover the ProcessingContext
+                # stashed during submit_request so fulfillment runs
+                # with the real identity/budget/contract services
+                # instead of an empty context that would fail every
+                # downstream lookup.
+                context = self._contexts.get(request_id)
+                if context is None:
+                    raise ApprovalError(
+                        f"Cannot fulfill request {request_id}: "
+                        f"ProcessingContext was not preserved from intake"
+                    )
                 fulfillment_result = await self.fulfillment.process(
                     request, context
                 )
