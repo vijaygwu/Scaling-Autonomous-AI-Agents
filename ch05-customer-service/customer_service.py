@@ -29,7 +29,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
+import inspect
 import uuid
 
 
@@ -89,10 +90,10 @@ class Customer:
     # Cap in-memory recent-order summary; full history lives in the
     # orders service. Callers should treat ``recent_orders`` as a
     # display window, not a complete audit log.
-    recent_orders: deque = field(
+    recent_orders: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=20)
     )
-    preferences: dict = field(default_factory=dict)
+    preferences: dict[str, Any] = field(default_factory=dict)
 
     @property
     def priority(self) -> Priority:
@@ -116,7 +117,7 @@ class Message:
     content: str
     timestamp: datetime
     agent_type: Optional[AgentType] = None
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -143,22 +144,22 @@ class ConversationContext:
     customer: Customer
     intent: Optional[str] = None
     intent_confidence: float = 0.0
-    extracted_entities: dict = field(default_factory=dict)
+    extracted_entities: dict[str, Any] = field(default_factory=dict)
     current_agent: Optional[AgentType] = None
     # Bound both lists so a long-running conversation cannot exhaust
     # memory. Per-conversation handoffs and tool calls rarely exceed
     # these caps; if you need full history, persist to the conversation
     # store rather than holding it in process.
-    previous_agents: deque = field(
+    previous_agents: deque[AgentType] = field(
         default_factory=lambda: deque(maxlen=10)
     )
-    tool_results: deque = field(
+    tool_results: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=50)
     )
     escalation_reason: Optional[str] = None
     sentiment_score: float = 0.0  # -1 to 1
 
-    def add_tool_result(self, tool_name: str, result: dict):
+    def add_tool_result(self, tool_name: str, result: dict[str, Any]):
         """Record a tool execution result."""
         self.tool_results.append(
             {
@@ -173,6 +174,8 @@ class ConversationContext:
 class Conversation:
     """Complete conversation state."""
 
+    MAX_IN_MEMORY_MESSAGES = 200
+
     conversation_id: str
     channel: ConversationChannel
     status: ConversationStatus
@@ -186,6 +189,7 @@ class Conversation:
     )
     resolved_at: Optional[datetime] = None
     quality_score: Optional[float] = None
+    turn_count: int = 0
 
     @classmethod
     def create(
@@ -206,6 +210,8 @@ class Conversation:
             self.conversation_id, role, content, agent_type
         )
         self.messages.append(message)
+        if len(self.messages) > self.MAX_IN_MEMORY_MESSAGES:
+            del self.messages[: -self.MAX_IN_MEMORY_MESSAGES]
         self.updated_at = datetime.now(timezone.utc)
         return message
 
@@ -307,6 +313,7 @@ class AgentConfig:
     max_turns: int = 10
     confidence_threshold: float = 0.7
     escalation_threshold: int = 3  # Failed attempts before escalation
+    timeout_seconds: float = 30.0
     tools: list[str] = field(default_factory=list)
     system_prompt_template: str = ""
 
@@ -321,6 +328,8 @@ class IntegrationConfig:
     orders_api_key: str = ""
     payments_base_url: str = ""
     payments_api_key: str = ""
+    knowledge_base_url: str = ""
+    knowledge_base_api_key: str = ""
     ticketing_base_url: str = ""
     ticketing_api_key: str = ""
 
@@ -333,6 +342,8 @@ class IntegrationConfig:
             orders_api_key=os.getenv("ORDERS_API_KEY", ""),
             payments_base_url=os.getenv("PAYMENTS_BASE_URL", ""),
             payments_api_key=os.getenv("PAYMENTS_API_KEY", ""),
+            knowledge_base_url=os.getenv("KNOWLEDGE_BASE_URL", ""),
+            knowledge_base_api_key=os.getenv("KNOWLEDGE_BASE_API_KEY", ""),
             ticketing_base_url=os.getenv("TICKETING_BASE_URL", ""),
             ticketing_api_key=os.getenv("TICKETING_API_KEY", ""),
         )
@@ -346,6 +357,7 @@ class QualityConfig:
     max_handle_time_seconds: int = 480
     sample_rate_for_review: float = 0.1
     sentiment_alert_threshold: float = -0.5
+    assessment_timeout_seconds: float = 30.0
 
     @classmethod
     def from_env(cls) -> "QualityConfig":
@@ -357,6 +369,9 @@ class QualityConfig:
             sample_rate_for_review=float(os.getenv("SAMPLE_RATE", "0.1")),
             sentiment_alert_threshold=float(
                 os.getenv("SENTIMENT_ALERT", "-0.5")
+            ),
+            assessment_timeout_seconds=float(
+                os.getenv("QA_ASSESSMENT_TIMEOUT", "30")
             ),
         )
 
@@ -534,11 +549,28 @@ class Tool(ABC):
 
     def validate_params(self, **kwargs) -> Optional[str]:
         """Validate parameters against definition. Returns error message if invalid."""
+        type_checks = {
+            "string": lambda value: isinstance(value, str),
+            "integer": lambda value: isinstance(value, int)
+            and not isinstance(value, bool),
+            "number": lambda value: isinstance(value, (int, float))
+            and not isinstance(value, bool),
+            "boolean": lambda value: isinstance(value, bool),
+            "array": lambda value: isinstance(value, list),
+            "object": lambda value: isinstance(value, dict),
+        }
         for param in self.definition.parameters:
             if param.required and param.name not in kwargs:
                 return f"Missing required parameter: {param.name}"
-            if param.name in kwargs and param.enum:
-                if kwargs[param.name] not in param.enum:
+            if param.name in kwargs:
+                value = kwargs[param.name]
+                check = type_checks.get(param.type)
+                if check and not check(value):
+                    return (
+                        f"Invalid type for {param.name}. "
+                        f"Expected {param.type}"
+                    )
+                if param.enum and value not in param.enum:
                     return f"Invalid value for {param.name}. Must be one of: {param.enum}"
         return None
 
@@ -553,11 +585,17 @@ def with_retry(max_attempts: int = 3, backoff_seconds: float = 1.0):
     request the server will never accept.
     """
 
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
     # Errors that are worth retrying. httpx raises ReadTimeout /
     # ConnectTimeout / ConnectError; non-2xx responses surface as
     # HTTPStatusError after raise_for_status().
     _retryable_classes: tuple = (
         asyncio.TimeoutError,
+        TimeoutError,
+        ConnectionError,
+        OSError,
         httpx.TimeoutException,
         httpx.ConnectError,
         httpx.RemoteProtocolError,
@@ -579,7 +617,7 @@ def with_retry(max_attempts: int = 3, backoff_seconds: float = 1.0):
             for attempt in range(max_attempts):
                 try:
                     return await func(*args, **kwargs)
-                except Exception as e:
+                except (*_retryable_classes, httpx.HTTPStatusError) as e:
                     last_error = e
                     if not _is_retryable(e):
                         # Permanent: don't waste retries on it.
@@ -692,6 +730,8 @@ class OrderStatusTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             if e.response.status_code == 404:
                 return ToolResult(
                     success=False,
@@ -750,48 +790,77 @@ class ModifyOrderTool(Tool):
             audit_level="detailed",
         )
 
+    @with_retry(max_attempts=3, backoff_seconds=0.25)
     @with_timeout(15.0)
     async def execute(
         self, order_id: str, action: str, details: dict
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
-
-        # First check if order can be modified
-        check_response = await self.client.get(f"/orders/{order_id}")
-        if check_response.status_code == 404:
-            return ToolResult(
-                success=False, data=None, error=f"Order {order_id} not found"
-            )
-
-        order = check_response.json()
-        if order["status"] in ["shipped", "in_transit", "delivered"]:
+        if not isinstance(details, dict):
             return ToolResult(
                 success=False,
                 data=None,
-                error=f"Cannot modify order in '{order['status']}' status. Please initiate a return instead.",
+                error="details must be an object",
             )
+        if action == "update_address" and not details:
+            return ToolResult(
+                success=False,
+                data=None,
+                error="update_address requires address details",
+            )
+        if action == "cancel_item" and not details.get("item_id"):
+            return ToolResult(
+                success=False,
+                data=None,
+                error="cancel_item requires details.item_id",
+            )
+        if action not in {"update_address", "cancel_item", "cancel_order"}:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=f"Unknown action: {action}",
+            )
+        idempotency_key = details.get("idempotency_key") or (
+            f"modify:{order_id}:{action}:"
+            f"{json.dumps(details, sort_keys=True, default=str)}"
+        )
+        headers = {"Idempotency-Key": idempotency_key}
 
         try:
+            # First check if order can be modified
+            check_response = await self.client.get(f"/orders/{order_id}")
+            if check_response.status_code == 404:
+                return ToolResult(
+                    success=False, data=None, error=f"Order {order_id} not found"
+                )
+            check_response.raise_for_status()
+
+            order = check_response.json()
+            if order["status"] in ["shipped", "in_transit", "delivered"]:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=f"Cannot modify order in '{order['status']}' status. Please initiate a return instead.",
+                )
+
             if action == "update_address":
                 response = await self.client.patch(
-                    f"/orders/{order_id}/address", json=details
+                    f"/orders/{order_id}/address",
+                    json=details,
+                    headers=headers,
                 )
             elif action == "cancel_item":
                 response = await self.client.delete(
-                    f"/orders/{order_id}/items/{details['item_id']}"
+                    f"/orders/{order_id}/items/{details['item_id']}",
+                    headers=headers,
                 )
-            elif action == "cancel_order":
+            else:
                 response = await self.client.post(
                     f"/orders/{order_id}/cancel",
                     json={
                         "reason": details.get("reason", "Customer requested")
                     },
-                )
-            else:
-                return ToolResult(
-                    success=False,
-                    data=None,
-                    error=f"Unknown action: {action}",
+                    headers=headers,
                 )
 
             response.raise_for_status()
@@ -811,6 +880,8 @@ class ModifyOrderTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             return ToolResult(
                 success=False,
                 data=None,
@@ -860,11 +931,17 @@ class InitiateReturnTool(Tool):
                     description="Additional details about the return reason",
                     required=False,
                 ),
+                ToolParameter(
+                    name="idempotency_key",
+                    type="string",
+                    description="Stable unique key for this return request",
+                ),
             ],
             requires_confirmation=True,
             audit_level="detailed",
         )
 
+    @with_retry(max_attempts=3, backoff_seconds=0.25)
     @with_timeout(20.0)
     async def execute(
         self,
@@ -872,37 +949,48 @@ class InitiateReturnTool(Tool):
         reason: str,
         item_ids: list = None,
         reason_details: str = None,
+        idempotency_key: Optional[str] = None,
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
-
-        # Check order eligibility
-        order_response = await self.client.get(f"/orders/{order_id}")
-        if order_response.status_code == 404:
-            return ToolResult(
-                success=False, data=None, error=f"Order {order_id} not found"
-            )
-
-        order = order_response.json()
-
-        # Check return window (30 days from delivery)
-        if order["status"] != "delivered":
+        if not idempotency_key:
             return ToolResult(
                 success=False,
                 data=None,
-                error=f"Cannot return order in '{order['status']}' status. Order must be delivered first.",
-            )
-
-        delivery_date = datetime.fromisoformat(
-            order["delivered_at"].replace("Z", "+00:00")
-        )
-        if datetime.now(timezone.utc) - delivery_date > timedelta(days=30):
-            return ToolResult(
-                success=False,
-                data=None,
-                error="Return window has expired (30 days from delivery)",
+                error=(
+                    "idempotency_key is required for return side effects; "
+                    "derive it from the conversation action id"
+                ),
             )
 
         try:
+            # Check order eligibility
+            order_response = await self.client.get(f"/orders/{order_id}")
+            if order_response.status_code == 404:
+                return ToolResult(
+                    success=False, data=None, error=f"Order {order_id} not found"
+                )
+            order_response.raise_for_status()
+
+            order = order_response.json()
+
+            # Check return window (30 days from delivery)
+            if order["status"] != "delivered":
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=f"Cannot return order in '{order['status']}' status. Order must be delivered first.",
+                )
+
+            delivery_date = datetime.fromisoformat(
+                order["delivered_at"].replace("Z", "+00:00")
+            )
+            if datetime.now(timezone.utc) - delivery_date > timedelta(days=30):
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error="Return window has expired (30 days from delivery)",
+                )
+
             return_request = {
                 "order_id": order_id,
                 "item_ids": item_ids
@@ -911,7 +999,11 @@ class InitiateReturnTool(Tool):
                 "reason_details": reason_details,
             }
 
-            response = await self.client.post("/returns", json=return_request)
+            response = await self.client.post(
+                "/returns",
+                json=return_request,
+                headers={"Idempotency-Key": idempotency_key},
+            )
             response.raise_for_status()
             return_data = response.json()
 
@@ -932,6 +1024,8 @@ class InitiateReturnTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             return ToolResult(
                 success=False,
                 data=None,
@@ -1013,6 +1107,8 @@ class TrackShipmentTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             if e.response.status_code == 404:
                 return ToolResult(
                     success=False,
@@ -1055,6 +1151,7 @@ class GetAccountBalanceTool(Tool):
             audit_level="standard",
         )
 
+    @with_retry(max_attempts=3, backoff_seconds=0.25)
     @with_timeout(10.0)
     async def execute(self, customer_id: str) -> ToolResult:
         start = datetime.now(timezone.utc)
@@ -1089,6 +1186,8 @@ class GetAccountBalanceTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             return ToolResult(
                 success=False,
                 data=None,
@@ -1135,11 +1234,19 @@ class ProcessRefundTool(Tool):
                         "goodwill",
                     ],
                 ),
+                ToolParameter(
+                    name="idempotency_key",
+                    type="string",
+                    description=(
+                        "Stable unique key for this logical refund operation"
+                    ),
+                ),
             ],
             requires_confirmation=True,
             audit_level="detailed",
         )
 
+    @with_retry(max_attempts=3, backoff_seconds=0.5)
     @with_timeout(30.0)
     async def execute(
         self,
@@ -1157,6 +1264,7 @@ class ProcessRefundTool(Tool):
             return ToolResult(
                 success=False, data=None, error=f"Order {order_id} not found"
             )
+        order_response.raise_for_status()
 
         order = order_response.json()
         max_refundable = order["total"] - order.get("refunded_amount", 0)
@@ -1168,13 +1276,14 @@ class ProcessRefundTool(Tool):
                 error=f"Refund amount ({amount}) exceeds maximum refundable ({max_refundable})",
             )
 
-        # Idempotency key must be unique per logical refund operation. Two
-        # legitimate partial refunds of the same amount and reason for the
-        # same order must NOT collide; callers supply their own key or we
-        # generate a fresh uuid-bearing one.
         if not idempotency_key:
-            idempotency_key = (
-                f"{order_id}-{amount}-{reason}-{uuid.uuid4()}"
+            return ToolResult(
+                success=False,
+                data=None,
+                error=(
+                    "idempotency_key is required for refund side effects; "
+                    "derive it from the conversation action id"
+                ),
             )
 
         try:
@@ -1207,6 +1316,8 @@ class ProcessRefundTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             return ToolResult(
                 success=False,
                 data=None,
@@ -1241,6 +1352,7 @@ class GetPaymentHistoryTool(Tool):
             audit_level="standard",
         )
 
+    @with_retry(max_attempts=3, backoff_seconds=0.25)
     @with_timeout(10.0)
     async def execute(self, customer_id: str, limit: int = 10) -> ToolResult:
         start = datetime.now(timezone.utc)
@@ -1286,6 +1398,8 @@ class GetPaymentHistoryTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             return ToolResult(
                 success=False,
                 data=None,
@@ -1341,6 +1455,7 @@ class SearchKnowledgeBaseTool(Tool):
             audit_level="minimal",
         )
 
+    @with_retry(max_attempts=3, backoff_seconds=0.25)
     @with_timeout(10.0)
     async def execute(
         self,
@@ -1390,6 +1505,8 @@ class SearchKnowledgeBaseTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             return ToolResult(
                 success=False,
                 data=None,
@@ -1489,6 +1606,8 @@ class RunDiagnosticTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             return ToolResult(
                 success=False, data=None, error=f"Diagnostic failed: {e}"
             )
@@ -1531,6 +1650,7 @@ class IdentifyCustomerTool(Tool):
             audit_level="detailed",
         )
 
+    @with_retry(max_attempts=3, backoff_seconds=0.25)
     @with_timeout(10.0)
     async def execute(
         self, identifier: str, identifier_type: str = None
@@ -1585,6 +1705,8 @@ class IdentifyCustomerTool(Tool):
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
             return ToolResult(
                 success=False, data=None, error=f"Customer lookup failed: {e}"
             )
@@ -1617,6 +1739,7 @@ class ClassifyIntentTool(Tool):
             audit_level="standard",
         )
 
+    @with_retry(max_attempts=3, backoff_seconds=0.25)
     @with_timeout(10.0)
     async def execute(
         self, message: str, conversation_context: str = None
@@ -1686,10 +1809,10 @@ Respond with JSON only:
             return ToolResult(
                 success=True,
                 data={
-                    "intent": result["intent"],
-                    "confidence": result["confidence"],
+                    "intent": str(result["intent"]),
+                    "confidence": float(result["confidence"]),
                     "recommended_agent": intent_to_agent.get(
-                        result["intent"], "triage"
+                        str(result["intent"]), "triage"
                     ),
                     "entities": result.get("entities", {}),
                     "sentiment": result.get("sentiment", 0.0),
@@ -1697,11 +1820,11 @@ Respond with JSON only:
                 execution_time_ms=execution_time,
             )
 
-        except Exception as e:
+        except (KeyError, TypeError, ValueError) as e:
             return ToolResult(
                 success=False,
                 data=None,
-                error=f"Intent classification failed: {e}",
+                error=f"Intent classification response invalid: {e}",
             )
 
 # ============================================================================
@@ -1785,7 +1908,7 @@ class BaseAgent(ABC):
         """Process a user message and generate a response."""
         # Per-conversation turn count (rather than per-agent) so a
         # shared agent does not bleed counts across conversations.
-        conversation.turn_count = getattr(conversation, "turn_count", 0) + 1
+        conversation.turn_count += 1
 
         # Check turn limit
         if conversation.turn_count > self.config.max_turns:
@@ -1797,7 +1920,7 @@ class BaseAgent(ABC):
             )
 
         # Build messages for LLM
-        messages = self._build_messages(conversation, user_message)
+        messages = await self._build_messages(conversation, user_message)
 
         # Specific-exception handling: a blanket ``except Exception``
         # turns every transient provider blip into a wasted human-review
@@ -1809,20 +1932,25 @@ class BaseAgent(ABC):
         backoff_seconds = 1.5
         last_exc: Optional[Exception] = None
 
+        response = None
         for attempt in range(max_transient_retries + 1):
             try:
-                response = await self.llm_client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=(
-                        self.config.max_tokens
-                        if hasattr(self.config, "max_tokens")
-                        else 2048
+                response = await asyncio.wait_for(
+                    self.llm_client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=(
+                            self.config.max_tokens
+                            if hasattr(self.config, "max_tokens")
+                            else 2048
+                        ),
+                        system=self.system_prompt,
+                        tools=self.get_tool_schemas(),
+                        messages=messages,
+                        timeout=self.config.timeout_seconds,
                     ),
-                    system=self.system_prompt,
-                    tools=self.get_tool_schemas(),
-                    messages=messages,
+                    timeout=self.config.timeout_seconds,
                 )
-                return await self._process_response(response, conversation)
+                break
 
             except (
                 anthropic.APITimeoutError,
@@ -1888,10 +2016,16 @@ class BaseAgent(ABC):
                     ),
                 )
 
-            except Exception as exc:  # noqa: BLE001
-                # Genuine unknown: log full stack trace and escalate
-                # generically, but don't retry (we don't know if it's
-                # safe to repeat).
+            except (
+                anthropic.APIError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                # Known non-retryable runtime failure: log the stack
+                # trace and escalate generically.
                 logger.exception(
                     "Unhandled error in %s: %s", self.agent_type, exc,
                 )
@@ -1905,6 +2039,60 @@ class BaseAgent(ABC):
                     escalation_reason=f"Unhandled: {type(exc).__name__}",
                 )
 
+        if response is None:
+            logger.error(
+                "process_message retry loop exited without response for %s: %s",
+                self.agent_type, last_exc,
+            )
+            return AgentResponse(
+                message="Connecting you with a human agent.",
+                agent_type=self.agent_type,
+                should_escalate=True,
+                escalation_reason="Exhausted retries with no result",
+            )
+
+        try:
+            return await self._process_response(response, conversation)
+        except anthropic.AuthenticationError as exc:
+            logger.exception(
+                "Auth error in %s; surfacing to ops: %s",
+                self.agent_type, exc,
+            )
+            raise
+        except anthropic.BadRequestError as exc:
+            logger.warning(
+                "Permanent 4xx in %s: %s", self.agent_type, exc,
+            )
+            return AgentResponse(
+                message=(
+                    "I'm having trouble with this request. "
+                    "Connecting you with a human agent who can help."
+                ),
+                agent_type=self.agent_type,
+                should_escalate=True,
+                escalation_reason=f"Bad request {exc.status_code}: {exc}",
+            )
+        except (
+            anthropic.APIError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            logger.exception(
+                "Unhandled post-tool error in %s: %s", self.agent_type, exc,
+            )
+            return AgentResponse(
+                message=(
+                    "I apologize, but I'm having a technical issue. "
+                    "Let me connect you with someone who can help."
+                ),
+                agent_type=self.agent_type,
+                should_escalate=True,
+                escalation_reason=f"Unhandled: {type(exc).__name__}",
+            )
+
         # Defensive: loop should always return; surface explicit error.
         logger.error(
             "process_message retry loop exited without return for %s: %s",
@@ -1917,7 +2105,7 @@ class BaseAgent(ABC):
             escalation_reason="Exhausted retries with no result",
         )
 
-    def _build_messages(
+    async def _build_messages(
         self, conversation: Conversation, user_message: str
     ) -> list[dict]:
         """Build message history for LLM.
@@ -1937,6 +2125,8 @@ class BaseAgent(ABC):
         cm = getattr(self, "conversation_manager", None)
         if cm is not None and hasattr(cm, "get_context_window"):
             window = cm.get_context_window(conversation.conversation_id)
+            if inspect.isawaitable(window):
+                window = await window
             if getattr(window, "summary", None):
                 messages.append(
                     {
@@ -1981,13 +2171,14 @@ class BaseAgent(ABC):
                         "tool": content_block.name,
                         "input": content_block.input,
                         "result": tool_result.to_llm_response(),
+                        "success": tool_result.success,
                     }
                 )
 
         # If we had tool calls, make another LLM call with results
-        if tool_calls and not final_message:
+        if tool_calls:
             final_message = await self._get_final_response(
-                conversation, tool_calls
+                conversation, tool_calls, preamble=final_message
             )
 
         # Check for transfer or escalation signals
@@ -2041,7 +2232,10 @@ class BaseAgent(ABC):
         return result
 
     async def _get_final_response(
-        self, conversation: Conversation, tool_calls: list[dict]
+        self,
+        conversation: Conversation,
+        tool_calls: list[dict],
+        preamble: str = "",
     ) -> str:
         """Get final response after tool execution."""
         # Build tool results message
@@ -2053,21 +2247,46 @@ class BaseAgent(ABC):
         )
 
         messages = conversation.get_history_for_llm()
+        prompt = "Based on these tool results, provide a helpful response to the customer:"
+        if preamble:
+            prompt += f"\n\nModel preamble before tool execution:\n{preamble}"
         messages.append(
             {
                 "role": "user",
-                "content": f"Based on these tool results, provide a helpful response to the customer:\n\n{tool_results_text}",
+                "content": f"{prompt}\n\n{tool_results_text}",
             }
         )
 
-        response = await self.llm_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=self.system_prompt,
-            messages=messages,
-        )
+        max_transient_retries = 1
+        for attempt in range(max_transient_retries + 1):
+            try:
+                response = await asyncio.wait_for(
+                    self.llm_client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=1024,
+                        system=self.system_prompt,
+                        messages=messages,
+                        timeout=self.config.timeout_seconds,
+                    ),
+                    timeout=self.config.timeout_seconds,
+                )
+                return response.content[0].text
+            except (
+                anthropic.APITimeoutError,
+                anthropic.RateLimitError,
+                anthropic.APIConnectionError,
+                asyncio.TimeoutError,
+            ) as exc:
+                if attempt == max_transient_retries:
+                    raise
+                logger.warning(
+                    "Transient final-response error in %s: %s",
+                    self.agent_type,
+                    exc,
+                )
+                await asyncio.sleep(1.5 * (2**attempt))
 
-        return response.content[0].text
+        raise RuntimeError("final-response retry loop exhausted")
 
     def _check_transfer(
         self, message: str
@@ -2609,11 +2828,7 @@ class ConversationMetrics:
     escalated: bool = False
     resolved: bool = False
     resolution_time_seconds: Optional[float] = None
-    agents_involved: list[AgentType] = None
-
-    def __post_init__(self):
-        if self.agents_involved is None:
-            self.agents_involved = []
+    agents_involved: list[AgentType] = field(default_factory=list)
 
 
 class ConversationManager:
@@ -2638,6 +2853,9 @@ class ConversationManager:
         self.conversation_metrics: "OrderedDict[str, ConversationMetrics]" = (
             OrderedDict()
         )
+        self._conversation_locks: "OrderedDict[str, asyncio.Lock]" = (
+            OrderedDict()
+        )
 
     def _record_active(self, conv_id: str, conversation, metrics) -> None:
         """Insert (or refresh LRU position for) a conversation."""
@@ -2645,9 +2863,12 @@ class ConversationManager:
         self.active_conversations.move_to_end(conv_id)
         self.conversation_metrics[conv_id] = metrics
         self.conversation_metrics.move_to_end(conv_id)
+        self._conversation_locks.setdefault(conv_id, asyncio.Lock())
+        self._conversation_locks.move_to_end(conv_id)
         while len(self.active_conversations) > self.MAX_ACTIVE_CONVERSATIONS:
-            self.active_conversations.popitem(last=False)
-            self.conversation_metrics.popitem(last=False)
+            evicted_id, _ = self.active_conversations.popitem(last=False)
+            self.conversation_metrics.pop(evicted_id, None)
+            self._conversation_locks.pop(evicted_id, None)
 
     async def start_conversation(
         self, customer: Customer, channel: ConversationChannel
@@ -2671,6 +2892,20 @@ class ConversationManager:
         self, conversation_id: str, message: str
     ) -> AgentResponse:
         """Process an incoming customer message."""
+        lock = self._conversation_locks.get(conversation_id)
+        if lock is None:
+            if conversation_id not in self.active_conversations:
+                raise ValueError(f"Conversation {conversation_id} not found")
+            lock = asyncio.Lock()
+            self._conversation_locks[conversation_id] = lock
+        self._conversation_locks.move_to_end(conversation_id)
+        async with lock:
+            return await self._process_message_locked(conversation_id, message)
+
+    async def _process_message_locked(
+        self, conversation_id: str, message: str
+    ) -> AgentResponse:
+        """Process a message while holding the per-conversation lock."""
         conversation = self.active_conversations.get(conversation_id)
         if not conversation:
             raise ValueError(f"Conversation {conversation_id} not found")
@@ -2901,8 +3136,9 @@ class QualityAssessment:
             flags.append("compliance_review_needed")
             recommendations.append("Manual review required for compliance")
 
-        # Calculate overall score (weighted average)
-        weights = {
+        # Example launch weights. Calibrate these against human QA labels
+        # before using the score for routing, compensation, or compliance.
+        weights = getattr(self.config, "quality_weights", None) or {
             "resolution": 0.30,
             "response_quality": 0.25,
             "efficiency": 0.15,
@@ -2967,17 +3203,58 @@ Score each dimension 0-100:
 Return JSON: {{"clarity": X, "helpfulness": X, "professionalism": X, "accuracy": X}}"""
 
         try:
-            response = await self.llm_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=200,
-                messages=[{"role": "user", "content": assessment_prompt}],
-            )
+            for attempt in range(2):
+                try:
+                    response = await asyncio.wait_for(
+                        self.llm_client.messages.create(
+                            model="claude-sonnet-4-20250514",
+                            max_tokens=200,
+                            messages=[
+                                {"role": "user", "content": assessment_prompt}
+                            ],
+                        ),
+                        timeout=self.config.assessment_timeout_seconds,
+                    )
+                    break
+                except (
+                    anthropic.APITimeoutError,
+                    anthropic.RateLimitError,
+                    anthropic.APIConnectionError,
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    ConnectionError,
+                    OSError,
+                ) as e:
+                    if attempt == 1:
+                        raise
+                    logger.warning(
+                        "Response quality assessment retrying: %s", e
+                    )
+                    await asyncio.sleep(0.5 * (2**attempt))
 
             scores = json.loads(response.content[0].text)
-            return sum(scores.values()) / len(scores)
+            required = {"clarity", "helpfulness", "professionalism", "accuracy"}
+            if not required.issubset(scores):
+                raise KeyError(f"missing score keys: {required - set(scores)}")
+            numeric_scores = [float(scores[key]) for key in required]
+            return sum(numeric_scores) / len(numeric_scores)
 
-        except Exception as e:
-            logger.warning(f"Response quality assessment failed: {e}")
+        except json.JSONDecodeError as e:
+            logger.warning("Response quality assessment returned non-JSON: %s", e)
+            return 50.0
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning("Response quality assessment malformed: %s", e)
+            return 50.0
+        except (
+            anthropic.APITimeoutError,
+            anthropic.RateLimitError,
+            anthropic.APIConnectionError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ) as e:
+            logger.warning("Response quality assessment provider failed: %s", e)
             return 50.0
 
     def _assess_efficiency(self, metrics: ConversationMetrics) -> float:
@@ -3028,11 +3305,17 @@ Return JSON: {{"clarity": X, "helpfulness": X, "professionalism": X, "accuracy":
                     score -= 50
                     break
 
-            # Check for prohibited phrases
-            prohibited = ["i promise", "guaranteed", "always", "never fails"]
-            for phrase in prohibited:
+            # Policy-configured phrases. The default list is illustrative;
+            # compliance teams should provide jurisdiction/workflow-specific
+            # terms and penalties.
+            prohibited = getattr(
+                self.config,
+                "prohibited_phrases",
+                {"i promise": 10, "definitely": 10, "always": 10, "never fails": 10},
+            )
+            for phrase, penalty in prohibited.items():
                 if phrase in content_lower:
-                    score -= 10
+                    score -= penalty
 
         return max(0, score)
 
@@ -3198,6 +3481,7 @@ class MetricsCollector:
 
     MAX_HOURLY_BUCKETS = 24
     MAX_TIMING_SAMPLES = 10_000
+    MAX_TIMING_KEYS = 1_000
 
     def __init__(self, storage_client: "MetricsStorage"):
         self.storage: "MetricsStorage" = storage_client
@@ -3222,6 +3506,16 @@ class MetricsCollector:
                     if tk.startswith(k):
                         self._timing_samples.pop(tk, None)
 
+    def _evict_timing_keys(self) -> None:
+        """Cap timing metric cardinality for arbitrary tool names."""
+        if len(self._timing_samples) <= self.MAX_TIMING_KEYS:
+            return
+        stale = sorted(self._timing_samples.keys())[
+            : -self.MAX_TIMING_KEYS
+        ]
+        for key in stale:
+            self._timing_samples.pop(key, None)
+
     async def record_conversation_start(self, conversation: Conversation):
         """Record a new conversation."""
         hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
@@ -3239,6 +3533,8 @@ class MetricsCollector:
         """Record first response latency."""
         hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
         self._timing_samples[f"{hour_key}_first_response"].append(latency_ms)
+        self._evict_old_buckets()
+        self._evict_timing_keys()
 
     async def record_conversation_end(
         self, conversation: Conversation, metrics: ConversationMetrics
@@ -3261,6 +3557,8 @@ class MetricsCollector:
             self._timing_samples[f"{hour_key}_resolution_time"].append(
                 metrics.resolution_time_seconds
             )
+        self._evict_old_buckets()
+        self._evict_timing_keys()
 
         # Record agent involvement
         for agent in metrics.agents_involved:
@@ -3281,6 +3579,8 @@ class MetricsCollector:
         self._timing_samples[f"{hour_key}_tool_{tool_name}_latency"].append(
             latency_ms
         )
+        self._evict_old_buckets()
+        self._evict_timing_keys()
 
     async def get_metrics(
         self, start: datetime, end: datetime
@@ -3453,6 +3753,9 @@ Complete customer service platform integration.
 import asyncio
 import anthropic
 import httpx
+import logging
+import os
+import signal
 
 
 from contextlib import asynccontextmanager
@@ -3482,7 +3785,9 @@ async def create_platform():
         base_url=config.integrations.orders_base_url
     ) as orders_client, httpx.AsyncClient(
         base_url=config.integrations.payments_base_url
-    ) as billing_client:
+    ) as billing_client, httpx.AsyncClient(
+        base_url=config.integrations.knowledge_base_url
+    ) as knowledge_base_client:
 
         # Create tools
         crm_tools = [
@@ -3506,7 +3811,7 @@ async def create_platform():
         # Technical and escalation tools live in the knowledge base /
         # diagnostics path the chapter introduced earlier.
         technical_tools = [
-            SearchKnowledgeBaseTool(llm_client),
+            SearchKnowledgeBaseTool(knowledge_base_client),
             RunDiagnosticTool(orders_client),
         ]
         escalation_tools = [
@@ -3544,9 +3849,65 @@ async def create_platform():
             storage_client=InMemoryMetricsStorage()
         )
 
+        # Graceful shutdown: when the process receives SIGTERM (or
+        # SIGINT under a non-interactive runner), stop accepting new
+        # conversations, drain in-flight ones up to grace_period, and
+        # let the context exit. Without this, a rolling deploy that
+        # signals workers can lose every active conversation's
+        # in-memory state.
+        shutdown_event = asyncio.Event()
+        manager.shutting_down = False
+        grace_period_seconds = float(
+            os.environ.get("CS_SHUTDOWN_GRACE_SECONDS", "60")
+        )
+
+        def _request_shutdown(signame: str) -> None:
+            logging.getLogger(__name__).warning(
+                "platform shutdown requested",
+                extra={"signal": signame},
+            )
+            manager.shutting_down = True
+            shutdown_event.set()
+
+        loop = asyncio.get_running_loop()
+        installed_signals: list = []
+        for signame in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, signame, None)
+            if sig is None:
+                continue
+            try:
+                loop.add_signal_handler(
+                    sig, _request_shutdown, signame
+                )
+                installed_signals.append(sig)
+            except (NotImplementedError, RuntimeError):
+                # Non-Unix loops (e.g., Windows ProactorEventLoop) and
+                # nested-loop contexts (Jupyter, some test runners)
+                # cannot install signal handlers; rely on the caller's
+                # higher-level orchestrator to drive shutdown instead.
+                pass
+
         try:
             yield manager, metrics_collector
         finally:
+            if shutdown_event.is_set():
+                drain = getattr(manager, "drain_active_conversations", None)
+                if callable(drain):
+                    try:
+                        await asyncio.wait_for(
+                            drain(), timeout=grace_period_seconds
+                        )
+                    except asyncio.TimeoutError:
+                        logging.getLogger(__name__).warning(
+                            "conversation drain hit %ss grace period; "
+                            "some in-flight state may not be persisted",
+                            grace_period_seconds,
+                        )
+            for sig in installed_signals:
+                try:
+                    loop.remove_signal_handler(sig)
+                except (NotImplementedError, RuntimeError):
+                    pass
             # Anything platform-wide to flush goes here. The httpx
             # clients are closed automatically when this block exits.
             await metrics_collector.storage.flush()

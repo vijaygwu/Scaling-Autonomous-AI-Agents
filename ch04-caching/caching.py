@@ -48,7 +48,9 @@ Monthly savings: ~$9,450
 
 from typing import Optional, Any
 import hashlib
+import asyncio
 import json
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -481,7 +483,8 @@ class CacheKeyGenerator:
 
         if isinstance(value, dict):
             return {
-                str(k): self._normalize(v) for k, v in sorted(value.items())
+                str(k): self._normalize(v)
+                for k, v in sorted(value.items(), key=lambda item: str(item[0]))
             }
 
         if isinstance(value, (set, frozenset)):
@@ -605,7 +608,9 @@ class SemanticKeyGenerator(CacheKeyGenerator):
         """
         # Combine query and context for embedding
         text = f"{query}\n{context}" if context else query
-        embedding = self.embedding_model.embed_text(text)
+        embedding = np.asarray(
+            self.embedding_model.embed_text(text), dtype=np.float32
+        )
 
         # Quantize embedding to create bucket key
         # This is a simplified approach - production systems
@@ -614,7 +619,12 @@ class SemanticKeyGenerator(CacheKeyGenerator):
 
         return (
             self.generate(
-                bucket=bucket, context_hash=hash(context) if context else None
+                bucket=bucket,
+                context_hash=(
+                    hashlib.sha256(context.encode("utf-8")).hexdigest()[:16]
+                    if context
+                    else None
+                ),
             ),
             embedding,
         )
@@ -861,9 +871,11 @@ class DependencyTracker:
     memory in long-lived deployments.
     """
 
-    def __init__(self):
+    def __init__(self, max_keys: int = 100_000):
         self._dependencies: Dict[str, Set[str]] = defaultdict(set)
         self._dependents: Dict[str, Set[str]] = defaultdict(set)
+        self._key_order: deque[str] = deque()
+        self._max_keys = max_keys
         self._lock = threading.RLock()
 
     def add_dependency(self, key: str, depends_on: str) -> None:
@@ -873,8 +885,23 @@ class DependencyTracker:
         When 'depends_on' is invalidated, 'key' should also be invalidated.
         """
         with self._lock:
+            is_new_key = key not in self._dependencies and key not in self._dependents
+            is_new_dep = (
+                depends_on not in self._dependencies
+                and depends_on not in self._dependents
+            )
+            if is_new_key:
+                self._key_order.append(key)
+            if is_new_dep:
+                self._key_order.append(depends_on)
             self._dependencies[key].add(depends_on)
             self._dependents[depends_on].add(key)
+            self._enforce_size_limit()
+
+    def _enforce_size_limit(self) -> None:
+        """Evict oldest graph nodes when the tracker exceeds its cap."""
+        while len(self._key_order) > self._max_keys:
+            self.remove_key(self._key_order.popleft())
 
     def get_cascade(self, key: str) -> Set[str]:
         """
@@ -910,6 +937,11 @@ class DependencyTracker:
             # Remove the key itself
             self._dependencies.pop(key, None)
             self._dependents.pop(key, None)
+            self._key_order = deque(
+                existing_key
+                for existing_key in self._key_order
+                if existing_key != key
+            )
 
 
 class CacheInvalidator:
@@ -922,14 +954,18 @@ class CacheInvalidator:
         backend: "CacheBackend",
         strategies: List[InvalidationStrategy],
         dependency_tracker: Optional[DependencyTracker] = None,
+        max_listeners: int = 1000,
     ):
         self.backend = backend
         self.strategies = strategies
         self.dependency_tracker = dependency_tracker or DependencyTracker()
         self._listeners: List[Callable[[str], None]] = []
+        self._max_listeners = max_listeners
 
     def on_invalidation(self, callback: Callable[[str], None]) -> None:
         """Register a callback for invalidation events."""
+        if len(self._listeners) >= self._max_listeners:
+            raise ValueError("too many cache invalidation listeners")
         self._listeners.append(callback)
 
     def check_and_invalidate(self, key: str) -> bool:
@@ -972,7 +1008,7 @@ class CacheInvalidator:
                 for listener in self._listeners:
                     try:
                         listener(k)
-                    except Exception as exc:  # noqa: BLE001
+                    except (RuntimeError, ValueError, TypeError) as exc:
                         # Don't let one bad listener break invalidation
                         # for the rest, but surface the failure rather
                         # than silently swallowing it.
@@ -1071,6 +1107,8 @@ class InMemoryBackend(CacheBackend):
         # ``popitem(last=False)`` to evict the least recently used entry.
         from collections import OrderedDict
 
+        if max_size < 1:
+            raise ValueError("max_size must be at least 1")
         self._cache: "OrderedDict[str, tuple[Any, float]]" = OrderedDict()
         self._max_size = max_size
         self._lock = threading.RLock()
@@ -1195,15 +1233,29 @@ class RedisBackend(CacheBackend):
         return json.loads(data.decode("utf-8"))
 
     def get(self, key: str) -> Optional[Any]:
+        prefixed = self._prefixed_key(key)
         try:
-            data = self._client.get(self._prefixed_key(key))
+            data = self._client.get(prefixed)
         except redis.RedisError as exc:
             _redis_logger.warning("Redis GET failed for %s: %s", key, exc)
             self._bump_error_metric("get")
             return None
         if data is None:
             return None
-        return self._deserialize(data)
+        try:
+            return self._deserialize(data)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            _redis_logger.warning(
+                "Redis cache value for %s is corrupt; deleting: %s", key, exc
+            )
+            self._bump_error_metric("deserialize")
+            try:
+                self._client.delete(prefixed)
+            except redis.RedisError as delete_exc:
+                _redis_logger.warning(
+                    "Redis DELETE failed for corrupt %s: %s", key, delete_exc
+                )
+            return None
 
     def set(
         self, key: str, value: Any, ttl: Optional[timedelta] = None
@@ -1251,9 +1303,9 @@ class RedisBackend(CacheBackend):
             return
         try:
             self._metrics.increment("cache.redis.error", tags={"op": op})
-        except Exception:  # noqa: BLE001
+        except (AttributeError, TypeError, RuntimeError) as exc:
             # Metrics sink must not itself fail the cache path.
-            pass
+            _redis_logger.debug("cache metrics sink failed: %s", exc)
 
     def get_many(self, keys: List[str]) -> Dict[str, Any]:
         if not keys:
@@ -1271,9 +1323,23 @@ class RedisBackend(CacheBackend):
             return {}
 
         result = {}
-        for key, value in zip(keys, values):
+        for key, prefixed_key, value in zip(keys, prefixed_keys, values):
             if value is not None:
-                result[key] = self._deserialize(value)
+                try:
+                    result[key] = self._deserialize(value)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    _redis_logger.warning(
+                        "Redis cached value for %s is corrupt: %s", key, exc
+                    )
+                    self._bump_error_metric("get_many_deserialize")
+                    try:
+                        self._client.delete(prefixed_key)
+                    except redis.RedisError as delete_exc:
+                        _redis_logger.debug(
+                            "failed deleting corrupt cache key %s: %s",
+                            key,
+                            delete_exc,
+                        )
 
         return result
 
@@ -1448,6 +1514,11 @@ class CacheManager:
             "embedding": {"hits": 0, "misses": 0},
             "tool": {"hits": 0, "misses": 0},
         }
+        self._stats_lock = threading.Lock()
+
+    def _record_stat(self, category: str, field: str) -> None:
+        with self._stats_lock:
+            self._stats[category][field] += 1
 
     def get_llm_response(
         self,
@@ -1470,10 +1541,10 @@ class CacheManager:
 
         result = self.backend.get(key)
         if result is not None:
-            self._stats["llm"]["hits"] += 1
+            self._record_stat("llm", "hits")
             return result.get("response")
 
-        self._stats["llm"]["misses"] += 1
+        self._record_stat("llm", "misses")
         return None
 
     def set_llm_response(
@@ -1515,10 +1586,10 @@ class CacheManager:
 
         result = self.backend.get(key)
         if result is not None:
-            self._stats["embedding"]["hits"] += 1
+            self._record_stat("embedding", "hits")
             return result.get("vector")
 
-        self._stats["embedding"]["misses"] += 1
+        self._record_stat("embedding", "misses")
         return None
 
     def set_embedding(
@@ -1541,10 +1612,10 @@ class CacheManager:
 
         result = self.backend.get(key)
         if result is not None:
-            self._stats["tool"]["hits"] += 1
+            self._record_stat("tool", "hits")
             return result.get("result")
 
-        self._stats["tool"]["misses"] += 1
+        self._record_stat("tool", "misses")
         return None
 
     def set_tool_result(
@@ -1566,7 +1637,12 @@ class CacheManager:
     def get_stats(self) -> dict:
         """Get cache statistics."""
         stats = {}
-        for category, counts in self._stats.items():
+        with self._stats_lock:
+            snapshot = {
+                category: counts.copy()
+                for category, counts in self._stats.items()
+            }
+        for category, counts in snapshot.items():
             total = counts["hits"] + counts["misses"]
             stats[category] = {
                 **counts,
@@ -1648,7 +1724,7 @@ class SemanticCache:
 
     Production note: ``get`` does a Python-level linear scan over
     ``_entries`` under a lock. That is fine for the demonstrative
-    sizes used in this chapter (max_entries=10000 by default), but
+    sizes used in this chapter (max_entries=1000 by default), but
     serializes the cache lookup behind one CPU per hot key under
     real QPS. For deployments above roughly 1k entries or above a
     few hundred QPS, switch to ``ProductionSemanticCache`` (defined
@@ -1666,7 +1742,7 @@ class SemanticCache:
         self,
         embedding_model: "EmbeddingModel",
         similarity_threshold: float = 0.95,
-        max_entries: int = 10000,
+        max_entries: int = 1000,
         ttl: timedelta = timedelta(hours=24),
         linear_scan_ok: bool = False,
     ):
@@ -1897,8 +1973,9 @@ class ProductionSemanticCache(SemanticCache):
     """
     Production-ready semantic cache with vector index for efficient lookup.
 
-    Uses approximate nearest neighbor search for O(log n) lookups
-    instead of O(n) linear scan.
+    Uses an HNSW approximate nearest-neighbor index when FAISS exposes
+    the required constructor, with an exact inner-product index fallback
+    for smaller deployments.
     """
 
     def __init__(
@@ -1920,7 +1997,8 @@ class ProductionSemanticCache(SemanticCache):
         )
 
         self.backend = backend
-        self._index = None  # Would be FAISS, Annoy, or similar in production
+        self._index = None  # FAISS HNSW/flat index when available
+        self._index_kind = "linear"
         self._embedding_dim = None
 
     def _normalize_embedding(self, embedding: Any) -> np.ndarray:
@@ -1939,15 +2017,28 @@ class ProductionSemanticCache(SemanticCache):
         """Initialize the vector index."""
         self._embedding_dim = embedding_dim
 
-        # In production, you'd use FAISS, Annoy, or ScaNN
-        # This is a placeholder showing the interface
         try:
             import faiss
 
-            self._index = faiss.IndexFlatIP(embedding_dim)  # Inner product
+            try:
+                self._index = faiss.IndexHNSWFlat(
+                    embedding_dim, 32, faiss.METRIC_INNER_PRODUCT
+                )
+                self._index.hnsw.efConstruction = 200
+                self._index.hnsw.efSearch = 64
+                self._index_kind = "hnsw"
+            except (AttributeError, TypeError):
+                # Older FAISS builds may not expose HNSW with an inner-
+                # product metric. Use exact cosine search rather than
+                # returning distance scores with the wrong ordering.
+                self._index = faiss.IndexFlatIP(embedding_dim)
+                self._index_kind = "flat"
         except ImportError:
-            # Fallback to linear scan if FAISS not available
+            # Fallback to the parent class's linear scan if FAISS is not
+            # installed. Production deployments should install FAISS or
+            # back this class with an external vector database.
             self._index = None
+            self._index_kind = "linear"
 
     def _rebuild_index_locked(self) -> None:
         """Rebuild the ANN index after entries are evicted."""
@@ -2015,9 +2106,22 @@ class ProductionSemanticCache(SemanticCache):
                     original_query=None,
                 )
 
+            entry = self._entries[best_idx]
+            cutoff = time.time() - self.ttl.total_seconds()
+            if entry.created_at < cutoff:
+                removed = self._evict_expired()
+                if removed:
+                    self._rebuild_index_locked()
+                self._misses += 1
+                return SemanticCacheResult(
+                    hit=False,
+                    response=None,
+                    similarity=float(best_similarity),
+                    original_query=None,
+                )
+
             if best_similarity >= self.similarity_threshold:
                 self._hits += 1
-                entry = self._entries[best_idx]
                 entry.access_count += 1
 
                 return SemanticCacheResult(
@@ -2244,7 +2348,11 @@ def semantic_lookup_with_quality(
 # ============================================================================
 
 from typing import List, Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -2266,11 +2374,27 @@ class CacheWarmer:
         llm_client: "LLMClient",
         embedding_model: "EmbeddingModel",
         max_workers: int = 4,
+        warm_timeout_seconds: float = 30.0,
+        llm_max_retries: int = 3,
+        llm_retry_backoff: float = 0.25,
+        embedding_max_retries: int = 3,
+        embedding_retry_backoff: float = 0.25,
     ):
+        if max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        if llm_max_retries < 1:
+            raise ValueError("llm_max_retries must be >= 1")
+        if embedding_max_retries < 1:
+            raise ValueError("embedding_max_retries must be >= 1")
         self.cache_manager = cache_manager
         self.llm_client = llm_client
         self.embedding_model = embedding_model
         self.max_workers = max_workers
+        self.warm_timeout_seconds = warm_timeout_seconds
+        self.llm_max_retries = llm_max_retries
+        self.llm_retry_backoff = llm_retry_backoff
+        self.embedding_max_retries = embedding_max_retries
+        self.embedding_retry_backoff = embedding_retry_backoff
 
     def warm_from_history(
         self, query_log: Iterator[dict], limit: int = 1000
@@ -2307,14 +2431,31 @@ class CacheWarmer:
                 )
                 futures.append(future)
 
-            for future in as_completed(futures):
-                stats["processed"] += 1
-                try:
-                    if future.result():
-                        stats["cached"] += 1
-                except Exception as e:
-                    logger.warning(f"Error warming query: {e}")
-                    stats["errors"] += 1
+            try:
+                for future in as_completed(
+                    futures,
+                    timeout=self.warm_timeout_seconds * max(1, len(futures)),
+                ):
+                    stats["processed"] += 1
+                    try:
+                        if future.result(timeout=0):
+                            stats["cached"] += 1
+                    except (
+                        FuturesTimeoutError,
+                        TimeoutError,
+                        ConnectionError,
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                    ) as e:
+                        logger.warning(f"Error warming query: {e}")
+                        stats["errors"] += 1
+            except FuturesTimeoutError:
+                for future in futures:
+                    if not future.done():
+                        future.cancel()
+                        stats["errors"] += 1
+                logger.warning("Cache warming timed out; cancelled unfinished work")
 
         return stats
 
@@ -2333,13 +2474,25 @@ class CacheWarmer:
         if cached is not None:
             return False  # Already cached
 
-        # Generate and cache response
-        response = self.llm_client.complete(
-            prompt=prompt,
-            model=model,
-            temperature=0.0,
-            system_prompt=system_prompt,
-        )
+        # Generate and cache response with transient retry/backoff.
+        response = None
+        for attempt in range(self.llm_max_retries):
+            try:
+                response = self.llm_client.complete(
+                    prompt=prompt,
+                    model=model,
+                    temperature=0.0,
+                    system_prompt=system_prompt,
+                    timeout=self.warm_timeout_seconds,
+                )
+                break
+            except (TimeoutError, ConnectionError, OSError) as exc:
+                if attempt == self.llm_max_retries - 1:
+                    raise
+                logger.warning("Transient warm-cache failure: %s", exc)
+                time.sleep(self.llm_retry_backoff * (2**attempt))
+        if response is None:
+            return False
 
         self.cache_manager.set_llm_response(
             prompt=prompt,
@@ -2379,15 +2532,34 @@ class CacheWarmer:
             batch = texts_to_embed[i : i + batch_size]
 
             try:
-                embeddings = self.embedding_model.embed_batch(batch)
+                embeddings = None
+                for attempt in range(self.embedding_max_retries):
+                    try:
+                        embeddings = self.embedding_model.embed_batch(batch)
+                        break
+                    except (
+                        TimeoutError,
+                        ConnectionError,
+                        OSError,
+                        RuntimeError,
+                    ) as exc:
+                        if attempt == self.embedding_max_retries - 1:
+                            raise
+                        delay = self.embedding_retry_backoff * (2**attempt)
+                        logger.warning(
+                            "Retrying embedding warm batch after error: %s", exc
+                        )
+                        time.sleep(delay)
+                if embeddings is None:
+                    raise RuntimeError("embedding batch returned no result")
 
                 for text, embedding in zip(batch, embeddings):
                     self.cache_manager.set_embedding(
-                        text, model, embedding.tolist()
+                        text, model, np.asarray(embedding).tolist()
                     )
                     stats["cached"] += 1
 
-            except Exception as e:
+            except (TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as e:
                 logger.error(f"Error computing embeddings: {e}")
 
             stats["processed"] += len(batch)
@@ -2413,7 +2585,7 @@ class CacheWarmer:
                     query=query, response=response, context=context
                 )
                 stats["added"] += 1
-            except Exception as e:
+            except (TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as e:
                 logger.warning(f"Error adding to semantic cache: {e}")
                 stats["errors"] += 1
 
@@ -2449,7 +2621,7 @@ class ScheduledCacheWarmer:
         """
         import schedule as sched
 
-        sched.every().day.at("03:00").do(self._run_warming)
+        sched.every().day.at(self._daily_time()).do(self._run_warming)
         self._stop_event.clear()
 
         while not self._stop_event.is_set():
@@ -2461,6 +2633,23 @@ class ScheduledCacheWarmer:
     def stop(self) -> None:
         """Stop the scheduled warmer."""
         self._stop_event.set()
+
+    def _daily_time(self) -> str:
+        """Parse a simple daily cron expression into HH:MM."""
+        parts = self.schedule.split()
+        if (
+            len(parts) == 5
+            and parts[0].isdigit()
+            and parts[1].isdigit()
+            and parts[2:] == ["*", "*", "*"]
+        ):
+            minute = int(parts[0])
+            hour = int(parts[1])
+            if 0 <= minute <= 59 and 0 <= hour <= 23:
+                return f"{hour:02d}:{minute:02d}"
+        raise ValueError(
+            "ScheduledCacheWarmer supports daily cron strings like '0 3 * * *'"
+        )
 
     def start_in_background(self) -> threading.Thread:
         """Run ``start()`` in a daemon thread; return the thread handle.
@@ -2691,14 +2880,37 @@ class CachedAgentRuntime:
         llm_client: "LLMClient",
         embedding_model: "EmbeddingModel",
         redis_url: str = "redis://localhost:6379",
+        llm_timeout_seconds: float = 30.0,
+        llm_max_retries: int = 3,
+        llm_retry_backoff: float = 0.25,
+        tool_timeout_seconds: float = 30.0,
+        tool_max_retries: int = 2,
+        tool_retry_backoff: float = 0.25,
     ):
+        if llm_max_retries < 1:
+            raise ValueError("llm_max_retries must be >= 1")
+        if tool_max_retries < 1:
+            raise ValueError("tool_max_retries must be >= 1")
         self.agent = agent
         self.llm_client = llm_client
         self.embedding_model = embedding_model
+        self.llm_timeout_seconds = llm_timeout_seconds
+        self.llm_max_retries = llm_max_retries
+        self.llm_retry_backoff = llm_retry_backoff
+        self.tool_timeout_seconds = tool_timeout_seconds
+        self.tool_max_retries = tool_max_retries
+        self.tool_retry_backoff = tool_retry_backoff
 
         # Initialize cache backends
         l1_cache = InMemoryBackend(max_size=1000)
-        l2_cache = RedisBackend(host="localhost", port=6379)
+        from urllib.parse import urlparse
+        parsed_redis = urlparse(redis_url)
+        l2_cache = RedisBackend(
+            host=parsed_redis.hostname or "localhost",
+            port=parsed_redis.port or 6379,
+            db=int(parsed_redis.path.lstrip("/") or 0),
+            password=parsed_redis.password,
+        )
         tiered_backend = TieredCacheBackend(l1_cache, l2_cache)
 
         # Initialize cache manager
@@ -2765,13 +2977,30 @@ class CachedAgentRuntime:
             if cached is not None:
                 return cached
 
-            # Call LLM
-            response = await self.llm_client.complete_async(
-                prompt=prompt,
-                model=self.agent.model,
-                temperature=0.0,
-                system_prompt=system_prompt,
-            )
+            # Call LLM with bounded transient retry. The cache key is stable
+            # across attempts, and the provider call has no side effects.
+            for attempt in range(self.llm_max_retries):
+                try:
+                    response = await asyncio.wait_for(
+                        self.llm_client.complete_async(
+                            prompt=prompt,
+                            model=self.agent.model,
+                            temperature=0.0,
+                            system_prompt=system_prompt,
+                        ),
+                        timeout=self.llm_timeout_seconds,
+                    )
+                    break
+                except (
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    ConnectionError,
+                    OSError,
+                    RuntimeError,
+                ):
+                    if attempt == self.llm_max_retries - 1:
+                        raise
+                    await asyncio.sleep(self.llm_retry_backoff * (2**attempt))
 
             # Cache response
             self.cache_manager.set_llm_response(
@@ -2792,8 +3021,33 @@ class CachedAgentRuntime:
             if cached is not None:
                 return cached
 
-            # Execute tool
-            result = await self.agent.execute_tool(tool_name, arguments)
+            # Execute tool with bounded retry only when the result is
+            # cacheable/idempotent under the tool cache policy.
+            policy = TOOL_CACHE_POLICIES.get(tool_name, CachePolicy.NO_CACHE)
+            attempts = (
+                self.tool_max_retries
+                if policy != CachePolicy.NO_CACHE
+                else 1
+            )
+            for attempt in range(attempts):
+                try:
+                    result = await asyncio.wait_for(
+                        self.agent.execute_tool(tool_name, arguments),
+                        timeout=self.tool_timeout_seconds,
+                    )
+                    break
+                except (
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    ConnectionError,
+                    OSError,
+                    RuntimeError,
+                ):
+                    if attempt == attempts - 1:
+                        raise
+                    await asyncio.sleep(
+                        self.tool_retry_backoff * (2**attempt)
+                    )
 
             # Cache result
             self.tool_cache.set(tool_name, arguments, result)

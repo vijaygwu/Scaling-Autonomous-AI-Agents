@@ -20,15 +20,33 @@ provide the surrounding context (imports, dependencies) as needed.
 # Block 1 (chapter listing #1)
 # ============================================================================
 
+from collections import OrderedDict, deque
+
 # What went wrong: stateful agent design
 class CustomerAgent:
-    def __init__(self):
-        self.conversation_history = {}  # In-memory state
+    def __init__(
+        self, max_messages_per_user: int = 100, max_users: int = 10_000
+    ):
+        # Still the wrong scaling model because state is local to this
+        # process, but bounded so the anti-pattern cannot OOM a demo.
+        self.max_messages_per_user = max_messages_per_user
+        self.max_users = max_users
+        self.conversation_history: OrderedDict[str, deque[dict]] = (
+            OrderedDict()
+        )
 
-    def handle_request(self, user_id, message):
+    def handle_request(self, user_id: str, message: str) -> None:
         # State lost when this instance dies or scales
         if user_id not in self.conversation_history:
-            self.conversation_history[user_id] = []
+            if len(self.conversation_history) >= self.max_users:
+                self.conversation_history.popitem(last=False)
+            self.conversation_history[user_id] = deque(
+                maxlen=self.max_messages_per_user
+            )
+        self.conversation_history.move_to_end(user_id)
+        self.conversation_history[user_id].append(
+            {"role": "user", "content": message}
+        )
         # ...
 
 # ============================================================================
@@ -37,12 +55,27 @@ class CustomerAgent:
 
 # Anti-pattern: Stateful agent design
 class StatefulAgent:
-    def __init__(self):
-        self.conversations: dict[str, list[dict]] = {}
+    def __init__(
+        self,
+        llm_client=None,
+        max_messages_per_conversation: int = 100,
+        max_conversations: int = 10_000,
+    ):
+        # Still an anti-pattern because state is local to one process, but
+        # bound the demo so a load test cannot OOM the interpreter.
+        self.llm_client = llm_client
+        self.max_messages_per_conversation = max_messages_per_conversation
+        self.max_conversations = max_conversations
+        self.conversations: OrderedDict[str, deque[dict]] = OrderedDict()
 
     def process_message(self, conversation_id: str, message: str) -> str:
         if conversation_id not in self.conversations:
-            self.conversations[conversation_id] = []
+            if len(self.conversations) >= self.max_conversations:
+                self.conversations.popitem(last=False)
+            self.conversations[conversation_id] = deque(
+                maxlen=self.max_messages_per_conversation
+            )
+        self.conversations.move_to_end(conversation_id)
 
         self.conversations[conversation_id].append(
             {"role": "user", "content": message}
@@ -55,6 +88,18 @@ class StatefulAgent:
         )
 
         return response
+
+    def _call_llm(self, messages: deque[dict]) -> str:
+        """Minimal LLM call stub so the anti-pattern example is runnable."""
+        if self.llm_client is None:
+            return "stub response"
+        response = self.llm_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=list(messages),
+            timeout=30.0,
+        )
+        return response.content[0].text
 
 # ============================================================================
 # Block 3 (chapter listing #3)
@@ -98,7 +143,9 @@ class ConversationState:
 class StateManager:
     """Manages externalized agent state in Redis."""
 
-    def __init__(self, redis_url: str = "redis://localhost:6379"):
+    def __init__(
+        self, redis_url: str = "redis://localhost:6379", state_ttl: int = 86400
+    ):
         # Explicit timeouts + health-check + bounded pool. The default
         # ``redis.from_url(...)`` produces a client that blocks
         # indefinitely on a hung server; in a worker pool that
@@ -111,7 +158,7 @@ class StateManager:
             health_check_interval=30,
             max_connections=50,
         )
-        self.state_ttl = 86400  # 24 hours default
+        self.state_ttl = state_ttl
 
     def get_state(self, conversation_id: str) -> Optional[ConversationState]:
         """Retrieve conversation state from Redis."""
@@ -146,9 +193,21 @@ class StateManager:
 class StatelessAgent:
     """Agent designed for horizontal scaling with externalized state."""
 
-    def __init__(self, state_manager: StateManager, llm_client):
+    def __init__(
+        self,
+        state_manager: StateManager,
+        llm_client,
+        max_messages_per_conversation: int = 100,
+        llm_max_retries: int = 3,
+        llm_retry_backoff: float = 0.25,
+    ):
+        if llm_max_retries < 1:
+            raise ValueError("llm_max_retries must be >= 1")
         self.state_manager = state_manager
         self.llm_client = llm_client
+        self.max_messages_per_conversation = max_messages_per_conversation
+        self.llm_max_retries = llm_max_retries
+        self.llm_retry_backoff = llm_retry_backoff
 
     def process_message(self, conversation_id: str, message: str) -> str:
         # Load state from external storage
@@ -165,6 +224,8 @@ class StatelessAgent:
 
         # Update state
         state.messages.append({"role": "assistant", "content": response})
+        if len(state.messages) > self.max_messages_per_conversation:
+            state.messages = state.messages[-self.max_messages_per_conversation:]
 
         # Persist state back to external storage
         self.state_manager.save_state(state)
@@ -178,13 +239,28 @@ class StatelessAgent:
         # indefinitely. Production callers should additionally wrap
         # this in the @with_retry/@with_timeout decorators introduced
         # in ch05 (customer service) to cap end-to-end latency budgets.
-        response = self.llm_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=messages,
-            timeout=30.0,  # seconds; aligns with default budget
-        )
-        return response.content[0].text
+        retryable_errors = [TimeoutError, ConnectionError, OSError]
+        provider = globals().get("anthropic")
+        if provider is not None:
+            for name in ("APITimeoutError", "APIConnectionError", "RateLimitError"):
+                err = getattr(provider, name, None)
+                if err is not None:
+                    retryable_errors.append(err)
+
+        for attempt in range(self.llm_max_retries):
+            try:
+                response = self.llm_client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=4096,
+                    messages=messages,
+                    timeout=30.0,  # seconds; aligns with default budget
+                )
+                return response.content[0].text
+            except tuple(retryable_errors):
+                if attempt == self.llm_max_retries - 1:
+                    raise
+                time.sleep(self.llm_retry_backoff * (2**attempt))
+        raise RuntimeError("LLM call exhausted retries")
 
 # ============================================================================
 # Block 4 (chapter listing #4)
@@ -193,7 +269,9 @@ class StatelessAgent:
 class VersionedStateManager:
     """State manager with optimistic locking for conflict detection."""
 
-    def __init__(self, redis_url: str = "redis://localhost:6379"):
+    def __init__(
+        self, redis_url: str = "redis://localhost:6379", state_ttl: int = 86400
+    ):
         # Mirror StateManager's production timeouts/pool; a flaky Redis
         # would otherwise wedge every version check behind the default
         # unbounded socket timeout.
@@ -205,6 +283,7 @@ class VersionedStateManager:
             health_check_interval=30,
             max_connections=50,
         )
+        self.state_ttl = state_ttl
 
     def get_state_with_version(
         self, conversation_id: str
@@ -244,13 +323,19 @@ class VersionedStateManager:
         
         redis.call('SET', KEYS[1], ARGV[1])
         redis.call('INCR', KEYS[2])
-        redis.call('EXPIRE', KEYS[1], 86400)
-        redis.call('EXPIRE', KEYS[2], 86400)
+        redis.call('EXPIRE', KEYS[1], ARGV[3])
+        redis.call('EXPIRE', KEYS[2], ARGV[3])
         return 1
         """
 
         result = self.redis.eval(
-            lua_script, 2, key, version_key, state.to_json(), expected_version
+            lua_script,
+            2,
+            key,
+            version_key,
+            state.to_json(),
+            expected_version,
+            self.state_ttl,
         )
 
         return result == 1
@@ -425,7 +510,7 @@ class WeightedBalancer:
                 # Base score from weight and connections
                 connection_score = (
                     worker.active_connections + 1
-                ) / worker.weight
+                ) / max(worker.weight, 1e-9)
 
                 # Latency penalty
                 avg_latency = self.get_average_latency(worker.worker_id)
@@ -496,7 +581,10 @@ class RedisTaskQueue:
         queue_name: str = "agent_tasks",
         visibility_timeout: int = 300,  # 5 minutes
         body_ttl_seconds: int = 7 * 24 * 3600,  # 7 days
+        max_queue_size: int = 100_000,
     ):
+        if max_queue_size < 1:
+            raise ValueError("max_queue_size must be >= 1")
         self.redis = redis.from_url(
             redis_url,
             decode_responses=True,
@@ -509,6 +597,7 @@ class RedisTaskQueue:
         self.processing_queue = f"{queue_name}:processing"
         self.dead_letter_queue = f"{queue_name}:dlq"
         self.visibility_timeout = visibility_timeout
+        self.max_queue_size = max_queue_size
         # Body TTL must comfortably exceed the worst-case queue
         # residence (queue depth × visibility timeout + retries).
         # A 24-hour TTL on the body but multi-day queue residence
@@ -516,6 +605,14 @@ class RedisTaskQueue:
         # returns None silently (work is lost). 7 days is a safer
         # default; callers with a different SLA should override it.
         self.body_ttl_seconds = body_ttl_seconds
+        self._enqueue_script = """
+        if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[1]) then
+            return 0
+        end
+        redis.call('SETEX', KEYS[2], tonumber(ARGV[2]), ARGV[3])
+        redis.call('LPUSH', KEYS[1], ARGV[4])
+        return 1
+        """
         self.logger = logging.getLogger(__name__)
 
     def enqueue(self, task: AgentTask) -> str:
@@ -524,10 +621,18 @@ class RedisTaskQueue:
 
         # Store task details
         task_key = f"task:{task.task_id}"
-        self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
-
-        # Add to queue
-        self.redis.lpush(self.queue_name, task.task_id)
+        inserted = self.redis.eval(
+            self._enqueue_script,
+            2,
+            self.queue_name,
+            task_key,
+            self.max_queue_size,
+            self.body_ttl_seconds,
+            task.to_json(),
+            task.task_id,
+        )
+        if not inserted:
+            raise RuntimeError(f"Queue {self.queue_name} is at capacity")
 
         self.logger.info(f"Enqueued task {task.task_id}")
         return task.task_id
@@ -683,6 +788,7 @@ class RabbitMQConfig:
     virtual_host: str = "/"
     heartbeat: int = 600
     connection_timeout: int = 30
+    message_ttl_ms: int = 3_600_000
 
 
 class RabbitMQTaskQueue:
@@ -754,7 +860,7 @@ class RabbitMQTaskQueue:
             arguments={
                 "x-dead-letter-exchange": self.dead_letter_exchange,
                 "x-dead-letter-routing-key": self.queue_name,
-                "x-message-ttl": 3600000,  # 1 hour TTL
+                "x-message-ttl": self.config.message_ttl_ms,
             },
         )
 
@@ -792,23 +898,30 @@ class RabbitMQTaskQueue:
         self.channel.basic_qos(prefetch_count=prefetch_count)
 
         def on_message(channel, method, properties, body):
-            task = AgentTask.from_json(body.decode("utf-8"))
+            try:
+                task = AgentTask.from_json(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError) as exc:
+                self.logger.warning("Invalid task payload sent to DLQ: %s", exc)
+                channel.basic_nack(
+                    delivery_tag=method.delivery_tag, requeue=False
+                )
+                return
 
             try:
                 success = callback(task)
-
-                if success:
-                    channel.basic_ack(delivery_tag=method.delivery_tag)
-                else:
-                    # Requeue with delay by rejecting
-                    channel.basic_nack(
-                        delivery_tag=method.delivery_tag, requeue=True
-                    )
-            except Exception as e:
-                self.logger.error(f"Error processing task: {e}")
-                # Don't requeue on exception, send to DLQ
+            except (TimeoutError, RuntimeError, OSError) as exc:
+                self.logger.exception("Task callback failed; sending to DLQ: %s", exc)
                 channel.basic_nack(
                     delivery_tag=method.delivery_tag, requeue=False
+                )
+                return
+
+            if success:
+                channel.basic_ack(delivery_tag=method.delivery_tag)
+            else:
+                # Requeue with delay by rejecting
+                channel.basic_nack(
+                    delivery_tag=method.delivery_tag, requeue=True
                 )
 
         self.channel.basic_consume(
@@ -831,6 +944,7 @@ import boto3
 import json
 from typing import Optional, Generator
 import logging
+from botocore.config import Config
 
 
 class SQSTaskQueue:
@@ -844,7 +958,16 @@ class SQSTaskQueue:
         visibility_timeout: int = 300,
         max_receive_count: int = 3,
     ):
-        self.sqs = boto3.client("sqs", region_name=region_name)
+        self.sqs = boto3.client(
+            "sqs",
+            region_name=region_name,
+            config=Config(
+                connect_timeout=2,
+                read_timeout=10,
+                max_pool_connections=50,
+                retries={"max_attempts": 4, "mode": "adaptive"},
+            ),
+        )
         self.queue_url = queue_url
         self.dlq_url = dead_letter_queue_url
         self.visibility_timeout = visibility_timeout
@@ -999,7 +1122,7 @@ class AgentWorker:
 
                 self._process_task(task)
 
-            except Exception as e:
+            except (TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as e:
                 self.logger.error(f"Error in worker loop: {e}")
                 time.sleep(1)  # Back off on errors
 
@@ -1028,7 +1151,7 @@ class AgentWorker:
                 f"Completed task {task.task_id} in {processing_time:.2f}s"
             )
 
-        except Exception as e:
+        except (TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as e:
             self.logger.error(f"Task {task.task_id} failed: {e}")
             self.task_queue.fail(task, str(e))
             self.stats.tasks_failed += 1
@@ -1161,8 +1284,14 @@ class WorkerPool:
             try:
                 self._check_worker_health()
                 self._recover_stale_tasks()
-            except Exception as e:
-                self.logger.error(f"Maintenance error: {e}")
+            except (
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as e:
+                self.logger.exception("Maintenance error: %s", e)
 
             self._shutdown_event.wait(timeout=30)
 
@@ -1525,8 +1654,14 @@ class AutoScaler:
                 elif decision < 0:
                     self._scale_down(abs(decision))
 
-            except Exception as e:
-                self.logger.error(f"Auto-scaler error: {e}")
+            except (
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as e:
+                self.logger.exception("Auto-scaler error: %s", e)
 
             self._stop_event.wait(timeout=self.config.evaluation_interval)
 
@@ -1703,9 +1838,16 @@ class ShardConfig:
 class ShardedStateManager:
     """State manager that distributes data across multiple shards."""
 
-    def __init__(self, shards: list[ShardConfig]):
+    def __init__(self, shards: list[ShardConfig], state_ttl: int = 86400):
+        if not shards:
+            raise ValueError("ShardedStateManager requires at least one shard")
+
         self.shards = {s.shard_id: s for s in shards}
-        self.shard_count = len(shards)
+        if len(self.shards) != len(shards):
+            raise ValueError("Shard IDs must be unique")
+        self.shard_ids = sorted(self.shards)
+        self.shard_count = len(self.shard_ids)
+        self.state_ttl = state_ttl
 
         # Initialize connections to each shard
         self.redis_clients: dict[int, redis.Redis] = {}
@@ -1732,7 +1874,8 @@ class ShardedStateManager:
         Libraries: uhashring, hash_ring, or ketama.
         """
         hash_value = int(hashlib.md5(key.encode()).hexdigest(), 16)
-        return hash_value % self.shard_count
+        shard_index = hash_value % self.shard_count
+        return self.shard_ids[shard_index]
 
     def _get_client(self, conversation_id: str) -> redis.Redis:
         """Get the Redis client for a conversation."""
@@ -1761,7 +1904,7 @@ class ShardedStateManager:
         if state.created_at == 0.0:
             state.created_at = state.updated_at
 
-        client.setex(key, 86400, state.to_json())
+        client.setex(key, self.state_ttl, state.to_json())
 
     def get_shard_stats(self) -> dict[int, dict]:
         """Get statistics from each shard."""
@@ -1795,11 +1938,17 @@ class ConnectionPool:
         min_connections: int = 5,
         max_connections: int = 20,
         connection_timeout: float = 30.0,
+        connection_error_types: tuple[type[BaseException], ...] = (
+            ConnectionError,
+            OSError,
+            RuntimeError,
+        ),
     ):
         self.connection_factory = connection_factory
         self.min_connections = min_connections
         self.max_connections = max_connections
         self.connection_timeout = connection_timeout
+        self.connection_error_types = connection_error_types
 
         self.pool: Queue = Queue(maxsize=max_connections)
         self.size = 0
@@ -1838,7 +1987,7 @@ class ConnectionPool:
         broken = False
         try:
             yield conn
-        except Exception:
+        except self.connection_error_types:
             # Caller hit an error using this connection; assume it is
             # in an indeterminate state. Close and replace instead of
             # returning to the pool.
@@ -1888,18 +2037,32 @@ from fastapi import FastAPI
 import anthropic
 
 app = FastAPI()
-client = anthropic.Anthropic()
-state_manager = StateManager("redis://localhost:6379")
-agent = StatelessAgent(state_manager, client)
-# Module-level handle shared by the queue-backed ``/chat`` endpoint and
-# ``wait_for_result`` below. Defined here so those references resolve
-# at import time; in production wire this through your app's lifespan
-# handler rather than a module global.
-task_queue = RedisTaskQueue("redis://localhost:6379")
+client: Optional[anthropic.Anthropic] = None
+state_manager: Optional[StateManager] = None
+agent: Optional[StatelessAgent] = None
+task_queue: Optional[RedisTaskQueue] = None
 
 
-@app.post("/chat")
-async def chat(conversation_id: str, message: str):
+def get_agent() -> StatelessAgent:
+    """Lazily construct clients so imports do not perform network setup."""
+    global client, state_manager, agent
+    if agent is None:
+        client = anthropic.Anthropic()
+        state_manager = StateManager("redis://localhost:6379")
+        agent = StatelessAgent(state_manager, client)
+    return agent
+
+
+def get_task_queue() -> RedisTaskQueue:
+    """Lazily construct the queue client outside module import."""
+    global task_queue
+    if task_queue is None:
+        task_queue = RedisTaskQueue("redis://localhost:6379")
+    return task_queue
+
+
+@app.post("/chat/direct")
+async def chat_direct(conversation_id: str, message: str):
     # ``agent.process_message`` is synchronous (it issues blocking
     # Redis + Anthropic SDK calls). Calling it directly from an async
     # endpoint would block the event loop and serialize every concurrent
@@ -1907,7 +2070,7 @@ async def chat(conversation_id: str, message: str):
     # off to the default ThreadPoolExecutor so the loop can serve other
     # requests while this one waits on I/O.
     response = await asyncio.to_thread(
-        agent.process_message, conversation_id, message
+        get_agent().process_message, conversation_id, message
     )
     return {"response": response}
 
@@ -1926,7 +2089,9 @@ async def wait_for_result(
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        raw = await asyncio.to_thread(task_queue.redis.get, f"task:{task_id}")
+        raw = await asyncio.to_thread(
+            get_task_queue().redis.get, f"task:{task_id}"
+        )
         if raw:
             task = AgentTask.from_json(raw)
             if task.status == TaskStatus.COMPLETED:
@@ -1937,8 +2102,8 @@ async def wait_for_result(
     return None
 
 
-@app.post("/chat")
-async def chat(conversation_id: str, message: str):
+@app.post("/chat/queued")
+async def chat_queued(conversation_id: str, message: str):
     task = AgentTask(
         task_id=str(uuid.uuid4()),
         conversation_id=conversation_id,
@@ -1946,7 +2111,7 @@ async def chat(conversation_id: str, message: str):
         created_at=time.time(),
     )
 
-    task_queue.enqueue(task)
+    get_task_queue().enqueue(task)
 
     # Poll for result (or use websockets/webhooks)
     result = await wait_for_result(task.task_id, timeout=60)
@@ -1974,11 +2139,9 @@ class PriorityTaskQueue:
     """
     Task queue with priority levels.
 
-    Note: the dequeue loop below checks multiple queues and is
-    not atomic. Under high concurrency, tasks may be processed
-    slightly out of priority order. For strict priority guarantees,
-    use Redis Streams with consumer groups or a Lua script to pop
-    atomically from the highest-priority non-empty queue.
+    Dequeue uses a Redis Lua script so the "find highest-priority
+    non-empty queue and pop one task" operation is atomic across
+    concurrent workers.
     """
 
     def __init__(self, redis_url: str):
@@ -1998,6 +2161,23 @@ class PriorityTaskQueue:
             "normal": "tasks:normal",
             "low": "tasks:low",
         }
+        self._priority_order = ["critical", "high", "normal", "low"]
+        self._dequeue_script = """
+        for i = 1, #KEYS do
+            while true do
+                local task_id = redis.call('RPOP', KEYS[i])
+                if not task_id then
+                    break
+                end
+
+                local task_data = redis.call('GET', ARGV[1] .. task_id)
+                if task_data then
+                    return task_data
+                end
+            end
+        end
+        return nil
+        """
 
     def enqueue(
         self, task: AgentTask, priority: str = "normal"
@@ -2005,27 +2185,30 @@ class PriorityTaskQueue:
         queue_name = self.queues.get(
             priority, self.queues["normal"]
         )
-        self.redis.lpush(queue_name, task.task_id)
         task_key = f"task:{task.task_id}"
-        self.redis.setex(task_key, 86400, task.to_json())
+        pipe = self.redis.pipeline(transaction=True)
+        pipe.setex(task_key, 86400, task.to_json())
+        pipe.lpush(queue_name, task.task_id)
+        pipe.execute()
 
     def dequeue(self, timeout: int = 5) -> Optional[AgentTask]:
-        # Check queues in priority order
-        for priority in ["critical", "high", "normal", "low"]:
-            task_id = self.redis.rpop(self.queues[priority])
-            if task_id:
-                data = self.redis.get(f"task:{task_id}")
-                if data:
-                    return AgentTask.from_json(data)
+        queues = [self.queues[p] for p in self._priority_order]
+        deadline = time.monotonic() + max(timeout, 0)
 
-        # Fall back to blocking pop on normal queue
-        queues = list(self.queues.values())
-        result = self.redis.brpop(queues, timeout=timeout)
-
-        if result:
-            _, task_id = result
-            data = self.redis.get(f"task:{task_id}")
+        while True:
+            data = self.redis.eval(
+                self._dequeue_script,
+                len(queues),
+                *queues,
+                "task:",
+            )
             if data:
                 return AgentTask.from_json(data)
 
-        return None
+            if timeout <= 0 or time.monotonic() >= deadline:
+                return None
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(0.1, remaining))

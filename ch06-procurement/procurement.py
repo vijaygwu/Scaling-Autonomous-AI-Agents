@@ -22,12 +22,15 @@ provide the surrounding context (imports, dependencies) as needed.
 # Block 1 (chapter listing #1)
 # ============================================================================
 
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
+from types import SimpleNamespace
 import logging
 import time
+
+MAX_APPROVAL_CHAIN_ENTRIES = 1000
 
 
 class PurchaseCategory(Enum):
@@ -35,6 +38,7 @@ class PurchaseCategory(Enum):
 
     SOFTWARE = "software"  # Requires security review above $10K
     HARDWARE = "hardware"  # Requires IT approval
+    IT_EQUIPMENT = "hardware"  # Alias used by tests/examples
     SERVICES = "services"  # Requires legal review above $25K
     OFFICE_SUPPLIES = "office_supplies"  # Low friction
     TRAVEL = "travel"  # Requires manager approval
@@ -530,7 +534,7 @@ class ApprovalTask:
     risk_level: str = ""
     recommendations: list[str] = field(default_factory=list)
     compliance_issues: list[Any] = field(default_factory=list)
-    submitted_at: Optional[datetime] = None
+    submitted_at: Optional[float] = None
     waiting_time: float = 0.0
 
 
@@ -659,12 +663,17 @@ class IdentityService:
     Book 2, Chapter 1.
     """
 
-    def __init__(self):
-        self._agents: dict[str, dict[str, Any]] = {}
-        self._users: dict[str, _User] = {}
+    def __init__(self, max_agents: int = 10_000, max_users: int = 10_000):
+        self._agents: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._users: "OrderedDict[str, _User]" = OrderedDict()
+        self._max_agents = max_agents
+        self._max_users = max_users
 
     def register_agent(self, agent_id: str, scopes: list[str]) -> None:
         self._agents[agent_id] = {"scopes": list(scopes)}
+        self._agents.move_to_end(agent_id)
+        while len(self._agents) > self._max_agents:
+            self._agents.popitem(last=False)
 
     def register_user(
         self,
@@ -675,9 +684,15 @@ class IdentityService:
         self._users[user_id] = _User(
             user_id, list(permissions), spending_limit
         )
+        self._users.move_to_end(user_id)
+        while len(self._users) > self._max_users:
+            self._users.popitem(last=False)
 
     async def get_user(self, user_id: str) -> Optional[_User]:
-        return self._users.get(user_id)
+        user = self._users.get(user_id)
+        if user is not None:
+            self._users.move_to_end(user_id)
+        return user
 
     async def authenticate(self, agent_id: str, token: str) -> AuthResult:
         # Demo-only token convention: valid-token-for-<id>
@@ -689,6 +704,7 @@ class IdentityService:
             return AuthResult(
                 authorized=False, reason="invalid token", agent_id=agent_id
             )
+        self._agents.move_to_end(agent_id)
         return AuthResult(
             authorized=True,
             agent_id=agent_id,
@@ -707,28 +723,57 @@ class BudgetService:
     For production, swap in the BudgetManager from Book 2, Chapter 3.
     """
 
-    def __init__(self):
-        self._caps: dict[str, dict[str, float]] = {}
-        self._spent: dict[str, dict[str, float]] = defaultdict(
-            lambda: {"daily": 0.0, "monthly": 0.0}
-        )
+    def __init__(self, max_cost_centers: int = 10_000):
+        self._caps: "OrderedDict[str, dict[str, float]]" = OrderedDict()
+        self._spent: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._max_cost_centers = max_cost_centers
 
     def set_cap(self, cost_center: str, daily: float, monthly: float) -> None:
         self._caps[cost_center] = {"daily": daily, "monthly": monthly}
+        self._caps.move_to_end(cost_center)
+        while len(self._caps) > self._max_cost_centers:
+            stale_cost_center, _ = self._caps.popitem(last=False)
+            self._spent.pop(stale_cost_center, None)
 
     def can_spend(self, cost_center: str, amount: float) -> bool:
         cap = self._caps.get(cost_center)
         if not cap:
             return False
-        s = self._spent[cost_center]
+        self._caps.move_to_end(cost_center)
+        s = self._get_spend_bucket(cost_center)
         return (
             s["daily"] + amount <= cap["daily"]
             and s["monthly"] + amount <= cap["monthly"]
         )
 
     def record_spend(self, cost_center: str, amount: float) -> None:
-        self._spent[cost_center]["daily"] += amount
-        self._spent[cost_center]["monthly"] += amount
+        bucket = self._get_spend_bucket(cost_center)
+        bucket["daily"] += amount
+        bucket["monthly"] += amount
+
+    def _get_spend_bucket(self, cost_center: str) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        day_key = now.date().isoformat()
+        month_key = f"{now.year:04d}-{now.month:02d}"
+        bucket = self._spent.get(cost_center)
+        if bucket is None:
+            bucket = {
+                "daily": 0.0,
+                "monthly": 0.0,
+                "day": day_key,
+                "month": month_key,
+            }
+            self._spent[cost_center] = bucket
+        self._spent.move_to_end(cost_center)
+        if bucket["day"] != day_key:
+            bucket["daily"] = 0.0
+            bucket["day"] = day_key
+        if bucket["month"] != month_key:
+            bucket["monthly"] = 0.0
+            bucket["month"] = month_key
+        while len(self._spent) > self._max_cost_centers:
+            self._spent.popitem(last=False)
+        return bucket
 
     async def get_remaining(
         self,
@@ -738,7 +783,7 @@ class BudgetService:
         cap = self._caps.get(cost_center)
         if not cap:
             return 0.0
-        return max(0.0, cap[period] - self._spent[cost_center][period])
+        return max(0.0, cap[period] - self._get_spend_bucket(cost_center)[period])
 
 
 # ------------------------------------------------------------
@@ -754,23 +799,46 @@ class EventBus:
     ``request.something`` event).
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        max_subscribers_per_topic: int = 100,
+        max_topics: int = 1_000,
+        handler_timeout_seconds: float = 5.0,
+    ):
         self._exact: dict[str, list[Callable[[dict], Awaitable[None]]]] = (
             defaultdict(list)
         )
         self._wildcards: dict[
             str, list[Callable[[dict], Awaitable[None]]]
         ] = defaultdict(list)
+        self._max_subscribers_per_topic = max_subscribers_per_topic
+        self._max_topics = max_topics
+        self._handler_timeout_seconds = handler_timeout_seconds
+        self.failed_deliveries: deque[dict[str, Any]] = deque(maxlen=1000)
 
     def subscribe(
         self,
         topic: str,
         handler: Callable[[dict], Awaitable[None]],
-    ) -> None:
-        if topic.endswith(".*"):
-            self._wildcards[topic[:-2]].append(handler)
-        else:
-            self._exact[topic].append(handler)
+    ) -> Callable[[], None]:
+        registry = self._wildcards if topic.endswith(".*") else self._exact
+        key = topic[:-2] if topic.endswith(".*") else topic
+        if key not in registry and self._topic_count() >= self._max_topics:
+            raise ValueError("too many event topics registered")
+        if len(registry[key]) >= self._max_subscribers_per_topic:
+            raise ValueError(f"too many subscribers for topic {topic}")
+        registry[key].append(handler)
+
+        def unsubscribe() -> None:
+            try:
+                registry[key].remove(handler)
+            except ValueError:
+                pass
+
+        return unsubscribe
+
+    def _topic_count(self) -> int:
+        return len(self._exact) + len(self._wildcards)
 
     async def emit(self, topic: str, event: dict) -> None:
         envelope = {
@@ -780,34 +848,46 @@ class EventBus:
         }
         # Exact-match subscribers
         for h in self._exact.get(topic, []):
-            try:
-                await h(envelope)
-            except Exception as exc:  # noqa: BLE001
-                # Never let one subscriber block others, but surface
-                # the failure on the structured logger so dropped
-                # deliveries are observable. Production: also push
-                # to a DLQ.
-                logging.getLogger(__name__).warning(
-                    "exact-match subscriber failed for %s: %s",
-                    envelope.get("topic", "?"),
-                    exc,
-                )
+            await self._deliver(h, envelope, "exact")
         # Wildcard subscribers: walk every prefix of topic
         parts = topic.split(".")
         for i in range(1, len(parts) + 1):
             prefix = ".".join(parts[:i])
             for h in self._wildcards.get(prefix, []):
-                try:
-                    await h(envelope)
-                except Exception as exc:  # noqa: BLE001
-                    # Wildcard handlers must not break the publish loop;
-                    # surface the failure on the structured logger so
-                    # ops can see the dropped delivery.
-                    logging.getLogger(__name__).warning(
-                        "wildcard handler failed for %s: %s",
-                        envelope.get("topic", "?"),
-                        exc,
-                    )
+                await self._deliver(h, envelope, "wildcard")
+
+    async def _deliver(
+        self,
+        handler: Callable[[dict], Awaitable[None]],
+        envelope: dict,
+        subscription_type: str,
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                handler(envelope), timeout=self._handler_timeout_seconds
+            )
+        except (
+            asyncio.TimeoutError,
+            TimeoutError,
+            RuntimeError,
+            OSError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            self.failed_deliveries.append(
+                {
+                    "topic": envelope.get("topic"),
+                    "subscription_type": subscription_type,
+                    "error": str(exc),
+                    "event": envelope.get("event"),
+                }
+            )
+            logging.getLogger(__name__).warning(
+                "%s subscriber failed for %s: %s",
+                subscription_type,
+                envelope.get("topic", "?"),
+                exc,
+            )
 
     # Backward-compatible alias
     publish = emit
@@ -829,22 +909,36 @@ class AgentMetrics:
     """
 
     MAX_TIMING_SAMPLES = 10_000
+    MAX_METRIC_KEYS = 1_000
 
     def __init__(self, agent_id: str = "anonymous"):
         self.agent_id = agent_id
-        self.counters: dict[str, int] = defaultdict(int)
-        self.timings: dict[str, deque[float]] = defaultdict(
-            lambda: deque(maxlen=self.MAX_TIMING_SAMPLES)
-        )
+        self.counters: OrderedDict[str, int] = OrderedDict()
+        self.timings: OrderedDict[str, deque[float]] = OrderedDict()
+
+    def _ensure_metric_key(self, registry: OrderedDict, name: str, factory):
+        if name in registry:
+            registry.move_to_end(name)
+            return registry[name]
+        if len(registry) >= self.MAX_METRIC_KEYS:
+            registry.popitem(last=False)
+        registry[name] = factory()
+        return registry[name]
 
     def increment(self, name: str, by: int = 1) -> None:
-        self.counters[name] += by
+        current = self._ensure_metric_key(self.counters, name, lambda: 0)
+        self.counters[name] = current + by
 
     def get(self, name: str, default: int = 0) -> int:
         return self.counters.get(name, default)
 
     def record_timing(self, name: str, seconds: float) -> None:
-        self.timings[name].append(seconds)
+        samples = self._ensure_metric_key(
+            self.timings,
+            name,
+            lambda: deque(maxlen=self.MAX_TIMING_SAMPLES),
+        )
+        samples.append(seconds)
 
 
 class OrchestratorMetrics(AgentMetrics):
@@ -866,7 +960,11 @@ class OrchestratorMetrics(AgentMetrics):
 class ApproverRegistry:
     """Maps approval levels to eligible approvers."""
 
-    def __init__(self):
+    def __init__(
+        self, max_approvers: int = 10_000, max_delegations: int = 10_000
+    ):
+        self._max_approvers = max_approvers
+        self._max_delegations = max_delegations
         self._by_level: dict[Any, list[Approver]] = defaultdict(list)
         self._by_id: dict[str, Approver] = {}
         self._delegations: list[DelegationRule] = []
@@ -877,10 +975,24 @@ class ApproverRegistry:
         if approver is None and isinstance(level, Approver):
             approver = level
             level = approver.level
+        if approver is None:
+            raise ValueError("approver is required")
+        if approver.approver_id not in self._by_id:
+            if len(self._by_id) >= self._max_approvers:
+                raise ValueError("too many approvers registered")
+        else:
+            prior = self._by_id[approver.approver_id]
+            for approvers in self._by_level.values():
+                try:
+                    approvers.remove(prior)
+                except ValueError:
+                    pass
         self._by_level[level].append(approver)
         self._by_id[approver.approver_id] = approver
 
     def add_delegation(self, rule: DelegationRule) -> None:
+        if len(self._delegations) >= self._max_delegations:
+            raise ValueError("too many delegation rules registered")
         self._delegations.append(rule)
 
     def approvers_for(self, level: Any) -> list[Approver]:
@@ -902,14 +1014,21 @@ class VendorDatabase:
     For production, replace with a real CRM/ERP integration.
     """
 
-    def __init__(self):
-        self._vendors: dict[str, Any] = {}
+    def __init__(self, max_vendors: int = 100_000):
+        self._vendors: "OrderedDict[str, Any]" = OrderedDict()
+        self._max_vendors = max_vendors
 
     def add(self, vendor: Any) -> None:
         self._vendors[vendor.id] = vendor
+        self._vendors.move_to_end(vendor.id)
+        while len(self._vendors) > self._max_vendors:
+            self._vendors.popitem(last=False)
 
     async def get(self, vendor_id: str) -> Optional[Any]:
-        return self._vendors.get(vendor_id)
+        vendor = self._vendors.get(vendor_id)
+        if vendor is not None:
+            self._vendors.move_to_end(vendor_id)
+        return vendor
 
     async def find_by_category(self, category: Any) -> list[Any]:
         return [
@@ -922,8 +1041,11 @@ class VendorDatabase:
 class ContractService:
     """Looks up negotiated pricing for a vendor and item."""
 
-    def __init__(self):
-        self._contracts: dict[tuple[str, str], dict[str, Any]] = {}
+    def __init__(self, max_contracts: int = 100_000):
+        self._contracts: "OrderedDict[tuple[str, str], dict[str, Any]]" = (
+            OrderedDict()
+        )
+        self._max_contracts = max_contracts
 
     def set_contract(
         self,
@@ -932,19 +1054,25 @@ class ContractService:
         unit_price: float,
         valid_until: Optional[datetime] = None,
     ) -> None:
-        self._contracts[(vendor_id, item_name)] = {
+        key = (vendor_id, item_name)
+        self._contracts[key] = {
             "unit_price": unit_price,
             "valid_until": valid_until,
         }
+        self._contracts.move_to_end(key)
+        while len(self._contracts) > self._max_contracts:
+            self._contracts.popitem(last=False)
 
     async def find_contract(
         self,
         vendor_id: str,
         item_name: str,
     ) -> Optional[dict[str, Any]]:
-        c = self._contracts.get((vendor_id, item_name))
+        key = (vendor_id, item_name)
+        c = self._contracts.get(key)
         if not c:
             return None
+        self._contracts.move_to_end(key)
         if c["valid_until"] and c["valid_until"] < datetime.now(timezone.utc):
             return None
         return c
@@ -968,6 +1096,12 @@ class MockLLM:
         self._responses = list(responses or [])
         self._default = MockResponse(content="(mock default response)")
         self.calls: list[dict] = []
+
+    def add_response(self, response: MockResponse) -> None:
+        self._responses.append(response)
+
+    def set_default_response(self, response: MockResponse) -> None:
+        self._default = response
 
     async def complete(
         self,
@@ -1122,7 +1256,7 @@ class IntakeAgent:
         self.validation_rules: list[ValidationRule] = []
         self.metrics = AgentMetrics()
 
-    def add_rule(self, rule: ValidationRule):
+    def add_rule(self, rule: ValidationRule) -> None:
         """Add a validation rule."""
         self.validation_rules.append(rule)
 
@@ -1199,7 +1333,7 @@ class IntakeAgent:
 
             return result
 
-        except Exception as e:
+        except (TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as e:
             self.metrics.increment("requests_errored")
             raise IntakeError(f"Intake processing failed: {e}") from e
 
@@ -1350,6 +1484,17 @@ class AnalysisAgent:
             total_potential_savings = 0.0
             compliance_issues = []
 
+            if not request.items:
+                compliance_issues.append(
+                    ComplianceIssue(
+                        severity="high",
+                        rule="MISSING_ITEMS",
+                        message=(
+                            "Purchase request must include at least one item"
+                        ),
+                    )
+                )
+
             for item in request.items:
                 item_analysis = await self._analyze_item(item, context)
                 item_analyses.append(item_analysis)
@@ -1358,7 +1503,7 @@ class AnalysisAgent:
 
             # Overall risk assessment
             risk = await self._assess_risk(
-                request, item_analyses, compliance_issues
+                request, item_analyses, compliance_issues, context
             )
 
             # Generate recommendations
@@ -1386,7 +1531,7 @@ class AnalysisAgent:
 
             return result
 
-        except Exception as e:
+        except (TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as e:
             self.metrics.increment("requests_errored")
             raise AnalysisError(f"Analysis failed: {e}") from e
 
@@ -1397,41 +1542,38 @@ class AnalysisAgent:
         analysis = ItemAnalysis(item_name=item.name)
 
         # AnalysisAgent.vendor_db is None until the orchestrator wires
-        # it in at startup; fall back to a no-savings analysis rather
-        # than crashing with AttributeError if a caller forgot to
-        # configure it.
+        # it in at startup; skip only alternative-vendor comparison so
+        # contract pricing and compliance checks below can still run.
         if self.vendor_db is None:
             analysis.savings_reason = (
                 "vendor_db not configured; alternative-vendor analysis "
                 "skipped"
             )
-            return analysis
+        else:
+            # Find alternative vendors
+            vendors = await self.vendor_db.find_by_category(item.category)
+            preferred = [
+                v for v in vendors if v.preferred and v.compliance_certified
+            ]
 
-        # Find alternative vendors
-        vendors = await self.vendor_db.find_by_category(item.category)
-        preferred = [
-            v for v in vendors if v.preferred and v.compliance_certified
-        ]
+            if preferred:
+                best = max(preferred, key=lambda v: v.rating)
+                analysis.recommended_vendor = best
 
-        if preferred:
-            best = max(preferred, key=lambda v: v.rating)
-            analysis.recommended_vendor = best
+                # Estimate savings from preferred vendor pricing
+                if best.id != item.vendor_id:
+                    # Placeholder savings estimate. A production version would
+                    # query ContractService.find_contract(vendor, item) for each
+                    # alternative vendor, compute price deltas against the
+                    # incumbent, and report the realized minimum. The 5%
+                    # multiplier here is illustrative only.
+                    analysis.potential_savings = item.total_price * 0.05
+                    analysis.savings_reason = (
+                        f"Switch to preferred vendor {best.name}"
+                    )
 
-            # Estimate savings from preferred vendor pricing
-            if best.id != item.vendor_id:
-                # Placeholder savings estimate. A production version would
-                # query ContractService.find_contract(vendor, item) for each
-                # alternative vendor, compute price deltas against the
-                # incumbent, and report the realized minimum. The 5%
-                # multiplier here is illustrative only.
-                analysis.potential_savings = item.total_price * 0.05
-                analysis.savings_reason = (
-                    f"Switch to preferred vendor {best.name}"
-                )
-
-        # Check compliance
-        if item.total_price > 10000:
-            if item.vendor_id:
+            # Check compliance
+            if item.total_price > 10000 and item.vendor_id:
                 vendor = await self.vendor_db.get(item.vendor_id)
                 if vendor and not vendor.compliance_certified:
                     analysis.compliance_issues.append(
@@ -1445,7 +1587,7 @@ class AnalysisAgent:
 
         # Check for contract pricing
         contract = await context.contract_service.find_contract(
-            item.vendor_id, item.category
+            item.vendor_id, item.name
         )
         if contract and item.unit_price > contract["unit_price"]:
             savings = (
@@ -1464,6 +1606,7 @@ class AnalysisAgent:
         request: PurchaseRequest,
         item_analyses: list[ItemAnalysis],
         compliance_issues: list[ComplianceIssue],
+        context: ProcessingContext,
     ) -> RiskAssessment:
         """Assess overall risk of the request."""
         factors = []
@@ -1491,7 +1634,10 @@ class AnalysisAgent:
         # New vendor risk
         for item in request.items:
             if item.vendor_id:
-                vendor = await self.vendor_db.get(item.vendor_id)
+                vendor_db = self.vendor_db or context.vendor_db
+                if vendor_db is None:
+                    continue
+                vendor = await vendor_db.get(item.vendor_id)
                 if vendor and vendor.risk_score > 50:
                     factors.append(f"High-risk vendor: {vendor.name}")
                     score += 20
@@ -1572,7 +1718,7 @@ class ApprovalAgent:
 
     def __init__(self, agent_id: str = "approval-agent"):
         self.agent_id = agent_id
-        self.approver_registry: ApproverRegistry = None
+        self.approver_registry: Optional[ApproverRegistry] = None
         self.delegation_rules: list[DelegationRule] = []
         self.metrics = AgentMetrics()
 
@@ -1597,6 +1743,7 @@ class ApprovalAgent:
                     "reason": auto_result.reason,
                 }
             )
+            del request.approval_chain[:-MAX_APPROVAL_CHAIN_ENTRIES]
             request.update_status(
                 RequestStatus.APPROVED,
                 self.agent_id,
@@ -1622,7 +1769,7 @@ class ApprovalAgent:
                 "timestamp": time.time(),
             }
             for approver in chain
-        ]
+        ][-MAX_APPROVAL_CHAIN_ENTRIES:]
 
         # Notify approvers
         await self._notify_approvers(request, chain, context)
@@ -1686,6 +1833,7 @@ class ApprovalAgent:
                     "notes": notes,
                 }
             )
+            del request.approval_chain[:-MAX_APPROVAL_CHAIN_ENTRIES]
 
         if decision == "approved":
             # Check if all required approvals are complete
@@ -1924,7 +2072,9 @@ class ProcurementOrchestrator:
     - Metrics collection
     """
 
-    def __init__(self):
+    def __init__(self, max_in_memory_requests: int = 10_000):
+        if max_in_memory_requests < 1:
+            raise ValueError("max_in_memory_requests must be >= 1")
         self.intake = IntakeAgent()
         self.analysis = AnalysisAgent()
         self.approval = ApprovalAgent()
@@ -1937,7 +2087,7 @@ class ProcurementOrchestrator:
         self.requests: "OrderedDict[str, PurchaseRequest]" = (
             __import__("collections").OrderedDict()
         )
-        self._max_in_memory_requests = 10_000
+        self._max_in_memory_requests = max_in_memory_requests
         # Per-request context map: submit_request stashes the
         # ProcessingContext under request.id so handle_approval_decision
         # can recover the same identity/budget/contract services
@@ -1948,6 +2098,19 @@ class ProcurementOrchestrator:
 
         # Set up tracing
         self.tracer = trace.get_tracer("procurement-orchestrator")
+
+    def _evict_oldest_request(self) -> None:
+        """Drop the oldest in-memory request and its processing context.
+
+        Used as the single entry point for hot-cache eviction so the
+        ``self.requests`` OrderedDict and the ``self._contexts`` dict
+        cannot drift out of sync; the durable purchase-request store
+        retains the request itself.
+        """
+        if not self.requests:
+            return
+        evicted_id, _ = self.requests.popitem(last=False)
+        self._contexts.pop(evicted_id, None)
 
     async def submit_request(
         self, request: PurchaseRequest, context: ProcessingContext
@@ -1983,12 +2146,15 @@ class ProcurementOrchestrator:
             self.requests[request.id] = request
             self._contexts[request.id] = context
             self.metrics.increment("requests_submitted")
-            # Bound the in-memory hot cache. ``OrderedDict.popitem(
-            # last=False)`` evicts the oldest insertion; the request
-            # itself remains durable in your purchase-request store.
+            # Bound the in-memory hot cache via the single
+            # ``_evict_oldest_request`` helper so contexts and requests
+            # are guaranteed to evict together; the request itself
+            # remains durable in your purchase-request store.
             while len(self.requests) > self._max_in_memory_requests:
-                evicted_id, _ = self.requests.popitem(last=False)
-                self._contexts.pop(evicted_id, None)
+                self._evict_oldest_request()
+            assert len(self._contexts) <= len(self.requests), (
+                "_contexts/requests sync invariant violated"
+            )
 
             await self.event_bus.emit(
                 "request.submitted",
@@ -2102,7 +2268,17 @@ class ProcurementOrchestrator:
                     },
                 )
 
-            except Exception as e:
+            except (IntakeError, AnalysisError, ApprovalError) as e:
+                span.record_exception(e)
+                self.metrics.increment("requests_errored")
+
+                await self.event_bus.emit(
+                    "request.error",
+                    {"request_id": request.id, "error": str(e)},
+                )
+
+                raise
+            except (TimeoutError, RuntimeError, OSError, ValueError) as e:
                 span.record_exception(e)
                 self.metrics.increment("requests_errored")
 
@@ -2114,6 +2290,65 @@ class ProcurementOrchestrator:
                 raise ProcurementError(
                     f"Failed to process request {request.id}: {e}"
                 ) from e
+
+    async def process(
+        self,
+        request: PurchaseRequest,
+        context: Optional[ProcessingContext] = None,
+    ) -> SimpleNamespace:
+        """Compatibility wrapper for older tests/listings.
+
+        The production API is ``submit_request(request, context)``.
+        This wrapper keeps extracted examples runnable by creating a
+        default context and translating the result back to the older
+        ``status``/``approval_level`` shape.
+        """
+        if context is None:
+            context = ProcessingContext(request_id=request.id)
+            context.identity_service.register_user(
+                request.requester_id,
+                permissions=["procurement:create"],
+                spending_limit=max(request.total_amount, 1_000_000),
+            )
+            context.budget_service.set_cap(
+                request.requester_department,
+                daily=max(request.total_amount, 1_000_000),
+                monthly=max(request.total_amount, 1_000_000),
+            )
+        required_level = request.required_approval_level
+        if (
+            required_level != ApprovalLevel.AUTO
+            and not context.approver_registry.approvers_for(required_level)
+        ):
+            context.approver_registry.register(
+                required_level,
+                Approver(
+                    approver_id=f"default-{required_level.value}",
+                    name=f"Default {required_level.value.title()} Approver",
+                    role="Approver",
+                    max_approval_amount=max(request.total_amount, 1_000_000),
+                    level=required_level,
+                    departments=[request.requester_department],
+                ),
+            )
+
+        result = await self.submit_request(request, context)
+        if result.status == "completed":
+            status = RequestStatus.APPROVED
+            approver_name = "Auto-Approval"
+        elif result.status == "pending_approval":
+            status = RequestStatus.PENDING_APPROVAL
+            approver_name = ""
+        else:
+            status = request.status
+            approver_name = ""
+
+        return SimpleNamespace(
+            status=status,
+            approval_level=required_level,
+            approver_name=approver_name,
+            submission=result,
+        )
 
     async def handle_approval_decision(
         self,
@@ -2401,7 +2636,7 @@ class ProcurementDashboard:
         ]
 
     def _get_decisions_today(self, decision: str) -> int:
-        today = datetime.now(timezone.utc).date()
+        current_date = datetime.now(timezone.utc).date()
         total = 0
         for envelope in self._recent_events:
             if envelope.get("topic") != "approval.decision":
@@ -2413,7 +2648,7 @@ class ProcurementDashboard:
             except (KeyError, ValueError):
                 continue
             if (
-                event_date == today
+                event_date == current_date
                 and envelope.get("event", {}).get("decision") == decision
             ):
                 total += 1
@@ -2574,8 +2809,29 @@ if __name__ == "__main__":
 # on the path; otherwise the except branch leaves the in-module class
 # definitions (Mock LLM, PurchaseRequest, etc.) intact for tests to
 # collect against.
-import pytest
+import importlib
 from unittest.mock import AsyncMock
+
+try:
+    pytest = importlib.import_module("pytest")
+except ImportError:
+    class _PytestMarkStub:
+        def parametrize(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+
+    class _PytestStub:
+        mark = _PytestMarkStub()
+
+        def fixture(self, func=None, **kwargs):
+            if func is None:
+                def decorator(wrapped):
+                    return wrapped
+                return decorator
+            return func
+
+    pytest = _PytestStub()
 
 try:
     # In a real project this imports from your src/procurement/ tree.
@@ -2657,16 +2913,23 @@ async def test_analysis_agent_flags_compliance_issues(mock_llm):
     mock_llm.set_default_response(
         MockResponse(content="Compliance issue: Missing cost center code.")
     )
-    agent = AnalysisAgent(llm=mock_llm)
+    agent = AnalysisAgent()
 
     incomplete_request = PurchaseRequest(
         id="REQ-002",
         requester_id="user_456",
+        requester_name="Test User",
+        requester_email="test@example.com",
+        requester_department="Engineering",
         items=[],  # Empty items list
-        cost_center=None,  # Missing required field
+        business_justification="",
     )
 
-    result = await agent.analyze(incomplete_request)
+    context = ProcessingContext(
+        request_id=incomplete_request.id,
+        actor_agent_id=agent.agent_id,
+    )
+    result = await agent.process(incomplete_request, context)
 
     assert len(result.compliance_issues) > 0
 
@@ -2678,8 +2941,6 @@ async def test_analysis_agent_flags_compliance_issues(mock_llm):
 #
 # Imports below are guarded so this listing parses when extracted as a
 # single module. In your project, they resolve from src/procurement/.
-import pytest
-
 try:
     # See the unit-test block above for the rebind-via-``as`` rationale.
     # In-module fallbacks keep tests collectable in either layout.
@@ -2698,22 +2959,33 @@ except ImportError:
 
 @pytest.fixture
 def orchestrator():
-    return ProcurementOrchestrator(config=test_config)
+    return ProcurementOrchestrator()
 
 
 def create_test_request(amount: float, category: str) -> PurchaseRequest:
     """Helper to create test requests with specified amount."""
+    category_map = {
+        "software": PurchaseCategory.SOFTWARE,
+        "hardware": PurchaseCategory.HARDWARE,
+        "office_supplies": PurchaseCategory.OFFICE_SUPPLIES,
+        "consulting": PurchaseCategory.SERVICES,
+    }
+    purchase_category = category_map.get(category, PurchaseCategory.SERVICES)
     return PurchaseRequest(
         id=f"REQ-{uuid.uuid4().hex[:8]}",
         requester_id="test_user",
+        requester_name="Test User",
+        requester_email="test@example.com",
+        requester_department="Engineering",
         items=[
             PurchaseItem(
-                description=f"Test {category} purchase",
+                name=f"Test {category} purchase",
                 quantity=1,
                 unit_price=amount,
-                category=category,
+                category=purchase_category,
             )
         ],
+        business_justification=f"Test {category} purchase",
     )
 
 
@@ -2752,8 +3024,6 @@ async def test_restricted_category_requires_review(orchestrator):
 # ============================================================================
 
 # tests/scenarios/test_approval_routing.py
-import pytest
-
 
 @pytest.mark.parametrize(
     "amount,expected_level",

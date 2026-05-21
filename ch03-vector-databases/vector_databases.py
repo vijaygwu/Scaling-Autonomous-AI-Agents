@@ -16,6 +16,26 @@ provide the surrounding context (imports, dependencies) as needed.
 """
 
 import logging
+import random
+import threading
+import time
+
+_TRANSIENT_LLM_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+try:  # Optional provider SDK; keep this file importable without it.
+    from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
+except ImportError:  # pragma: no cover - dependency not required for examples
+    pass
+else:
+    _TRANSIENT_LLM_EXCEPTIONS = _TRANSIENT_LLM_EXCEPTIONS + (
+        APIConnectionError,
+        APIError,
+        APITimeoutError,
+        RateLimitError,
+    )
 
 
 # ============================================================================
@@ -405,6 +425,11 @@ class InstructorEmbedding(EmbeddingModel):
         instruction = "Represent the document for retrieval:"
         return self.embed_text(document, instruction)
 
+    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        instruction = "Represent the document for retrieval:"
+        embeddings = self.model.encode([[instruction, text] for text in texts])
+        return [embedding.tolist() for embedding in embeddings]
+
 # ============================================================================
 # Block 7 (chapter listing #7)
 # ============================================================================
@@ -421,6 +446,8 @@ def truncate_embedding(
     truncated = embedding[:target_dim]
     # Re-normalize after truncation
     norm = np.linalg.norm(truncated)
+    if norm == 0:
+        raise ValueError("Cannot normalize a zero embedding vector")
     return (np.array(truncated) / norm).tolist()
 
 # ============================================================================
@@ -682,10 +709,24 @@ class SemanticChunker(DocumentChunker):
 
         # Get embeddings for all sentences
         embeddings = self.embedding_model.embed_batch(sentences)
+        if len(embeddings) != len(sentences):
+            raise ValueError(
+                f"Embedding model returned {len(embeddings)} embeddings "
+                f"for {len(sentences)} sentences"
+            )
 
         chunks = []
         current_chunk_sentences = [sentences[0]]
         current_chunk_embedding = embeddings[0]
+        sentence_starts = []
+        search_offset = 0
+        for sentence in sentences:
+            start = document.content.find(sentence, search_offset)
+            if start == -1:
+                start = search_offset
+            sentence_starts.append(start)
+            search_offset = start + len(sentence)
+        current_chunk_start = sentence_starts[0]
         chunk_index = 0
 
         for i in range(1, len(sentences)):
@@ -708,7 +749,7 @@ class SemanticChunker(DocumentChunker):
             if should_break:
                 # Save current chunk
                 chunk_text = " ".join(current_chunk_sentences)
-                start_char = document.content.find(current_chunk_sentences[0])
+                start_char = current_chunk_start
 
                 chunks.append(
                     DocumentChunk(
@@ -727,6 +768,7 @@ class SemanticChunker(DocumentChunker):
 
                 current_chunk_sentences = [sentence]
                 current_chunk_embedding = sentence_embedding
+                current_chunk_start = sentence_starts[i]
                 chunk_index += 1
             else:
                 current_chunk_sentences.append(sentence)
@@ -741,7 +783,7 @@ class SemanticChunker(DocumentChunker):
         # Save final chunk
         if current_chunk_sentences:
             chunk_text = " ".join(current_chunk_sentences)
-            start_char = document.content.find(current_chunk_sentences[0])
+            start_char = current_chunk_start
 
             chunks.append(
                 DocumentChunk(
@@ -870,7 +912,12 @@ class Retriever(ABC):
     """Abstract base class for retrievers."""
 
     @abstractmethod
-    def retrieve(self, query: str, top_k: int = 5) -> List[RetrievalResult]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[RetrievalResult]:
         """Retrieve relevant chunks for a query."""
         pass
 
@@ -889,13 +936,15 @@ class VectorRetriever(Retriever):
         query: str,
         top_k: int = 5,
         filter_metadata: Dict[str, Any] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalResult]:
         query_embedding = self.embedding_model.embed_text(query)
+        effective_filter = metadata_filter or filter_metadata
 
         results = self.vector_store.search(
             query_vector=query_embedding,
             top_k=top_k,
-            filter_metadata=filter_metadata,
+            filter_metadata=effective_filter,
         )
 
         return [
@@ -929,20 +978,22 @@ class BM25Retriever(Retriever):
     MAX_IN_MEMORY_DOCUMENTS = 100_000
 
     def __init__(
-        self, documents: List[DocumentChunk], k1: float = 1.5, b: float = 0.75
+        self,
+        documents: List[DocumentChunk],
+        k1: float = 1.5,
+        b: float = 0.75,
+        max_documents: int = MAX_IN_MEMORY_DOCUMENTS,
     ):
         # The default values k1=1.5 and b=0.75 were empirically derived by
         # Robertson et al. and remain effective across diverse corpora.
         self.k1 = k1
         self.b = b
-        if len(documents) > self.MAX_IN_MEMORY_DOCUMENTS:
-            import warnings
-            warnings.warn(
-                f"BM25Retriever loaded {len(documents)} chunks "
-                f"(soft cap {self.MAX_IN_MEMORY_DOCUMENTS}). For larger "
-                "corpora, back BM25 with Elasticsearch/OpenSearch rather "
-                "than this in-memory implementation.",
-                stacklevel=2,
+        self.max_documents = max_documents
+        if len(documents) > self.max_documents:
+            raise ValueError(
+                f"BM25Retriever received {len(documents)} chunks "
+                f"(hard cap {self.max_documents}). For larger corpora, "
+                "use Elasticsearch/OpenSearch or another external keyword index."
             )
         self.documents = {doc.chunk_id: doc for doc in documents}
         self._build_index(documents)
@@ -1013,7 +1064,12 @@ class BM25Retriever(Retriever):
 
         return score
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[RetrievalResult]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[RetrievalResult]:
         query_terms = self._tokenize(query)
 
         # Get candidate documents (those containing at least one query term)
@@ -1030,8 +1086,13 @@ class BM25Retriever(Retriever):
         scores.sort(key=lambda x: x[1], reverse=True)
 
         results = []
-        for doc_id, score in scores[:top_k]:
+        for doc_id, score in scores:
             doc = self.documents[doc_id]
+            if metadata_filter and any(
+                doc.metadata.get(key) != value
+                for key, value in metadata_filter.items()
+            ):
+                continue
             results.append(
                 RetrievalResult(
                     chunk_id=doc_id,
@@ -1041,6 +1102,8 @@ class BM25Retriever(Retriever):
                     retrieval_method="bm25",
                 )
             )
+            if len(results) >= top_k:
+                break
 
         return results
 
@@ -1156,16 +1219,19 @@ class HybridRetriever(Retriever):
         self,
         query: str,
         top_k: int = 5,
-        vector_k: int = None,
-        keyword_k: int = None,
+        vector_k: Optional[int] = None,
+        keyword_k: Optional[int] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalResult]:
         """Retrieve using hybrid approach."""
         vector_k = vector_k or top_k * 2
         keyword_k = keyword_k or top_k * 2
 
-        vector_results = self.vector_retriever.retrieve(query, top_k=vector_k)
+        vector_results = self.vector_retriever.retrieve(
+            query, top_k=vector_k, metadata_filter=metadata_filter
+        )
         keyword_results = self.keyword_retriever.retrieve(
-            query, top_k=keyword_k
+            query, top_k=keyword_k, metadata_filter=metadata_filter
         )
 
         if self.fusion_method == "rrf":
@@ -1183,6 +1249,7 @@ class HybridRetriever(Retriever):
 
 from datetime import datetime, timezone
 from typing import Set
+from collections import OrderedDict
 import hashlib
 
 
@@ -1194,11 +1261,15 @@ class IndexManager:
         vector_store: "VectorStore",
         embedding_model: EmbeddingModel,
         chunker: DocumentChunker,
+        max_tracked_documents: int = 100_000,
     ):
+        if max_tracked_documents < 1:
+            raise ValueError("max_tracked_documents must be >= 1")
         self.vector_store = vector_store
         self.embedding_model = embedding_model
         self.chunker = chunker
-        self._document_hashes: Dict[str, str] = {}
+        self._max_tracked_documents = max_tracked_documents
+        self._document_hashes: OrderedDict[str, str] = OrderedDict()
 
     def _compute_hash(self, content: str) -> str:
         """Compute content hash for change detection."""
@@ -1211,13 +1282,24 @@ class IndexManager:
             filter={"document_id": document_id}
         )
 
+    def _remember_document_hash(
+        self, document_id: str, content_hash: str
+    ) -> None:
+        """Track recent document hashes without unbounded memory growth."""
+        self._document_hashes[document_id] = content_hash
+        self._document_hashes.move_to_end(document_id)
+        while len(self._document_hashes) > self._max_tracked_documents:
+            self._document_hashes.popitem(last=False)
+
     def add_document(self, document: Document) -> int:
         """Add new document to the index."""
         content_hash = self._compute_hash(document.content)
 
         # Check if document already exists
-        if document.document_id in self._document_hashes:
-            if self._document_hashes[document.document_id] == content_hash:
+        existing_hash = self._document_hashes.get(document.document_id)
+        if existing_hash is not None:
+            self._document_hashes.move_to_end(document.document_id)
+            if existing_hash == content_hash:
                 return 0  # No changes needed
             else:
                 # Document changed, update instead
@@ -1232,6 +1314,11 @@ class IndexManager:
         # Generate embeddings
         contents = [chunk.content for chunk in chunks]
         embeddings = self.embedding_model.embed_batch(contents)
+        if len(embeddings) != len(chunks):
+            raise ValueError(
+                f"Embedding model returned {len(embeddings)} embeddings "
+                f"for {len(chunks)} chunks"
+            )
 
         # Insert into vector store
         vectors_to_insert = []
@@ -1251,7 +1338,7 @@ class IndexManager:
             )
 
         self.vector_store.upsert(vectors_to_insert)
-        self._document_hashes[document.document_id] = content_hash
+        self._remember_document_hash(document.document_id, content_hash)
 
         return len(chunks)
 
@@ -1457,12 +1544,20 @@ class RAGPipeline:
         self,
         retriever: Retriever,
         llm_client: LLMClient,
-        system_prompt: str = None,
+        system_prompt: Optional[str] = None,
         max_context_tokens: int = 4000,
+        timeout_seconds: float = 30.0,
+        max_retries: int = 3,
+        retry_backoff: float = 0.25,
     ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         self.retriever = retriever
         self.llm_client = llm_client
         self.max_context_tokens = max_context_tokens
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         self.system_prompt = system_prompt or (
             "You are a helpful assistant that answers questions based on "
             "the provided context. If the context doesn't contain enough "
@@ -1510,7 +1605,11 @@ class RAGPipeline:
     ) -> RAGResponse:
         """Execute RAG query."""
         # Retrieve relevant context
-        results = self.retriever.retrieve(query=question, top_k=top_k)
+        results = self.retriever.retrieve(
+            query=question,
+            top_k=top_k,
+            metadata_filter=metadata_filter,
+        )
 
         if not results:
             return RAGResponse(
@@ -1522,6 +1621,13 @@ class RAGPipeline:
 
         # Truncate to fit context window
         results = self._truncate_context(results)
+        if not results:
+            return RAGResponse(
+                answer="Retrieved documents exceeded the context budget.",
+                sources=[],
+                confidence=0.0,
+                metadata={"retrieval_count": 0, "context_truncated": True},
+            )
         context = self._format_context(results)
 
         # Construct prompt
@@ -1532,23 +1638,37 @@ Question: {question}
 
 Please answer the question based on the context provided. Cite specific sources when possible."""
 
-        # Generate response. We catch provider errors and degrade
-        # rather than letting one transient blip crash the request:
-        # readers building atop this should keep the degraded path so
-        # the agent can return a "retrieval succeeded; generation
-        # failed" response that the caller can inspect.
-        try:
-            response = self.llm_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=0.1,
-            )
-        except Exception as exc:  # noqa: BLE001 - degrade not crash
+        # Generate response with bounded transient retries. If every
+        # provider attempt fails, degrade rather than crashing the request:
+        # the caller can inspect "retrieval succeeded; generation failed."
+        response = None
+        generation_error: Optional[BaseException] = None
+        for attempt in range(self.max_retries):
+            try:
+                response = self.llm_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=0.1,
+                    timeout=self.timeout_seconds,
+                )
+                break
+            except _TRANSIENT_LLM_EXCEPTIONS as exc:
+                generation_error = exc
+                if attempt == self.max_retries - 1:
+                    break
+                time.sleep(self.retry_backoff * (2**attempt))
+            except (RuntimeError, ValueError) as exc:
+                generation_error = exc
+                break
+
+        if response is None:
             logging.getLogger(__name__).warning(
-                "RAG generation failed for question=%r: %s", question, exc
+                "RAG generation failed for question=%r: %s",
+                question,
+                generation_error,
             )
             return RAGResponse(
                 answer="",
@@ -1556,7 +1676,7 @@ Please answer the question based on the context provided. Cite specific sources 
                 confidence=0.0,
                 metadata={
                     "retrieval_count": len(results),
-                    "generation_error": str(exc),
+                    "generation_error": str(generation_error),
                 },
             )
 
@@ -1583,8 +1703,33 @@ Please answer the question based on the context provided. Cite specific sources 
 class QueryExpander:
     """Expand queries for better retrieval coverage."""
 
-    def __init__(self, llm_client: LLMClient):
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        timeout_seconds: float = 30.0,
+        max_retries: int = 3,
+        retry_backoff: float = 0.25,
+    ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         self.llm_client = llm_client
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+
+    def _completion(self, prompt: str, temperature: float):
+        for attempt in range(self.max_retries):
+            try:
+                return self.llm_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    timeout=self.timeout_seconds,
+                )
+            except _TRANSIENT_LLM_EXCEPTIONS:
+                if attempt == self.max_retries - 1:
+                    raise
+                time.sleep(self.retry_backoff * (2**attempt))
 
     def expand(self, query: str, num_variations: int = 3) -> List[str]:
         """Generate query variations."""
@@ -1595,14 +1740,7 @@ Original query: {query}
 
 Return only the variations, one per line."""
 
-        # Explicit per-call timeout so a stalled provider does not
-        # pin the caller; rely on the SDK default only as a fallback.
-        response = self.llm_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            timeout=30.0,
-        )
+        response = self._completion(prompt, temperature=0.7)
 
         raw = response.choices[0].message.content.strip().split("\n")
         variations = [v.strip() for v in raw if v.strip()]
@@ -1731,10 +1869,43 @@ class SelfRAGPipeline:
         retriever: Retriever,
         llm_client: LLMClient,
         confidence_threshold: float = 0.7,
+        timeout_seconds: float = 30.0,
+        max_retries: int = 3,
+        retry_backoff: float = 0.25,
     ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         self.retriever = retriever
         self.llm_client = llm_client
         self.confidence_threshold = confidence_threshold
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+
+    def _completion(self, prompt: str, temperature: float, model: str = "gpt-4o-mini"):
+        for attempt in range(self.max_retries):
+            try:
+                return self.llm_client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    timeout=self.timeout_seconds,
+                )
+            except _TRANSIENT_LLM_EXCEPTIONS:
+                if attempt == self.max_retries - 1:
+                    raise
+                time.sleep(self.retry_backoff * (2**attempt))
+
+    def _generate_answer_with_retry(
+        self, results: List[RetrievalResult], question: str
+    ) -> RAGResponse:
+        for attempt in range(self.max_retries):
+            try:
+                return self._generate_answer(results, question)
+            except _TRANSIENT_LLM_EXCEPTIONS:
+                if attempt == self.max_retries - 1:
+                    raise
+                time.sleep(self.retry_backoff * (2**attempt))
 
     def _needs_retrieval(self, question: str) -> bool:
         """Determine if question requires retrieval."""
@@ -1745,11 +1916,7 @@ Question: {question}
 
 Respond with only "RETRIEVE" or "GENERAL"."""
 
-        response = self.llm_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        )
+        response = self._completion(prompt, temperature=0)
 
         return "RETRIEVE" in response.choices[0].message.content.upper()
 
@@ -1764,11 +1931,7 @@ Context: {context}
 
 Respond with only a number between 0.0 and 1.0."""
 
-        response = self.llm_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        )
+        response = self._completion(prompt, temperature=0)
 
         try:
             return float(response.choices[0].message.content.strip())
@@ -1798,10 +1961,8 @@ Respond with only a number between 0.0 and 1.0."""
         # Check if retrieval is needed
         if not self._needs_retrieval(question):
             # Answer directly without retrieval
-            response = self.llm_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": question}],
-                temperature=0.1,
+            response = self._completion(
+                question, temperature=0.1, model="gpt-4o"
             )
 
             return RAGResponse(
@@ -1827,7 +1988,7 @@ Respond with only a number between 0.0 and 1.0."""
         # Generate answer with context using the subclass's hook.
         # The hasattr guard at function entry ensures _generate_answer
         # exists by the time we reach this point.
-        return self._generate_answer(results, question)
+        return self._generate_answer_with_retry(results, question)
 
 
 # ============================================================================
@@ -1891,23 +2052,54 @@ class QdrantVectorStore(VectorStore):
         host: str = "localhost",
         port: int = 6333,
         dimension: int = 1536,
+        timeout: float = 10.0,
+        max_retries: int = 3,
     ):
         from qdrant_client import QdrantClient
         from qdrant_client.models import Distance, VectorParams
 
-        self.client = QdrantClient(host=host, port=port)
+        self.client = QdrantClient(host=host, port=port, timeout=timeout)
         self.collection_name = collection_name
         self.dimension = dimension
+        if max_retries < 1:
+            raise ValueError("max_retries must be at least 1")
+        self.max_retries = max_retries
 
         # Create collection if it doesn't exist
-        collections = self.client.get_collections().collections
+        collections = self._with_retry(self.client.get_collections).collections
         if collection_name not in [c.name for c in collections]:
-            self.client.create_collection(
+            self._with_retry(
+                self.client.create_collection,
                 collection_name=collection_name,
                 vectors_config=VectorParams(
                     size=dimension, distance=Distance.COSINE
                 ),
             )
+
+    def _with_retry(self, operation, *args, **kwargs):
+        """Run a Qdrant operation with bounded transient retries."""
+        last_error = None
+        transient_errors = (TimeoutError, ConnectionError, OSError)
+        try:
+            from httpx import TimeoutException, TransportError
+
+            transient_errors = transient_errors + (
+                TimeoutException,
+                TransportError,
+            )
+        except ImportError:
+            pass
+        for attempt in range(self.max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except (ValueError, TypeError):
+                raise
+            except transient_errors as exc:
+                last_error = exc
+                if attempt == self.max_retries - 1:
+                    break
+                time.sleep((0.1 * (2**attempt)) + random.uniform(0, 0.05))
+        raise last_error
 
     def upsert(self, vectors: List[Dict[str, Any]]) -> int:
         from qdrant_client.models import PointStruct
@@ -1921,7 +2113,8 @@ class QdrantVectorStore(VectorStore):
             for v in vectors
         ]
 
-        self.client.upsert(
+        self._with_retry(
+            self.client.upsert,
             collection_name=self.collection_name, points=points
         )
 
@@ -1943,7 +2136,8 @@ class QdrantVectorStore(VectorStore):
             ]
             query_filter = Filter(must=conditions)
 
-        results = self.client.search(
+        results = self._with_retry(
+            self.client.search,
             collection_name=self.collection_name,
             query_vector=query_vector,
             limit=top_k,
@@ -1966,7 +2160,8 @@ class QdrantVectorStore(VectorStore):
     def delete(self, ids: List[str]) -> int:
         from qdrant_client.models import PointIdsList
 
-        self.client.delete(
+        self._with_retry(
+            self.client.delete,
             collection_name=self.collection_name,
             points_selector=PointIdsList(points=ids),
         )
@@ -1974,7 +2169,7 @@ class QdrantVectorStore(VectorStore):
         return len(ids)
 
     def get_stats(self) -> Dict[str, Any]:
-        info = self.client.get_collection(self.collection_name)
+        info = self._with_retry(self.client.get_collection, self.collection_name)
         return {
             "vector_count": info.points_count,
             # Qdrant's Python client does not expose disk byte size
@@ -1982,7 +2177,7 @@ class QdrantVectorStore(VectorStore):
             # (a dict of field types) as size_bytes. Surface both
             # fields with their real names instead.
             "payload_schema": info.payload_schema,
-            "size_bytes": None,
+            "size_bytes": 0,
             "last_updated": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -2005,7 +2200,8 @@ class QdrantVectorStore(VectorStore):
         ids: set[str] = set()
         next_offset = None
         while True:
-            points, next_offset = self.client.scroll(
+            points, next_offset = self._with_retry(
+                self.client.scroll,
                 collection_name=self.collection_name,
                 scroll_filter=Filter(must=conditions),
                 limit=1024,
@@ -2053,6 +2249,7 @@ class KnowledgeBase:
     # stats. Beyond this threshold, stream chunks from the vector store
     # rather than holding the whole corpus in process memory.
     MAX_IN_MEMORY_CHUNKS = 500_000
+    MAX_IN_MEMORY_DOCUMENTS = 100_000
 
     def __init__(
         self,
@@ -2070,6 +2267,9 @@ class KnowledgeBase:
         self._documents: Dict[str, KnowledgeDocument] = {}
         self._chunks: List[DocumentChunk] = []
         self._scale_warning_emitted = False
+        self._index_lock = threading.RLock()
+        self._defer_keyword_rebuilds = 0
+        self._keyword_index_dirty = False
 
         # Build retrieval pipeline
         self.vector_retriever = VectorRetriever(
@@ -2101,6 +2301,11 @@ class KnowledgeBase:
         # Generate embeddings
         contents = [chunk.content for chunk in chunks]
         embeddings = self.embedding_model.embed_batch(contents)
+        if len(embeddings) != len(chunks):
+            raise ValueError(
+                f"Embedding model returned {len(embeddings)} embeddings "
+                f"for {len(chunks)} chunks"
+            )
 
         # Prepare vectors for storage
         vectors = []
@@ -2117,31 +2322,51 @@ class KnowledgeBase:
         # Store in vector database
         self.vector_store.upsert(vectors)
 
-        # Track locally
-        self._documents[document.document_id] = document
-        self._chunks.extend(chunks)
+        # Track locally. Keep all in-process indexes under one lock so a
+        # reader cannot observe documents/chunks while the BM25 index still
+        # represents a previous snapshot.
+        with self._index_lock:
+            self._documents[document.document_id] = document
+            while len(self._documents) > self.MAX_IN_MEMORY_DOCUMENTS:
+                self._documents.pop(next(iter(self._documents)))
+            available_slots = self.MAX_IN_MEMORY_CHUNKS - len(self._chunks)
+            if available_slots > 0:
+                self._chunks.extend(chunks[:available_slots])
 
-        if (
-            len(self._chunks) > self.MAX_IN_MEMORY_CHUNKS
-            and not self._scale_warning_emitted
-        ):
-            import warnings
-            warnings.warn(
-                f"KnowledgeBase holds {len(self._chunks)} chunks in memory "
-                f"(soft cap {self.MAX_IN_MEMORY_CHUNKS}). For larger corpora, "
-                "stream chunks from the vector store rather than retaining "
-                "them in self._chunks.",
-                stacklevel=2,
-            )
-            self._scale_warning_emitted = True
+            if len(chunks) > available_slots and not self._scale_warning_emitted:
+                import warnings
+                warnings.warn(
+                    f"KnowledgeBase reached its in-memory keyword cap "
+                    f"({self.MAX_IN_MEMORY_CHUNKS} chunks). Additional chunks "
+                    "were written to the vector store only; use an external "
+                    "keyword index for full-corpus BM25 at this scale.",
+                    stacklevel=2,
+                )
+                self._scale_warning_emitted = True
 
-        # Rebuild BM25 index
-        self._rebuild_keyword_index()
+            self._keyword_index_dirty = True
+            if self._defer_keyword_rebuilds == 0:
+                self._rebuild_keyword_index_locked()
+                self._keyword_index_dirty = False
 
         return len(chunks)
 
+    def _mark_keyword_index_dirty(self) -> None:
+        """Rebuild keyword indexes unless a bulk import is deferring work."""
+        with self._index_lock:
+            self._keyword_index_dirty = True
+            if self._defer_keyword_rebuilds == 0:
+                self._rebuild_keyword_index_locked()
+                self._keyword_index_dirty = False
+
     def _rebuild_keyword_index(self):
         """Rebuild keyword search index after document changes."""
+        with self._index_lock:
+            self._rebuild_keyword_index_locked()
+            self._keyword_index_dirty = False
+
+    def _rebuild_keyword_index_locked(self) -> None:
+        """Rebuild keyword search index. Caller must hold _index_lock."""
         if self._chunks:
             self.keyword_retriever = BM25Retriever(self._chunks)
 
@@ -2197,16 +2422,16 @@ class KnowledgeBase:
     ) -> Dict[str, int]:
         """Import multiple documents efficiently.
 
-        ``add_document`` rebuilds the BM25 index on every call. For
-        bulk import we suppress that rebuild and run it once at the
-        end (O(N) instead of O(N^2)). Failures are logged with stack
-        traces via ``logger.exception`` rather than printed.
+        ``add_document`` normally rebuilds the BM25 index after each
+        document. For bulk import we defer rebuilds under a lock and run
+        one rebuild at the end (O(N) instead of O(N^2)). Failures are
+        logged with stack traces via ``logger.exception`` rather than
+        printed.
         """
         stats = {"total": len(documents), "chunks": 0, "failed": 0}
 
-        # Defer keyword-index rebuilds; one rebuild at the end suffices.
-        prior_rebuild = self._rebuild_keyword_index
-        self._rebuild_keyword_index = lambda: None
+        with self._index_lock:
+            self._defer_keyword_rebuilds += 1
         try:
             for i in range(0, len(documents), batch_size):
                 batch = documents[i : i + batch_size]
@@ -2214,15 +2439,27 @@ class KnowledgeBase:
                     try:
                         chunks_added = self.add_document(doc)
                         stats["chunks"] += chunks_added
-                    except Exception:
+                    except (
+                        TimeoutError,
+                        ConnectionError,
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                    ):
                         stats["failed"] += 1
                         logging.getLogger(__name__).exception(
                             "Failed to import document %s", doc.document_id
                         )
         finally:
-            self._rebuild_keyword_index = prior_rebuild
-        # Single rebuild covering all newly-added chunks.
-        self._rebuild_keyword_index()
+            with self._index_lock:
+                self._defer_keyword_rebuilds -= 1
+                should_rebuild = (
+                    self._defer_keyword_rebuilds == 0
+                    and self._keyword_index_dirty
+                )
+                if should_rebuild:
+                    self._rebuild_keyword_index_locked()
+                    self._keyword_index_dirty = False
 
         return stats
 

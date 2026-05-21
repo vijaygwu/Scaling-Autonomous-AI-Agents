@@ -21,15 +21,17 @@ provide the surrounding context (imports, dependencies) as needed.
 # ============================================================================
 
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, TypeVar, Generic
 import redis
 from redis.asyncio import Redis as AsyncRedis
+from redis.exceptions import RedisError, WatchError
 
 T = TypeVar("T")
 
@@ -65,6 +67,18 @@ class StateStore(ABC, Generic[T]):
         """Store state with optional TTL."""
         pass
 
+    async def compare_and_set(
+        self,
+        key: str,
+        value: T,
+        expected_version: Optional[int],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        """Store state only if the current version still matches."""
+        raise NotImplementedError(
+            "compare_and_set is not supported by this StateStore"
+        )
+
     @abstractmethod
     async def delete(self, key: str) -> bool:
         """Delete state. Returns True if key existed."""
@@ -79,6 +93,12 @@ class StateStore(ABC, Generic[T]):
     async def get_metadata(self, key: str) -> Optional[StateMetadata]:
         """Retrieve metadata for a state entry."""
         pass
+
+    async def scan(
+        self, key_pattern: str, batch_size: int = 100
+    ) -> AsyncIterator[str]:
+        """Iterate keys matching a backend-specific pattern."""
+        raise NotImplementedError("scan is not supported by this StateStore")
 
 
 class RedisStateStore(StateStore[dict[str, Any]]):
@@ -106,10 +126,20 @@ class RedisStateStore(StateStore[dict[str, Any]]):
         return f"{self._prefix}meta:{key}"
 
     async def get(self, key: str) -> Optional[dict[str, Any]]:
-        data = await self._redis.get(self._make_key(key))
+        try:
+            data = await self._redis.get(self._make_key(key))
+        except RedisError:
+            logging.getLogger(__name__).exception("Redis get failed for key=%s", key)
+            raise
         if data is None:
             return None
-        return json.loads(data)
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as exc:
+            logging.getLogger(__name__).warning(
+                "Corrupt JSON in Redis state key=%s: %s", key, exc
+            )
+            raise ValueError(f"Corrupt JSON in state key {key}") from exc
 
     async def set(
         self,
@@ -154,6 +184,58 @@ class RedisStateStore(StateStore[dict[str, Any]]):
         )
         await pipe.execute()
 
+    async def compare_and_set(
+        self,
+        key: str,
+        value: dict[str, Any],
+        expected_version: Optional[int],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        """Optimistic write using Redis WATCH on the metadata version."""
+        ttl = ttl_seconds or self._default_ttl
+        full_key = self._make_key(key)
+        meta_key = self._make_meta_key(key)
+        now = datetime.now(timezone.utc)
+
+        async with self._redis.pipeline() as pipe:
+            try:
+                await pipe.watch(meta_key)
+                raw_meta = await pipe.get(meta_key)
+
+                if raw_meta is None:
+                    if expected_version is not None:
+                        await pipe.unwatch()
+                        return False
+                    created_at = now
+                    next_version = 1
+                else:
+                    parsed = json.loads(raw_meta)
+                    current_version = int(parsed["version"])
+                    if current_version != expected_version:
+                        await pipe.unwatch()
+                        return False
+                    created_at = datetime.fromisoformat(parsed["created_at"])
+                    next_version = current_version + 1
+
+                pipe.multi()
+                pipe.setex(full_key, ttl, json.dumps(value))
+                pipe.setex(
+                    meta_key,
+                    ttl,
+                    json.dumps(
+                        {
+                            "created_at": created_at.isoformat(),
+                            "updated_at": now.isoformat(),
+                            "version": next_version,
+                            "ttl_seconds": ttl,
+                        }
+                    ),
+                )
+                await pipe.execute()
+                return True
+            except WatchError:
+                return False
+
     async def delete(self, key: str) -> bool:
         result = await self._redis.delete(
             self._make_key(key), self._make_meta_key(key)
@@ -195,6 +277,62 @@ class RedisStateStore(StateStore[dict[str, Any]]):
 
     async def delete_raw(self, key: str) -> int:
         return await self._redis.delete(key)
+
+    async def compare_and_delete_raw(self, key: str, expected: str) -> bool:
+        """Atomically delete ``key`` only if its value still matches."""
+        script = """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        """
+        return bool(await self._redis.eval(script, 1, key, expected))
+
+    async def eval_raw(self, script: str, numkeys: int, *args: Any) -> Any:
+        """Evaluate a Redis Lua script through the public store API."""
+        return await self._redis.eval(script, numkeys, *args)
+
+    async def publish_raw(self, channel: str, payload: str) -> int:
+        """Publish a serialized notification on a Redis channel."""
+        return int(await self._redis.publish(channel, payload))
+
+    async def subscribe_raw(self, channel: str) -> Any:
+        """Subscribe to a Redis channel through the public store API."""
+        pubsub = self._redis.pubsub()
+        await pubsub.subscribe(channel)
+        return pubsub
+
+    async def get_pubsub_message_raw(
+        self, pubsub: Any, timeout: float = 1.0
+    ) -> Optional[dict[str, Any]]:
+        """Read one pub/sub message while yielding control on timeout."""
+        return await pubsub.get_message(
+            ignore_subscribe_messages=True,
+            timeout=timeout,
+        )
+
+    async def unsubscribe_raw(self, pubsub: Any, channel: str) -> None:
+        """Unsubscribe and close a Redis pub/sub handle."""
+        await pubsub.unsubscribe(channel)
+        close = getattr(pubsub, "aclose", None) or getattr(pubsub, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+    async def scan(
+        self, key_pattern: str, batch_size: int = 100
+    ) -> AsyncIterator[str]:
+        match = self._make_key(key_pattern)
+        async for full_key in self._redis.scan_iter(
+            match=match, count=batch_size
+        ):
+            key = (
+                full_key.decode("utf-8")
+                if isinstance(full_key, bytes)
+                else str(full_key)
+            )
+            yield key[len(self._prefix):] if key.startswith(self._prefix) else key
 
 
 # ============================================================================
@@ -662,6 +800,8 @@ class ConversationManager:
         max_tokens: int = 8000,
         summary_threshold: int = 4000,
         min_recent_messages: int = 10,
+        max_messages_per_conversation: int = 5000,
+        allow_non_transactional_store: bool = False,
     ):
         """
         Initialize conversation manager.
@@ -672,27 +812,70 @@ class ConversationManager:
             max_tokens: Maximum tokens in context window
             summary_threshold: Trigger summarization above this
             min_recent_messages: Always keep this many recent messages
+            max_messages_per_conversation: Absolute in-memory message cap
         """
+        if max_messages_per_conversation < 1:
+            raise ValueError("max_messages_per_conversation must be >= 1")
+        if min_recent_messages < 0:
+            raise ValueError("min_recent_messages must be >= 0")
+        if min_recent_messages > max_messages_per_conversation:
+            raise ValueError(
+                "min_recent_messages cannot exceed "
+                "max_messages_per_conversation"
+            )
         self._store = state_store
         self._summarizer = summarizer
         self._max_tokens = max_tokens
         self._summary_threshold = summary_threshold
         self._min_recent = min_recent_messages
+        self._max_messages = max_messages_per_conversation
+        self._allow_non_transactional_store = allow_non_transactional_store
         self._encoder = tiktoken.get_encoding("cl100k_base")
 
     async def add_message(
         self, conversation_id: str, message: Message
     ) -> None:
         """Add a message and trigger compaction if needed."""
-        state = await self._load_state(conversation_id)
-        state["messages"].append(self._message_to_dict(message))
-        state["total_tokens"] += message.token_count
+        key = f"conversation:{conversation_id}"
 
-        # Check if compaction needed
-        if state["total_tokens"] > self._summary_threshold:
-            state = await self._compact(state)
+        for attempt in range(5):
+            state = await self._load_state(conversation_id)
+            metadata = await self._store.get_metadata(key)
+            expected_version = metadata.version if metadata else None
 
-        await self._store.set(f"conversation:{conversation_id}", state)
+            state["messages"].append(self._message_to_dict(message))
+            state["total_tokens"] += message.token_count
+
+            # Check if compaction needed by tokens or absolute message count.
+            if (
+                state["total_tokens"] > self._summary_threshold
+                or len(state["messages"]) > self._max_messages
+            ):
+                state = await self._compact(state)
+
+            try:
+                saved = await self._store.compare_and_set(
+                    key, state, expected_version=expected_version
+                )
+            except NotImplementedError:
+                if not self._allow_non_transactional_store:
+                    raise RuntimeError(
+                        "ConversationManager requires compare_and_set for "
+                        "multi-writer stores; pass "
+                        "allow_non_transactional_store=True only for "
+                        "single-writer tests or demos"
+                    )
+                await self._store.set(key, state)
+                return
+
+            if saved:
+                return
+
+            await asyncio.sleep(min(0.05 * (2**attempt), 0.5))
+
+        raise RuntimeError(
+            f"Could not append message to {conversation_id}: concurrent updates"
+        )
 
     async def get_context_window(
         self, conversation_id: str, max_tokens: Optional[int] = None
@@ -724,11 +907,9 @@ class ConversationManager:
             if tokens_used + message.token_count <= available_for_messages:
                 selected.insert(0, message)
                 tokens_used += message.token_count
-            elif len(selected) < self._min_recent:
-                # Force include minimum recent messages
-                selected.insert(0, message)
-                tokens_used += message.token_count
             else:
+                # ``min_recent_messages`` is a preference, not permission
+                # to exceed the caller's token budget.
                 break
 
         return ConversationWindow(
@@ -743,7 +924,8 @@ class ConversationManager:
         messages = [self._dict_to_message(m) for m in state["messages"]]
 
         # Keep recent messages, summarize the rest
-        keep_count = max(self._min_recent, len(messages) // 3)
+        preferred_keep = max(self._min_recent, len(messages) // 3)
+        keep_count = min(preferred_keep, self._max_messages, len(messages))
         to_summarize = messages[:-keep_count]
         to_keep = messages[-keep_count:]
 
@@ -893,23 +1075,32 @@ class Checkpoint:
     created_at: datetime
     checksum: str
 
+    @staticmethod
+    def _payload_state(state: dict[str, Any]) -> dict[str, Any]:
+        """Return user checkpoint state without persistence metadata."""
+        return {
+            key: value
+            for key, value in state.items()
+            if key not in {"_checksum", "_step_id"}
+        }
+
     @classmethod
     def create(
         cls, task_id: str, step_id: str, state: dict[str, Any]
     ) -> "Checkpoint":
-        state_json = json.dumps(state, sort_keys=True)
+        state_json = json.dumps(cls._payload_state(state), sort_keys=True)
         checksum = hashlib.sha256(state_json.encode()).hexdigest()[:16]
         return cls(
             task_id=task_id,
             step_id=step_id,
-            state=state,
+            state=dict(state),
             created_at=datetime.now(timezone.utc),
             checksum=checksum,
         )
 
     def verify(self) -> bool:
         """Verify checkpoint integrity."""
-        state_json = json.dumps(self.state, sort_keys=True)
+        state_json = json.dumps(self._payload_state(self.state), sort_keys=True)
         expected = hashlib.sha256(state_json.encode()).hexdigest()[:16]
         return expected == self.checksum
 
@@ -998,7 +1189,15 @@ class TaskCheckpointer:
         try:
             yield ctx
             await self._store.transition_status(task_id, TaskStatus.COMPLETED)
-        except Exception as e:
+        except (
+            StateCorruptionError,
+            asyncpg.PostgresError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as e:
             await self._flush_task(task_id)  # Ensure last checkpoint saved
             await self._store.transition_status(
                 task_id, TaskStatus.FAILED, error_message=str(e)
@@ -1018,6 +1217,19 @@ class TaskCheckpointer:
         # Include checksum in state for later verification
         checkpoint.state["_checksum"] = checkpoint.checksum
         checkpoint.state["_step_id"] = step_id
+        if (
+            task_id not in self._pending_checkpoints
+            and len(self._pending_checkpoints) >= self._max_pending
+        ):
+            await self._flush_all()
+        if (
+            task_id not in self._pending_checkpoints
+            and len(self._pending_checkpoints) >= self._max_pending
+        ):
+            raise RuntimeError(
+                "Pending checkpoint buffer is full; apply backpressure "
+                "or increase max_pending"
+            )
         self._pending_checkpoints[task_id] = checkpoint
 
     async def get_resume_point(
@@ -1046,7 +1258,14 @@ class TaskCheckpointer:
                 # Cooperative shutdown: re-raise so the caller's
                 # ``stop()`` semantics still work.
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except (
+                asyncpg.PostgresError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
                 _log.exception(
                     "Checkpoint flush failed; continuing loop: %s", exc
                 )
@@ -1062,13 +1281,13 @@ class TaskCheckpointer:
         # Take a bounded slice; leave excess for the next flush.
         pending_items = list(self._pending_checkpoints.items())
         batch = pending_items[: self._max_pending]
-        # Remove only what we are about to flush; entries that arrive
-        # mid-flush stay queued for the next interval.
-        for task_id, _ in batch:
-            self._pending_checkpoints.pop(task_id, None)
 
         for task_id, checkpoint in batch:
             await self._store.update_checkpoint(task_id, checkpoint.state)
+            # Pop only after durable write succeeds, and only if a newer
+            # checkpoint for the same task did not arrive during the await.
+            if self._pending_checkpoints.get(task_id) is checkpoint:
+                self._pending_checkpoints.pop(task_id, None)
 
     async def _flush_task(self, task_id: str) -> None:
         """Flush checkpoint for specific task."""
@@ -1180,12 +1399,13 @@ class AdaptiveStrategy(CheckpointStrategy):
         min_interval: int = 10,
         max_interval: int = 300,
         cost_threshold: float = 1.0,
+        recent_cost_window: int = 100,
     ):
         self._min = timedelta(seconds=min_interval)
         self._max = timedelta(seconds=max_interval)
         self._threshold = cost_threshold
-        # Bounded deque keeps the last 100 costs without manual trimming.
-        self._recent_costs: deque[float] = deque(maxlen=100)
+        # Bounded deque keeps recent costs without manual trimming.
+        self._recent_costs: deque[float] = deque(maxlen=recent_cost_window)
 
     def record_operation_cost(self, cost: float) -> None:
         """Record the cost of a recent operation."""
@@ -1248,10 +1468,12 @@ class RecoveryCoordinator:
         task_store: PostgresTaskStore,
         conversation_manager: ConversationManager,
         max_recovery_attempts: int = 3,
+        stale_task_after: timedelta = timedelta(minutes=5),
     ):
         self._tasks = task_store
         self._conversations = conversation_manager
         self._max_attempts = max_recovery_attempts
+        self._stale_task_after = stale_task_after
 
     async def recover_interrupted_tasks(
         self, worker_id: str, task_types: Optional[list[str]] = None
@@ -1284,18 +1506,22 @@ class RecoveryCoordinator:
                     SELECT * FROM task_state
                     WHERE status = 'running'
                     AND task_type = ANY($1)
-                    AND updated_at < NOW() - INTERVAL '5 minutes'
+                    AND updated_at < NOW() - $2::interval
                     ORDER BY updated_at
                     """,
                     task_types,
+                    self._stale_task_after,
                 )
             else:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(
+                    """
                     SELECT * FROM task_state
                     WHERE status = 'running'
-                    AND updated_at < NOW() - INTERVAL '5 minutes'
+                    AND updated_at < NOW() - $1::interval
                     ORDER BY updated_at
-                    """)
+                    """,
+                    self._stale_task_after,
+                )
             return [self._tasks._row_to_task(r) for r in rows]
 
     async def _recover_task(self, task: TaskState) -> RecoveryResult:
@@ -1622,8 +1848,11 @@ class SharedStateCoordinator:
                     lock_data["expires_at"]
                 )
                 if datetime.now(timezone.utc) > existing_expires:
-                    # Lock expired, try to take over
-                    await self._store.delete_raw(lock_key)
+                    # Lock expired, try to take over without deleting a
+                    # new owner that acquired between our read and delete.
+                    await self._store.compare_and_delete_raw(
+                        lock_key, existing
+                    )
                     continue
 
             # Check timeout
@@ -1648,7 +1877,7 @@ class SharedStateCoordinator:
         """
         lock_key = f"lock:{resource_id}"
 
-        # Lua script ensures atomic check and delete
+        # Lua script performs check-and-delete atomically in Redis.
         script = """
         local lock_data = redis.call('GET', KEYS[1])
         if lock_data then
@@ -1660,7 +1889,7 @@ class SharedStateCoordinator:
         return 0
         """
 
-        result = await self._store._redis.eval(script, 1, lock_key, owner_id)
+        result = await self._store.eval_raw(script, 1, lock_key, owner_id)
         released = result == 1
         if not released:
             # Either the lock had already expired, or another owner is
@@ -1709,8 +1938,7 @@ class SharedStateCoordinator:
         Uses Redis pub/sub for real-time notifications.
         """
         channel = f"changes:{resource_id}"
-        pubsub = self._store._redis.pubsub()
-        await pubsub.subscribe(channel)
+        pubsub = await self._store.subscribe_raw(channel)
 
         # Cancellable listen loop: ``get_message`` with a timeout
         # yields control regularly so the surrounding asyncio task can
@@ -1719,8 +1947,8 @@ class SharedStateCoordinator:
         # block indefinitely on a half-open socket.
         try:
             while True:
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
+                message = await self._store.get_pubsub_message_raw(
+                    pubsub, timeout=1.0
                 )
                 if message is None:
                     continue
@@ -1730,14 +1958,17 @@ class SharedStateCoordinator:
         except asyncio.CancelledError:
             raise
         finally:
-            await pubsub.unsubscribe(channel)
+            await self._store.unsubscribe_raw(pubsub, channel)
 
     async def publish_change(
         self, resource_id: str, state: dict[str, Any]
     ) -> None:
         """Publish a state change notification."""
         channel = f"changes:{resource_id}"
-        await self._store._redis.publish(channel, json.dumps(state))
+        publish = getattr(self._store, "publish_raw", None)
+        if publish is None:
+            raise TypeError("SharedStateCoordinator requires a Redis publish-capable store")
+        await publish(channel, json.dumps(state))
 
 
 class LockTimeout(Exception):
@@ -1997,22 +2228,19 @@ class StateMigrator:
         """
         stats = {"migrated": 0, "already_current": 0, "failed": 0}
 
-        # This would iterate through all matching keys
-        # Implementation depends on store capabilities
-        # Here's a conceptual example:
-
-        # async for key in store.scan(key_pattern):
-        #     state = await store.get(key)
-        #     if state:
-        #         try:
-        #             migrated = await self.migrate(state)
-        #             if migrated != state:
-        #                 await store.set(key, migrated)
-        #                 stats["migrated"] += 1
-        #             else:
-        #                 stats["already_current"] += 1
-        #         except Exception:
-        #             stats["failed"] += 1
+        async for key in store.scan(key_pattern, batch_size=batch_size):
+            state = await store.get(key)
+            if not state:
+                continue
+            try:
+                migrated = await self.migrate(state)
+                if migrated != state:
+                    await store.set(key, migrated)
+                    stats["migrated"] += 1
+                else:
+                    stats["already_current"] += 1
+            except (MigrationError, ValueError, KeyError, TypeError):
+                stats["failed"] += 1
 
         return stats
 
@@ -2146,7 +2374,7 @@ class ConversationRecoveryPipeline:
                     data_loss=False,
                     error=None,
                 )
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, ValueError) as e:
             # Log corruption details for analysis
             await self._log_corruption(conversation_id, "json_decode", str(e))
 
@@ -2165,7 +2393,11 @@ class ConversationRecoveryPipeline:
                 )
 
         # Phase 3: Try backup store
-        backup_data = await self._backup.get(key)
+        try:
+            backup_data = await self._backup.get(key)
+        except (json.JSONDecodeError, RedisError, ValueError) as e:
+            await self._log_corruption(conversation_id, "backup_read", str(e))
+            backup_data = None
         if backup_data and self._validate_conversation(backup_data):
             await self._primary.set(key, backup_data)
             await self._log_recovery(conversation_id, "backup_restore")
@@ -2197,6 +2429,47 @@ class ConversationRecoveryPipeline:
             data_loss=True,
             error="Unable to recover conversation from any source",
         )
+
+    async def _log_corruption(
+        self, conversation_id: str, kind: str, detail: str
+    ) -> None:
+        """Record corruption diagnostics without blocking recovery."""
+        logging.getLogger(__name__).warning(
+            "conversation corruption detected",
+            extra={
+                "conversation_id": conversation_id,
+                "kind": kind,
+                "detail": detail,
+            },
+        )
+
+    async def _get_raw_data(self, key: str) -> Optional[bytes]:
+        """Fetch raw serialized state bytes from the primary store."""
+        full_key = (
+            self._primary._make_key(key)
+            if hasattr(self._primary, "_make_key")
+            else key
+        )
+        raw = await self._primary.get_raw(full_key)
+        if isinstance(raw, str):
+            return raw.encode("utf-8")
+        return raw
+
+    async def _log_recovery(
+        self, conversation_id: str, strategy: str
+    ) -> None:
+        """Record a successful recovery strategy."""
+        logging.getLogger(__name__).info(
+            "conversation recovered",
+            extra={
+                "conversation_id": conversation_id,
+                "strategy": strategy,
+            },
+        )
+
+    def _calculate_data_loss(self, recovered: dict[str, Any]) -> bool:
+        """Conservative data-loss indicator for restored state."""
+        return not recovered.get("messages") or recovered.get("summary") is None
 
     def _attempt_json_repair(self, raw: bytes) -> Optional[dict]:
         """
@@ -2272,7 +2545,7 @@ class ConversationRecoveryPipeline:
         (Postgres, OpenSearch, etc.); the in-memory fallback below
         keeps the example runnable without that wiring.
         """
-        store = getattr(self, "audit_store", None)
+        store = getattr(self, "_audit", None)
         if store is not None and hasattr(store, "events_for"):
             events = await store.events_for(conversation_id)
             return list(events) if events else []
