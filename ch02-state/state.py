@@ -470,8 +470,24 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
         endpoint_url: Optional[str] = None,
     ):
         self._table_name = table_name
+        # Explicit production config: bound the per-request budget,
+        # cap the connection pool, and use the SDK's adaptive retry
+        # mode (exponential backoff with throttling-aware
+        # rescheduling). The boto3 defaults are 60 s connect + 60 s
+        # read and unbounded pooling, which silently lets a flaky
+        # DynamoDB partition consume every async worker.
+        from botocore.config import Config as BotoConfig
+        boto_config = BotoConfig(
+            connect_timeout=2,
+            read_timeout=5,
+            max_pool_connections=50,
+            retries={"max_attempts": 4, "mode": "adaptive"},
+        )
         self._dynamodb = boto3.resource(
-            "dynamodb", region_name=region, endpoint_url=endpoint_url
+            "dynamodb",
+            region_name=region,
+            endpoint_url=endpoint_url,
+            config=boto_config,
         )
         self._table = self._dynamodb.Table(table_name)
 
@@ -480,13 +496,22 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
             response = await asyncio.to_thread(
                 self._table.get_item, Key={"pk": key}
             )
-            item = response.get("Item")
-            if item is None:
-                return None
-            # Convert Decimals back to native types
-            return self._deserialize(item.get("data", {}))
-        except ClientError:
+        except ClientError as exc:
+            # Distinguish "not found" (legitimate cache miss) from
+            # "DynamoDB call failed" (operational signal). Re-raising
+            # surfaces throttling, network blips, and credential
+            # issues to the caller's retry/escalation path instead of
+            # silently degrading every read to a None result.
+            import logging
+            logging.getLogger(__name__).warning(
+                "DynamoDB get_item failed for key=%s: %s", key, exc
+            )
+            raise
+        item = response.get("Item")
+        if item is None:
             return None
+        # Convert Decimals back to native types
+        return self._deserialize(item.get("data", {}))
 
     async def set(
         self,
@@ -1409,12 +1434,19 @@ class CorruptionHandler:
             raise ValueError(f"Unknown repair strategy: {repair_strategy}")
 
     async def _rollback_state(self, key: str) -> Optional[dict[str, Any]]:
-        """Roll back to previous version if available."""
+        """Roll back to previous version if available.
+
+        This is a placeholder: real rollback requires a version-history
+        table (or a versioned store) that is out of scope for this
+        chapter's primary KV backend. Subclasses backed by such a
+        store should override.
+        """
         metadata = await self._primary.get_metadata(key)
         if metadata and metadata.version > 1:
-            # In production, this would query a version history table
-            # or use a store that supports versioning natively
-            pass
+            raise NotImplementedError(
+                "Version-aware rollback requires a history-backed store; "
+                "override _rollback_state in a subclass."
+            )
         return None
 
     async def _partial_recovery(
@@ -1680,11 +1712,23 @@ class SharedStateCoordinator:
         pubsub = self._store._redis.pubsub()
         await pubsub.subscribe(channel)
 
+        # Cancellable listen loop: ``get_message`` with a timeout
+        # yields control regularly so the surrounding asyncio task can
+        # be cancelled if Redis drops the connection or the caller
+        # tears down the watcher. ``async for ... listen()`` would
+        # block indefinitely on a half-open socket.
         try:
-            async for message in pubsub.listen():
-                if message["type"] == "message":
+            while True:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if message is None:
+                    continue
+                if message.get("type") == "message":
                     data = json.loads(message["data"])
                     await callback(data)
+        except asyncio.CancelledError:
+            raise
         finally:
             await pubsub.unsubscribe(channel)
 
@@ -1783,9 +1827,14 @@ class ConflictResolver:
         a_dominates = all(clock_a.get(k, 0) >= v for k, v in clock_b.items())
         b_dominates = all(clock_b.get(k, 0) >= v for k, v in clock_a.items())
 
-        if a_dominates and not b_dominates:
+        # Identical clocks: same causal version. Returning either
+        # (without merging) is correct; merging would double-count
+        # additive fields such as loyalty points.
+        if a_dominates and b_dominates:
             return state_a, False
-        if b_dominates and not a_dominates:
+        if a_dominates:
+            return state_a, False
+        if b_dominates:
             return state_b, False
 
         # True concurrent updates - need merge

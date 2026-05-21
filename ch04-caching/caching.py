@@ -662,11 +662,15 @@ class AdaptiveTTLManager:
         min_ttl: timedelta = timedelta(seconds=30),
         max_ttl: timedelta = timedelta(hours=24),
         base_ttl: timedelta = timedelta(minutes=15),
+        max_tracked_keys: int = 10_000,
     ):
         self.min_ttl = min_ttl
         self.max_ttl = max_ttl
         self.base_ttl = base_ttl
-        self._stats: Dict[str, AccessStats] = {}
+        # LRU-bounded so unique-query workloads do not leak unbounded stats.
+        from collections import OrderedDict
+        self.max_tracked_keys = max_tracked_keys
+        self._stats: "OrderedDict[str, AccessStats]" = OrderedDict()
 
     def record_access(self, key: str) -> None:
         """Record a cache access (hit or miss)."""
@@ -680,6 +684,7 @@ class AdaptiveTTLManager:
                 created_at=stats.created_at,
                 invalidation_count=stats.invalidation_count,
             )
+            self._stats.move_to_end(key)
         else:
             self._stats[key] = AccessStats(
                 access_count=1,
@@ -687,6 +692,8 @@ class AdaptiveTTLManager:
                 created_at=now,
                 invalidation_count=0,
             )
+            if len(self._stats) > self.max_tracked_keys:
+                self._stats.popitem(last=False)
 
     def record_invalidation(self, key: str) -> None:
         """Record when a cached item is invalidated."""
@@ -698,6 +705,7 @@ class AdaptiveTTLManager:
                 created_at=stats.created_at,
                 invalidation_count=stats.invalidation_count + 1,
             )
+            self._stats.move_to_end(key)
 
     def get_ttl(self, key: str) -> timedelta:
         """
@@ -845,6 +853,12 @@ class DependencyTracker:
     Tracks dependencies between cache entries for cascading invalidation.
 
     When a dependency is invalidated, all dependents are also invalidated.
+
+    Memory contract: the dependency graph grows monotonically. Callers
+    that evict cache keys (TTL, LRU, manual delete) must also call
+    :py:meth:`remove_key` so the entry is purged from both
+    ``_dependencies`` and ``_dependents``; otherwise this tracker leaks
+    memory in long-lived deployments.
     """
 
     def __init__(self):
@@ -1246,7 +1260,15 @@ class RedisBackend(CacheBackend):
             return {}
 
         prefixed_keys = [self._prefixed_key(k) for k in keys]
-        values = self._client.mget(prefixed_keys)
+        try:
+            values = self._client.mget(prefixed_keys)
+        except redis.RedisError as exc:
+            # Distinguish backend failure from cache miss; logging +
+            # error-metric bump preserves SLO-relevant signal that a
+            # silent empty-dict return would lose.
+            _redis_logger.warning("Redis MGET failed: %s", exc)
+            self._bump_error_metric("get_many")
+            return {}
 
         result = {}
         for key, value in zip(keys, values):
@@ -1278,6 +1300,7 @@ class RedisBackend(CacheBackend):
             return all(results)
         except redis.RedisError as exc:
             _redis_logger.warning("Redis pipeline SET failed: %s", exc)
+            self._bump_error_metric("set_many")
             return False
 
     # Cap DEL batches so a single SCAN cursor that returns thousands
@@ -1301,16 +1324,20 @@ class RedisBackend(CacheBackend):
         count = 0
 
         cursor = 0
-        while True:
-            cursor, keys = self._client.scan(
-                cursor, match=prefixed_pattern, count=100
-            )
-            for i in range(0, len(keys), self.DELETE_BATCH_SIZE):
-                batch = keys[i : i + self.DELETE_BATCH_SIZE]
-                if batch:
-                    count += self._client.delete(*batch)
-            if cursor == 0:
-                break
+        try:
+            while True:
+                cursor, keys = self._client.scan(
+                    cursor, match=prefixed_pattern, count=100
+                )
+                for i in range(0, len(keys), self.DELETE_BATCH_SIZE):
+                    batch = keys[i : i + self.DELETE_BATCH_SIZE]
+                    if batch:
+                        count += self._client.delete(*batch)
+                if cursor == 0:
+                    break
+        except redis.RedisError as exc:
+            _redis_logger.warning("delete_pattern SCAN failed: %s", exc)
+            self._bump_error_metric("delete_pattern")
 
         return count
 
@@ -1896,6 +1923,18 @@ class ProductionSemanticCache(SemanticCache):
         self._index = None  # Would be FAISS, Annoy, or similar in production
         self._embedding_dim = None
 
+    def _normalize_embedding(self, embedding: Any) -> np.ndarray:
+        """Convert model output to a normalized float32 vector."""
+        vector = np.asarray(embedding, dtype=np.float32)
+        if vector.ndim != 1 or vector.size == 0:
+            raise ValueError("Embedding must be a non-empty 1D vector")
+        if not np.all(np.isfinite(vector)):
+            raise ValueError("Embedding contains NaN or infinite values")
+        norm = np.linalg.norm(vector)
+        if norm == 0:
+            raise ValueError("Embedding vector has zero norm")
+        return vector / norm
+
     def _init_index(self, embedding_dim: int) -> None:
         """Initialize the vector index."""
         self._embedding_dim = embedding_dim
@@ -1910,6 +1949,17 @@ class ProductionSemanticCache(SemanticCache):
             # Fallback to linear scan if FAISS not available
             self._index = None
 
+    def _rebuild_index_locked(self) -> None:
+        """Rebuild the ANN index after entries are evicted."""
+        if self._embedding_dim is None:
+            return
+        self._init_index(self._embedding_dim)
+        if self._index is not None and self._entries:
+            vectors = np.vstack(
+                [entry.embedding for entry in self._entries]
+            ).astype(np.float32)
+            self._index.add(vectors)
+
     def get(
         self, query: str, context: Optional[str] = None, k: int = 5
     ) -> SemanticCacheResult:
@@ -1917,10 +1967,18 @@ class ProductionSemanticCache(SemanticCache):
         Look up query using efficient ANN search.
         """
         text = f"{query}\n{context}" if context else query
-        query_embedding = self.embedding_model.embed_text(text)
+        query_embedding = self._normalize_embedding(
+            self.embedding_model.embed_text(text)
+        )
 
-        # Normalize for cosine similarity
-        query_embedding = query_embedding / np.linalg.norm(query_embedding)
+        if (
+            self._embedding_dim is not None
+            and len(query_embedding) != self._embedding_dim
+        ):
+            raise ValueError(
+                "Query embedding dimension does not match cache index "
+                f"({len(query_embedding)} != {self._embedding_dim})"
+            )
 
         if self._index is None:
             # Fallback to base implementation
@@ -1944,6 +2002,18 @@ class ProductionSemanticCache(SemanticCache):
 
             best_similarity = similarities[0][0]
             best_idx = indices[0][0]
+            if best_idx < 0 or best_idx >= len(self._entries):
+                # Defensive recovery: if the index and entry list ever
+                # drift, rebuild the index and report a miss rather than
+                # returning the wrong cached response.
+                self._rebuild_index_locked()
+                self._misses += 1
+                return SemanticCacheResult(
+                    hit=False,
+                    response=None,
+                    similarity=0.0,
+                    original_query=None,
+                )
 
             if best_similarity >= self.similarity_threshold:
                 self._hits += 1
@@ -1979,14 +2049,18 @@ class ProductionSemanticCache(SemanticCache):
     ) -> None:
         """Add entry to cache and index."""
         text = f"{query}\n{context}" if context else query
-        embedding = self.embedding_model.embed_text(text)
+        embedding = self._normalize_embedding(
+            self.embedding_model.embed_text(text)
+        )
 
         # Initialize index on first entry
         if self._embedding_dim is None:
             self._init_index(len(embedding))
-
-        # Normalize for cosine similarity
-        embedding = embedding / np.linalg.norm(embedding)
+        elif len(embedding) != self._embedding_dim:
+            raise ValueError(
+                "Embedding dimension does not match cache index "
+                f"({len(embedding)} != {self._embedding_dim})"
+            )
 
         entry = SemanticCacheEntry(
             query=query,
@@ -1996,11 +2070,19 @@ class ProductionSemanticCache(SemanticCache):
         )
 
         with self._lock:
-            # Add to index
-            if self._index is not None:
-                self._index.add(embedding.reshape(1, -1).astype(np.float32))
+            index_needs_rebuild = self._evict_expired() > 0
+            if len(self._entries) >= self.max_entries:
+                self._evict_lfu()
+                index_needs_rebuild = True
 
             self._entries.append(entry)
+            if self._index is not None:
+                if index_needs_rebuild:
+                    self._rebuild_index_locked()
+                else:
+                    self._index.add(
+                        embedding.reshape(1, -1).astype(np.float32)
+                    )
 
             # Persist to backend if available
             if self.backend:
@@ -2028,8 +2110,10 @@ class ThresholdTuner:
     to recommend an appropriate threshold for your workload.
     """
 
-    def __init__(self):
-        self._samples: List[dict] = []
+    def __init__(self, max_samples: int = 10_000):
+        # Bounded ring buffer: long-running deployments would otherwise
+        # accumulate samples indefinitely.
+        self._samples: "deque[dict]" = deque(maxlen=max_samples)
 
     def record_sample(
         self,

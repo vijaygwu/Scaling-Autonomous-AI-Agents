@@ -292,7 +292,9 @@ class OpenAIEmbedding(EmbeddingModel):
     """OpenAI embedding model implementation."""
 
     def __init__(
-        self, model: str = "text-embedding-3-small", api_key: str = None
+        self,
+        model: str = "text-embedding-3-small",
+        api_key: Optional[str] = None,
     ):
         from openai import OpenAI
 
@@ -921,6 +923,11 @@ class BM25Retriever(Retriever):
     and b controls length normalization (typically 0.75).
     """
 
+    # Scale rail: this in-memory implementation rebuilds its inverted index
+    # on every add. Beyond ~100K chunks, back BM25 with Elasticsearch or
+    # OpenSearch rather than hot-rebuilding in process memory.
+    MAX_IN_MEMORY_DOCUMENTS = 100_000
+
     def __init__(
         self, documents: List[DocumentChunk], k1: float = 1.5, b: float = 0.75
     ):
@@ -928,6 +935,15 @@ class BM25Retriever(Retriever):
         # Robertson et al. and remain effective across diverse corpora.
         self.k1 = k1
         self.b = b
+        if len(documents) > self.MAX_IN_MEMORY_DOCUMENTS:
+            import warnings
+            warnings.warn(
+                f"BM25Retriever loaded {len(documents)} chunks "
+                f"(soft cap {self.MAX_IN_MEMORY_DOCUMENTS}). For larger "
+                "corpora, back BM25 with Elasticsearch/OpenSearch rather "
+                "than this in-memory implementation.",
+                stacklevel=2,
+            )
         self.documents = {doc.chunk_id: doc for doc in documents}
         self._build_index(documents)
 
@@ -1579,14 +1595,23 @@ Original query: {query}
 
 Return only the variations, one per line."""
 
+        # Explicit per-call timeout so a stalled provider does not
+        # pin the caller; rely on the SDK default only as a fallback.
         response = self.llm_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
+            timeout=30.0,
         )
 
-        variations = response.choices[0].message.content.strip().split("\n")
-        return [query] + [v.strip() for v in variations if v.strip()]
+        raw = response.choices[0].message.content.strip().split("\n")
+        variations = [v.strip() for v in raw if v.strip()]
+        # Clamp to the requested number to defend against
+        # over-generative responses; fall back to the original query
+        # if the provider returned nothing usable.
+        if not variations:
+            return [query]
+        return [query] + variations[:num_variations]
 
 
 class MultiQueryRAG(RAGPipeline):
@@ -2024,6 +2049,11 @@ class KnowledgeDocument:
 class KnowledgeBase:
     """Enterprise knowledge base with RAG capabilities."""
 
+    # Scale rail: chunks are retained locally to support BM25 rebuilds and
+    # stats. Beyond this threshold, stream chunks from the vector store
+    # rather than holding the whole corpus in process memory.
+    MAX_IN_MEMORY_CHUNKS = 500_000
+
     def __init__(
         self,
         vector_store: VectorStore,
@@ -2039,6 +2069,7 @@ class KnowledgeBase:
         # Initialize retrievers
         self._documents: Dict[str, KnowledgeDocument] = {}
         self._chunks: List[DocumentChunk] = []
+        self._scale_warning_emitted = False
 
         # Build retrieval pipeline
         self.vector_retriever = VectorRetriever(
@@ -2089,6 +2120,20 @@ class KnowledgeBase:
         # Track locally
         self._documents[document.document_id] = document
         self._chunks.extend(chunks)
+
+        if (
+            len(self._chunks) > self.MAX_IN_MEMORY_CHUNKS
+            and not self._scale_warning_emitted
+        ):
+            import warnings
+            warnings.warn(
+                f"KnowledgeBase holds {len(self._chunks)} chunks in memory "
+                f"(soft cap {self.MAX_IN_MEMORY_CHUNKS}). For larger corpora, "
+                "stream chunks from the vector store rather than retaining "
+                "them in self._chunks.",
+                stacklevel=2,
+            )
+            self._scale_warning_emitted = True
 
         # Rebuild BM25 index
         self._rebuild_keyword_index()

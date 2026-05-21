@@ -1741,7 +1741,14 @@ class AgentResponse:
 
 
 class BaseAgent(ABC):
-    """Base class for all customer service agents."""
+    """Base class for all customer service agents.
+
+    Turn accounting lives on the ``Conversation`` (not on the agent
+    instance) so a single shared agent serving multiple concurrent
+    conversations does not leak its turn counter across them. See
+    :py:meth:`process_message`, which reads/writes
+    ``conversation.turn_count``.
+    """
 
     def __init__(
         self,
@@ -1752,7 +1759,6 @@ class BaseAgent(ABC):
         self.config = config
         self.tools = {tool.definition.name: tool for tool in tools}
         self.llm_client = llm_client
-        self.turn_count = 0
 
     @property
     @abstractmethod
@@ -1777,10 +1783,12 @@ class BaseAgent(ABC):
         self, conversation: Conversation, user_message: str
     ) -> AgentResponse:
         """Process a user message and generate a response."""
-        self.turn_count += 1
+        # Per-conversation turn count (rather than per-agent) so a
+        # shared agent does not bleed counts across conversations.
+        conversation.turn_count = getattr(conversation, "turn_count", 0) + 1
 
         # Check turn limit
-        if self.turn_count > self.config.max_turns:
+        if conversation.turn_count > self.config.max_turns:
             return AgentResponse(
                 message="I've been working on this for a while. Let me connect you with a colleague who can continue helping.",
                 agent_type=self.agent_type,
@@ -3006,15 +3014,19 @@ Return JSON: {{"clarity": X, "helpfulness": X, "professionalism": X, "accuracy":
         """Check for compliance violations."""
         score = 100.0
 
-        # Check for sensitive data exposure (simplified)
+        # Check for sensitive data exposure (simplified).
+        # Bare \d{13,16} catches order IDs, tracking numbers, and
+        # phone numbers as false positives; gate the penalty on a
+        # Luhn check so we only flag plausible card numbers.
         for message in conversation.messages:
             content_lower = message.content.lower()
 
-            # Check for potential card number exposure
             import re
 
-            if re.search(r"\b\d{13,16}\b", message.content):
-                score -= 50
+            for candidate in re.findall(r"\b\d{13,16}\b", message.content):
+                if self._looks_like_pan(candidate):
+                    score -= 50
+                    break
 
             # Check for prohibited phrases
             prohibited = ["i promise", "guaranteed", "always", "never fails"]
@@ -3023,6 +3035,19 @@ Return JSON: {{"clarity": X, "helpfulness": X, "professionalism": X, "accuracy":
                     score -= 10
 
         return max(0, score)
+
+    @staticmethod
+    def _looks_like_pan(digits: str) -> bool:
+        """Luhn-mod-10 check; weeds out non-PAN numeric strings."""
+        total = 0
+        for i, ch in enumerate(reversed(digits)):
+            d = int(ch)
+            if i % 2 == 1:
+                d *= 2
+                if d > 9:
+                    d -= 9
+            total += d
+        return total % 10 == 0
 
 
 class FeedbackCollector:
@@ -3569,9 +3594,13 @@ async def handle_customer_message(
     await metrics.record_first_response(conversation_id, latency_ms)
 
     for tool_call in response.tool_calls:
+        # Use an explicit success flag rather than substring-sniffing
+        # the result string (which would misclassify any benign output
+        # that contains the word "error").
+        success = bool(tool_call.get("success", False))
         await metrics.record_tool_usage(
             tool_call["tool"],
-            "error" not in tool_call["result"].lower(),
+            success,
             0,  # Would need actual timing
         )
 

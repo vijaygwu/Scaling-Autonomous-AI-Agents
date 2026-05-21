@@ -1398,10 +1398,25 @@ class BackpressureQueueConsumer:
         consumer's role is to apply backpressure (rate limiting) on
         top of that. We dequeued the task to check it through the
         limiter; now we put it back at the head so the next worker
-        picks it up immediately. We also clear its visibility-timeout
-        marker since we never actually started processing it.
+        picks it up immediately.
+
+        Compensate for the side effects of the dequeue itself:
+        ``RedisTaskQueue.dequeue`` increments ``task.attempt`` and
+        installs a visibility-timeout marker, both of which are
+        accounting that should only happen on real processing
+        attempts. Without rolling these back, every pass through the
+        rate limiter burns one retry from the task's retry budget
+        and could push the task into the dead-letter queue without
+        a worker ever touching it.
         """
         q = self.task_queue
+        # Roll back the attempt bump that dequeue applied (this was
+        # a shaping pass, not a processing attempt) and persist.
+        if task.attempt > 0:
+            task.attempt -= 1
+            q.redis.setex(
+                f"task:{task.task_id}", q.body_ttl_seconds, task.to_json()
+            )
         # Remove from processing list (one occurrence) and clear the
         # visibility timer.
         q.redis.lrem(q.processing_queue, 1, task.task_id)
@@ -1876,6 +1891,11 @@ app = FastAPI()
 client = anthropic.Anthropic()
 state_manager = StateManager("redis://localhost:6379")
 agent = StatelessAgent(state_manager, client)
+# Module-level handle shared by the queue-backed ``/chat`` endpoint and
+# ``wait_for_result`` below. Defined here so those references resolve
+# at import time; in production wire this through your app's lifespan
+# handler rather than a module global.
+task_queue = RedisTaskQueue("redis://localhost:6379")
 
 
 @app.post("/chat")
