@@ -77,6 +77,22 @@ $EDITOR ch01-scaling/scaling.py
 - **Wrapped listings**: Blocks that are not standalone Python (log samples, Dockerfile snippets, JSON examples, etc.) are wrapped in raw docstrings and labelled with a reason — they preserve the book content verbatim but are not meant to execute.
 - **Future imports**: `from __future__ import annotations` is hoisted to the top of each file when used anywhere in the chapter.
 
+## Production Safety Patterns
+
+The chapter modules carry the production-readiness patterns advocated in the book. When you copy code into your own project, these patterns travel with it:
+
+- **Bounded collections**: `deque(maxlen=...)`, OrderedDict-backed LRU caches, ring-buffer metrics. The `AdaptiveTTLManager` and `ThresholdTuner` in `ch04-caching` are bounded so high-cardinality keys do not leak memory. The `BackpressureConsumer` in `ch01-scaling` rolls back the dequeue's attempt-counter increment so rate limiting does not silently burn retry budget.
+- **Explicit timeouts and retries**: Redis (`socket_timeout`, `socket_connect_timeout`, `health_check_interval`), DynamoDB (`BotoConfig` with `connect_timeout=2`, `read_timeout=5`, adaptive retries), LLM providers (per-call `timeout=30`), asyncpg connection pools with `command_timeout`. No caller hangs indefinitely on a flaky dependency.
+- **Specific exception handling**: typed ladders for the Anthropic SDK (`APITimeoutError` / `RateLimitError` / `APIConnectionError` retry once; `AuthenticationError` / `BadRequestError` escalate without retry); `redis.RedisError` handlers that bump distinct error metrics so a Redis backend failure is observable separately from a normal cache miss.
+- **Scale rails with loud warnings**: `BM25Retriever` and `KnowledgeBase` in `ch03-vector-databases` emit `warnings.warn(...)` past their in-memory operating envelope; `SemanticCache` in `ch04-caching` warns at the linear-scan cutover threshold and points callers at `ProductionSemanticCache` (FAISS-backed).
+- **Idempotency**: `ProcurementOrchestrator.submit_request` short-circuits on duplicate request IDs and returns `SubmissionResult(status="duplicate")`. Customer-service refund tools fall back to `uuid4` idempotency keys when callers do not supply one, so two legitimate partial refunds of the same order do not collide.
+- **PAN detection that does not false-positive on order IDs**: the compliance regex in `ch05-customer-service` is gated on a Luhn mod-10 check before docking the conversation's compliance score, so 13-16-digit tracking numbers no longer count as card-number exposure.
+- **Cancellable async loops**: Redis pubsub watchers in `ch02-state` use timed `pubsub.get_message(timeout=1.0)` rather than open-ended `pubsub.listen()`, so the surrounding asyncio task can be cancelled cleanly when Redis drops the connection.
+- **Vector-clock semantics**: the conflict-resolution path in `ch02-state` short-circuits identical clocks before invoking the additive merge, so concurrent updates that happen to land at the same causal version do not double-count fields like loyalty-point totals.
+- **Per-conversation state on shared agents**: `BaseAgent` in `ch05-customer-service` keeps the turn counter on the `Conversation` object rather than on the agent instance, so a single shared agent serving multiple concurrent conversations does not leak its turn count across them.
+
+These are not just illustrative; they are the patterns the surrounding prose advocates. If you copy a class out of one of these modules, you take the safety scaffolding with it.
+
 ## External Services Referenced
 
 Book 3 reaches further across the infrastructure stack than Books 1 or 2. Code in this repository references the following services and libraries — provide your own deployments or mocks when running examples:
