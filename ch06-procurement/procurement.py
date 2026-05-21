@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Complete Example: Procurement Automation
 
@@ -16,6 +14,8 @@ docstrings so this file always remains valid Python.
 To use a particular class or function, copy it into your own project and
 provide the surrounding context (imports, dependencies) as needed.
 """
+
+from __future__ import annotations
 
 
 # ============================================================================
@@ -61,6 +61,21 @@ class ApprovalLevel(Enum):
     VP = "vp"  # $25,001 - $100,000
     EXECUTIVE = "executive"  # Over $100,000
     BOARD = "board"  # Over $1,000,000
+
+
+@dataclass(frozen=True)
+class ApprovalPolicy:
+    """Configurable purchase-approval thresholds and routine rules."""
+
+    auto_limit: float = 500.0
+    manager_limit: float = 5_000.0
+    director_limit: float = 25_000.0
+    vp_limit: float = 100_000.0
+    board_limit: float = 1_000_000.0
+    preferred_vendor_auto_limit: float = 1_000.0
+    routine_categories: frozenset[PurchaseCategory] = field(
+        default_factory=lambda: frozenset({PurchaseCategory.OFFICE_SUPPLIES})
+    )
 
 
 class RequestStatus(Enum):
@@ -129,6 +144,9 @@ class PurchaseRequest:
     status: RequestStatus = RequestStatus.DRAFT
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    approval_policy: ApprovalPolicy = field(
+        default_factory=ApprovalPolicy, repr=False
+    )
 
     # Processing state
     assigned_agent: Optional[str] = None
@@ -159,25 +177,26 @@ class PurchaseRequest:
     def required_approval_level(self) -> ApprovalLevel:
         """Determine required approval level based on amount and category."""
         amount = self.total_amount
+        policy = self.approval_policy
 
         # Board approval for very large purchases
-        if amount > 1_000_000:
+        if amount > policy.board_limit:
             return ApprovalLevel.BOARD
 
         # Executive for large purchases
-        if amount > 100_000:
+        if amount > policy.vp_limit:
             return ApprovalLevel.EXECUTIVE
 
         # VP for significant purchases
-        if amount > 25_000:
+        if amount > policy.director_limit:
             return ApprovalLevel.VP
 
         # Director for medium purchases
-        if amount > 5_000:
+        if amount > policy.manager_limit:
             return ApprovalLevel.DIRECTOR
 
         # Manager for small purchases
-        if amount > 500:
+        if amount > policy.auto_limit:
             return ApprovalLevel.MANAGER
 
         # Auto-approve very small routine items
@@ -188,9 +207,9 @@ class PurchaseRequest:
 
     def _is_routine(self) -> bool:
         """Check if this is a routine, low-risk purchase."""
-        routine_categories = {PurchaseCategory.OFFICE_SUPPLIES}
-        return self.total_amount <= 500 and all(
-            item.category in routine_categories for item in self.items
+        policy = self.approval_policy
+        return self.total_amount <= policy.auto_limit and all(
+            item.category in policy.routine_categories for item in self.items
         )
 
     def update_status(
@@ -834,6 +853,8 @@ class EventBus:
                 registry[key].remove(handler)
             except ValueError:
                 pass
+            if not registry.get(key):
+                registry.pop(key, None)
 
         return unsubscribe
 
@@ -1889,17 +1910,14 @@ class ApprovalAgent:
     ) -> AutoApprovalResult:
         """Check if request can be auto-approved."""
         # Low-value office supplies
-        if request.total_amount <= 500 and all(
-            item.category == PurchaseCategory.OFFICE_SUPPLIES
-            for item in request.items
-        ):
+        if request._is_routine():
             return AutoApprovalResult(
                 eligible=True,
                 reason="Low-value office supplies (policy AUTO-001)",
             )
 
         # Pre-approved vendor + budget available
-        if request.total_amount <= 1000:
+        if request.total_amount <= request.approval_policy.preferred_vendor_auto_limit:
             all_preferred = True
             for item in request.items:
                 if item.vendor_id:

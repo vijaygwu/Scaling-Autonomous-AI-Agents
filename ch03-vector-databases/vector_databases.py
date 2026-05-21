@@ -1002,7 +1002,7 @@ class BM25Retriever(Retriever):
         """Simple tokenization."""
         return re.findall(r"\b\w+\b", text.lower())
 
-    def _build_index(self, documents: List[DocumentChunk]):
+    def _build_index(self, documents: List[DocumentChunk]) -> None:
         """Build inverted index and document statistics."""
         self.doc_lengths = {}
         self.inverted_index = defaultdict(list)
@@ -1549,6 +1549,8 @@ class RAGPipeline:
         timeout_seconds: float = 30.0,
         max_retries: int = 3,
         retry_backoff: float = 0.25,
+        model: str = "gpt-4o",
+        temperature: float = 0.1,
     ):
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
@@ -1558,6 +1560,8 @@ class RAGPipeline:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        self.model = model
+        self.temperature = temperature
         self.system_prompt = system_prompt or (
             "You are a helpful assistant that answers questions based on "
             "the provided context. If the context doesn't contain enough "
@@ -1646,12 +1650,12 @@ Please answer the question based on the context provided. Cite specific sources 
         for attempt in range(self.max_retries):
             try:
                 response = self.llm_client.chat.completions.create(
-                    model="gpt-4o",
+                    model=self.model,
                     messages=[
                         {"role": "system", "content": self.system_prompt},
                         {"role": "user", "content": user_message},
                     ],
-                    temperature=0.1,
+                    temperature=self.temperature,
                     timeout=self.timeout_seconds,
                 )
                 break
@@ -2042,6 +2046,17 @@ class VectorStore(ABC):
         """Get index statistics."""
         pass
 
+    @abstractmethod
+    def get_ids_by_metadata(
+        self,
+        filter: Dict[str, Any],
+        *,
+        max_results: int = 100_000,
+        page_size: int = 1024,
+    ) -> set[str]:
+        """Get vector IDs matching a metadata filter, bounded by max_results."""
+        pass
+
 
 class QdrantVectorStore(VectorStore):
     """Qdrant implementation of VectorStore."""
@@ -2181,16 +2196,28 @@ class QdrantVectorStore(VectorStore):
             "last_updated": datetime.now(timezone.utc).isoformat(),
         }
 
-    def get_ids_by_metadata(self, filter: Dict[str, Any]) -> set:
+    def get_ids_by_metadata(
+        self,
+        filter: Dict[str, Any],
+        *,
+        max_results: int = 100_000,
+        page_size: int = 1024,
+    ) -> set[str]:
         """Get all IDs matching metadata filter.
 
         Pages through Qdrant's scroll cursor until exhausted. The
         previous implementation passed ``limit=10000`` and read only
         the first page, which silently truncated large collections
         and let downstream updates/deletes leak orphaned vectors.
-        Page size 1024 balances round-trip overhead against memory.
+        ``max_results`` prevents broad filters from materializing an
+        unbounded ID set in memory.
         """
         from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        if max_results < 1:
+            raise ValueError("max_results must be >= 1")
+        if page_size < 1:
+            raise ValueError("page_size must be >= 1")
 
         conditions = [
             FieldCondition(key=k, match=MatchValue(value=v))
@@ -2200,17 +2227,28 @@ class QdrantVectorStore(VectorStore):
         ids: set[str] = set()
         next_offset = None
         while True:
+            limit = min(page_size, max_results - len(ids) + 1)
             points, next_offset = self._with_retry(
                 self.client.scroll,
                 collection_name=self.collection_name,
                 scroll_filter=Filter(must=conditions),
-                limit=1024,
+                limit=limit,
                 offset=next_offset,
                 with_payload=False,
             )
-            ids.update(str(p.id) for p in points)
+            for point in points:
+                ids.add(str(point.id))
+                if len(ids) > max_results:
+                    raise RuntimeError(
+                        f"metadata filter matched more than {max_results} IDs"
+                    )
             if next_offset is None:
                 break
+            if len(ids) >= max_results:
+                raise RuntimeError(
+                    f"metadata filter matched at least {max_results} IDs; "
+                    "narrow the filter or raise max_results"
+                )
         return ids
 
 

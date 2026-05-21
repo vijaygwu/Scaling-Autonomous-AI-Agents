@@ -1038,13 +1038,14 @@ Code Navigation (line numbers are approximate):
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Any, Dict, List, Union
+from typing import Optional, Any, Dict, List, Union, Callable
 from datetime import timedelta
 import logging
 import redis
 from redis.cluster import RedisCluster
 import json
 import threading
+import time
 from functools import lru_cache
 
 _redis_logger = logging.getLogger("agent.cache.redis")
@@ -1182,8 +1183,14 @@ class RedisBackend(CacheBackend):
         cluster_nodes: Optional[List[dict]] = None,
         key_prefix: str = "agent:",
         metrics: Optional[Any] = None,
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
     ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         self.key_prefix = key_prefix
+        self._max_retries = max_retries
+        self._retry_backoff = retry_backoff
         # Optional metrics sink with an ``increment(name, tags=...)``
         # method (statsd / OpenTelemetry / Datadog all expose this
         # shape). If supplied, Redis-error paths bump a counter so
@@ -1232,13 +1239,28 @@ class RedisBackend(CacheBackend):
     def _deserialize(self, data: bytes) -> Any:
         return json.loads(data.decode("utf-8"))
 
+    def _redis_call(
+        self, op: str, operation: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Run Redis cache I/O with bounded retry for transient failures."""
+        last_error: Optional[BaseException] = None
+        for attempt in range(self._max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except (redis.RedisError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+                if attempt == self._max_retries - 1:
+                    break
+                time.sleep(self._retry_backoff * (2**attempt))
+        self._bump_error_metric(op)
+        raise RuntimeError(f"Redis {op} failed after retries") from last_error
+
     def get(self, key: str) -> Optional[Any]:
         prefixed = self._prefixed_key(key)
         try:
-            data = self._client.get(prefixed)
-        except redis.RedisError as exc:
+            data = self._redis_call("get", self._client.get, prefixed)
+        except RuntimeError as exc:
             _redis_logger.warning("Redis GET failed for %s: %s", key, exc)
-            self._bump_error_metric("get")
             return None
         if data is None:
             return None
@@ -1250,8 +1272,8 @@ class RedisBackend(CacheBackend):
             )
             self._bump_error_metric("deserialize")
             try:
-                self._client.delete(prefixed)
-            except redis.RedisError as delete_exc:
+                self._redis_call("delete_corrupt", self._client.delete, prefixed)
+            except RuntimeError as delete_exc:
                 _redis_logger.warning(
                     "Redis DELETE failed for corrupt %s: %s", key, delete_exc
                 )
@@ -1267,28 +1289,31 @@ class RedisBackend(CacheBackend):
         try:
             if ttl_seconds:
                 return bool(
-                    self._client.setex(prefixed, ttl_seconds, serialized)
+                    self._redis_call(
+                        "set", self._client.setex, prefixed, ttl_seconds, serialized
+                    )
                 )
-            return bool(self._client.set(prefixed, serialized))
-        except redis.RedisError as exc:
+            return bool(self._redis_call("set", self._client.set, prefixed, serialized))
+        except RuntimeError as exc:
             _redis_logger.warning("Redis SET failed for %s: %s", key, exc)
-            self._bump_error_metric("set")
             return False
 
     def delete(self, key: str) -> bool:
         try:
-            return bool(self._client.delete(self._prefixed_key(key)))
-        except redis.RedisError as exc:
+            return bool(
+                self._redis_call("delete", self._client.delete, self._prefixed_key(key))
+            )
+        except RuntimeError as exc:
             _redis_logger.warning("Redis DELETE failed for %s: %s", key, exc)
-            self._bump_error_metric("delete")
             return False
 
     def exists(self, key: str) -> bool:
         try:
-            return bool(self._client.exists(self._prefixed_key(key)))
-        except redis.RedisError as exc:
+            return bool(
+                self._redis_call("exists", self._client.exists, self._prefixed_key(key))
+            )
+        except RuntimeError as exc:
             _redis_logger.warning("Redis EXISTS failed for %s: %s", key, exc)
-            self._bump_error_metric("exists")
             return False
 
     def _bump_error_metric(self, op: str) -> None:
@@ -1313,13 +1338,12 @@ class RedisBackend(CacheBackend):
 
         prefixed_keys = [self._prefixed_key(k) for k in keys]
         try:
-            values = self._client.mget(prefixed_keys)
-        except redis.RedisError as exc:
+            values = self._redis_call("get_many", self._client.mget, prefixed_keys)
+        except RuntimeError as exc:
             # Distinguish backend failure from cache miss; logging +
             # error-metric bump preserves SLO-relevant signal that a
             # silent empty-dict return would lose.
             _redis_logger.warning("Redis MGET failed: %s", exc)
-            self._bump_error_metric("get_many")
             return {}
 
         result = {}
@@ -1333,8 +1357,10 @@ class RedisBackend(CacheBackend):
                     )
                     self._bump_error_metric("get_many_deserialize")
                     try:
-                        self._client.delete(prefixed_key)
-                    except redis.RedisError as delete_exc:
+                        self._redis_call(
+                            "delete_corrupt", self._client.delete, prefixed_key
+                        )
+                    except RuntimeError as delete_exc:
                         _redis_logger.debug(
                             "failed deleting corrupt cache key %s: %s",
                             key,
@@ -1350,7 +1376,7 @@ class RedisBackend(CacheBackend):
             return True
 
         ttl_seconds = int(ttl.total_seconds()) if ttl else None
-        try:
+        def execute_pipeline() -> list[Any]:
             pipe = self._client.pipeline()
 
             for key, value in items.items():
@@ -1362,11 +1388,13 @@ class RedisBackend(CacheBackend):
                 else:
                     pipe.set(prefixed, serialized)
 
-            results = pipe.execute()
+            return pipe.execute()
+
+        try:
+            results = self._redis_call("set_many", execute_pipeline)
             return all(results)
-        except redis.RedisError as exc:
+        except RuntimeError as exc:
             _redis_logger.warning("Redis pipeline SET failed: %s", exc)
-            self._bump_error_metric("set_many")
             return False
 
     # Cap DEL batches so a single SCAN cursor that returns thousands
@@ -1392,18 +1420,23 @@ class RedisBackend(CacheBackend):
         cursor = 0
         try:
             while True:
-                cursor, keys = self._client.scan(
-                    cursor, match=prefixed_pattern, count=100
+                cursor, keys = self._redis_call(
+                    "delete_pattern_scan",
+                    self._client.scan,
+                    cursor,
+                    match=prefixed_pattern,
+                    count=100,
                 )
                 for i in range(0, len(keys), self.DELETE_BATCH_SIZE):
                     batch = keys[i : i + self.DELETE_BATCH_SIZE]
                     if batch:
-                        count += self._client.delete(*batch)
+                        count += self._redis_call(
+                            "delete_pattern_delete", self._client.delete, *batch
+                        )
                 if cursor == 0:
                     break
-        except redis.RedisError as exc:
+        except RuntimeError as exc:
             _redis_logger.warning("delete_pattern SCAN failed: %s", exc)
-            self._bump_error_metric("delete_pattern")
 
         return count
 
@@ -2886,11 +2919,15 @@ class CachedAgentRuntime:
         tool_timeout_seconds: float = 30.0,
         tool_max_retries: int = 2,
         tool_retry_backoff: float = 0.25,
+        l1_cache_max_size: int = 1000,
+        semantic_similarity_threshold: float = 0.95,
     ):
         if llm_max_retries < 1:
             raise ValueError("llm_max_retries must be >= 1")
         if tool_max_retries < 1:
             raise ValueError("tool_max_retries must be >= 1")
+        if l1_cache_max_size < 1:
+            raise ValueError("l1_cache_max_size must be >= 1")
         self.agent = agent
         self.llm_client = llm_client
         self.embedding_model = embedding_model
@@ -2900,9 +2937,11 @@ class CachedAgentRuntime:
         self.tool_timeout_seconds = tool_timeout_seconds
         self.tool_max_retries = tool_max_retries
         self.tool_retry_backoff = tool_retry_backoff
+        self.l1_cache_max_size = l1_cache_max_size
+        self.semantic_similarity_threshold = semantic_similarity_threshold
 
         # Initialize cache backends
-        l1_cache = InMemoryBackend(max_size=1000)
+        l1_cache = InMemoryBackend(max_size=self.l1_cache_max_size)
         from urllib.parse import urlparse
         parsed_redis = urlparse(redis_url)
         l2_cache = RedisBackend(
@@ -2919,7 +2958,7 @@ class CachedAgentRuntime:
         # Initialize semantic cache for query matching
         self.semantic_cache = ProductionSemanticCache(
             embedding_model=embedding_model,
-            similarity_threshold=0.95,
+            similarity_threshold=self.semantic_similarity_threshold,
             backend=l2_cache,
         )
 

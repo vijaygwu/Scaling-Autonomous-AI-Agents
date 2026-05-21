@@ -23,6 +23,7 @@ provide the surrounding context (imports, dependencies) as needed.
 import json
 import logging
 import re
+import asyncio
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -114,10 +115,16 @@ class RedisStateStore(StateStore[dict[str, Any]]):
         redis_client: AsyncRedis,
         key_prefix: str = "state:",
         default_ttl: int = 3600,
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
     ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         self._redis = redis_client
         self._prefix = key_prefix
         self._default_ttl = default_ttl
+        self._max_retries = max_retries
+        self._retry_backoff = retry_backoff
 
     def _make_key(self, key: str) -> str:
         return f"{self._prefix}{key}"
@@ -125,12 +132,30 @@ class RedisStateStore(StateStore[dict[str, Any]]):
     def _make_meta_key(self, key: str) -> str:
         return f"{self._prefix}meta:{key}"
 
+    async def _with_redis_retry(
+        self, label: str, operation: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        """Run a Redis operation with bounded transient retry/backoff."""
+        last_error: Optional[BaseException] = None
+        for attempt in range(self._max_retries):
+            try:
+                return await operation()
+            except WatchError:
+                raise
+            except (RedisError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+                if attempt == self._max_retries - 1:
+                    break
+                await asyncio.sleep(self._retry_backoff * (2**attempt))
+        logging.getLogger(__name__).exception(
+            "Redis %s failed after %s attempts", label, self._max_retries
+        )
+        raise RuntimeError(f"Redis {label} failed after retries") from last_error
+
     async def get(self, key: str) -> Optional[dict[str, Any]]:
-        try:
-            data = await self._redis.get(self._make_key(key))
-        except RedisError:
-            logging.getLogger(__name__).exception("Redis get failed for key=%s", key)
-            raise
+        data = await self._with_redis_retry(
+            "get", lambda: self._redis.get(self._make_key(key))
+        )
         if data is None:
             return None
         try:
@@ -167,22 +192,24 @@ class RedisStateStore(StateStore[dict[str, Any]]):
                 created_at=now, updated_at=now, version=1, ttl_seconds=ttl
             )
 
-        # Use pipeline for atomic update
-        pipe = self._redis.pipeline()
-        pipe.setex(full_key, ttl, json.dumps(value))
-        pipe.setex(
-            meta_key,
-            ttl,
-            json.dumps(
-                {
-                    "created_at": meta.created_at.isoformat(),
-                    "updated_at": meta.updated_at.isoformat(),
-                    "version": meta.version,
-                    "ttl_seconds": meta.ttl_seconds,
-                }
-            ),
-        )
-        await pipe.execute()
+        async def write_pipeline() -> Any:
+            pipe = self._redis.pipeline()
+            pipe.setex(full_key, ttl, json.dumps(value))
+            pipe.setex(
+                meta_key,
+                ttl,
+                json.dumps(
+                    {
+                        "created_at": meta.created_at.isoformat(),
+                        "updated_at": meta.updated_at.isoformat(),
+                        "version": meta.version,
+                        "ttl_seconds": meta.ttl_seconds,
+                    }
+                ),
+            )
+            return await pipe.execute()
+
+        await self._with_redis_retry("set", write_pipeline)
 
     async def compare_and_set(
         self,
@@ -197,56 +224,70 @@ class RedisStateStore(StateStore[dict[str, Any]]):
         meta_key = self._make_meta_key(key)
         now = datetime.now(timezone.utc)
 
-        async with self._redis.pipeline() as pipe:
+        for attempt in range(self._max_retries):
             try:
-                await pipe.watch(meta_key)
-                raw_meta = await pipe.get(meta_key)
+                async with self._redis.pipeline() as pipe:
+                    await pipe.watch(meta_key)
+                    raw_meta = await pipe.get(meta_key)
 
-                if raw_meta is None:
-                    if expected_version is not None:
-                        await pipe.unwatch()
-                        return False
-                    created_at = now
-                    next_version = 1
-                else:
-                    parsed = json.loads(raw_meta)
-                    current_version = int(parsed["version"])
-                    if current_version != expected_version:
-                        await pipe.unwatch()
-                        return False
-                    created_at = datetime.fromisoformat(parsed["created_at"])
-                    next_version = current_version + 1
+                    if raw_meta is None:
+                        if expected_version is not None:
+                            await pipe.unwatch()
+                            return False
+                        created_at = now
+                        next_version = 1
+                    else:
+                        parsed = json.loads(raw_meta)
+                        current_version = int(parsed["version"])
+                        if current_version != expected_version:
+                            await pipe.unwatch()
+                            return False
+                        created_at = datetime.fromisoformat(parsed["created_at"])
+                        next_version = current_version + 1
 
-                pipe.multi()
-                pipe.setex(full_key, ttl, json.dumps(value))
-                pipe.setex(
-                    meta_key,
-                    ttl,
-                    json.dumps(
-                        {
-                            "created_at": created_at.isoformat(),
-                            "updated_at": now.isoformat(),
-                            "version": next_version,
-                            "ttl_seconds": ttl,
-                        }
-                    ),
-                )
-                await pipe.execute()
-                return True
+                    pipe.multi()
+                    pipe.setex(full_key, ttl, json.dumps(value))
+                    pipe.setex(
+                        meta_key,
+                        ttl,
+                        json.dumps(
+                            {
+                                "created_at": created_at.isoformat(),
+                                "updated_at": now.isoformat(),
+                                "version": next_version,
+                                "ttl_seconds": ttl,
+                            }
+                        ),
+                    )
+                    await pipe.execute()
+                    return True
             except WatchError:
                 return False
+            except (RedisError, TimeoutError, ConnectionError, OSError):
+                if attempt == self._max_retries - 1:
+                    raise
+                await asyncio.sleep(self._retry_backoff * (2**attempt))
+        return False
 
     async def delete(self, key: str) -> bool:
-        result = await self._redis.delete(
-            self._make_key(key), self._make_meta_key(key)
+        result = await self._with_redis_retry(
+            "delete",
+            lambda: self._redis.delete(
+                self._make_key(key), self._make_meta_key(key)
+            ),
         )
         return result > 0
 
     async def exists(self, key: str) -> bool:
-        return await self._redis.exists(self._make_key(key)) > 0
+        result = await self._with_redis_retry(
+            "exists", lambda: self._redis.exists(self._make_key(key))
+        )
+        return result > 0
 
     async def get_metadata(self, key: str) -> Optional[StateMetadata]:
-        data = await self._redis.get(self._make_meta_key(key))
+        data = await self._with_redis_retry(
+            "get_metadata", lambda: self._redis.get(self._make_meta_key(key))
+        )
         if data is None:
             return None
         parsed = json.loads(data)
@@ -269,14 +310,20 @@ class RedisStateStore(StateStore[dict[str, Any]]):
         ex: Optional[int] = None,
     ) -> bool:
         return bool(
-            await self._redis.set(key, value, nx=nx, ex=ex)
+            await self._with_redis_retry(
+                "set_raw", lambda: self._redis.set(key, value, nx=nx, ex=ex)
+            )
         )
 
     async def get_raw(self, key: str) -> Optional[str]:
-        return await self._redis.get(key)
+        return await self._with_redis_retry(
+            "get_raw", lambda: self._redis.get(key)
+        )
 
     async def delete_raw(self, key: str) -> int:
-        return await self._redis.delete(key)
+        return await self._with_redis_retry(
+            "delete_raw", lambda: self._redis.delete(key)
+        )
 
     async def compare_and_delete_raw(self, key: str, expected: str) -> bool:
         """Atomically delete ``key`` only if its value still matches."""
@@ -286,15 +333,26 @@ class RedisStateStore(StateStore[dict[str, Any]]):
         end
         return 0
         """
-        return bool(await self._redis.eval(script, 1, key, expected))
+        return bool(
+            await self._with_redis_retry(
+                "compare_and_delete_raw",
+                lambda: self._redis.eval(script, 1, key, expected),
+            )
+        )
 
     async def eval_raw(self, script: str, numkeys: int, *args: Any) -> Any:
         """Evaluate a Redis Lua script through the public store API."""
-        return await self._redis.eval(script, numkeys, *args)
+        return await self._with_redis_retry(
+            "eval_raw", lambda: self._redis.eval(script, numkeys, *args)
+        )
 
     async def publish_raw(self, channel: str, payload: str) -> int:
         """Publish a serialized notification on a Redis channel."""
-        return int(await self._redis.publish(channel, payload))
+        return int(
+            await self._with_redis_retry(
+                "publish_raw", lambda: self._redis.publish(channel, payload)
+            )
+        )
 
     async def subscribe_raw(self, channel: str) -> Any:
         """Subscribe to a Redis channel through the public store API."""
@@ -405,8 +463,36 @@ class PostgresTaskStore:
         ON task_state(created_at);
     """
 
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
+    ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         self._pool = pool
+        self._max_retries = max_retries
+        self._retry_backoff = retry_backoff
+
+    async def _with_pg_retry(
+        self, label: str, operation: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        last_error: Optional[BaseException] = None
+        for attempt in range(self._max_retries):
+            try:
+                return await operation()
+            except (
+                asyncpg.PostgresError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+            ) as exc:
+                last_error = exc
+                if attempt == self._max_retries - 1:
+                    break
+                await asyncio.sleep(self._retry_backoff * (2**attempt))
+        raise RuntimeError(f"Postgres {label} failed after retries") from last_error
 
     @classmethod
     async def create(cls, dsn: str) -> "PostgresTaskStore":
@@ -429,26 +515,32 @@ class PostgresTaskStore:
         self, task_id: str, task_type: str, payload: dict[str, Any]
     ) -> TaskState:
         """Create a new task in pending state."""
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO task_state (task_id, task_type, status, payload)
-                VALUES ($1, $2, 'pending', $3)
-                RETURNING *
-                """,
-                task_id,
-                task_type,
-                json.dumps(payload),
-            )
-            return self._row_to_task(row)
+        async def insert_task() -> TaskState:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO task_state (task_id, task_type, status, payload)
+                    VALUES ($1, $2, 'pending', $3)
+                    RETURNING *
+                    """,
+                    task_id,
+                    task_type,
+                    json.dumps(payload),
+                )
+                return self._row_to_task(row)
+
+        return await self._with_pg_retry("create_task", insert_task)
 
     async def get_task(self, task_id: str) -> Optional[TaskState]:
         """Retrieve task by ID."""
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM task_state WHERE task_id = $1", task_id
-            )
-            return self._row_to_task(row) if row else None
+        async def fetch_task() -> Optional[TaskState]:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM task_state WHERE task_id = $1", task_id
+                )
+                return self._row_to_task(row) if row else None
+
+        return await self._with_pg_retry("get_task", fetch_task)
 
     async def update_checkpoint(
         self,
@@ -463,32 +555,35 @@ class PostgresTaskStore:
         the current attempt_count matches. This prevents lost updates
         when multiple workers process the same task.
         """
-        async with self._pool.acquire() as conn:
-            if expected_version is not None:
-                result = await conn.execute(
-                    """
-                    UPDATE task_state 
-                    SET checkpoint = $2, 
-                        updated_at = NOW(),
-                        attempt_count = attempt_count + 1
-                    WHERE task_id = $1 
-                        AND attempt_count = $3
-                    """,
-                    task_id,
-                    json.dumps(checkpoint),
-                    expected_version,
-                )
-            else:
-                result = await conn.execute(
-                    """
-                    UPDATE task_state 
-                    SET checkpoint = $2, updated_at = NOW()
-                    WHERE task_id = $1
-                    """,
-                    task_id,
-                    json.dumps(checkpoint),
-                )
-            return result == "UPDATE 1"
+        async def update() -> bool:
+            async with self._pool.acquire() as conn:
+                if expected_version is not None:
+                    result = await conn.execute(
+                        """
+                        UPDATE task_state 
+                        SET checkpoint = $2, 
+                            updated_at = NOW(),
+                            attempt_count = attempt_count + 1
+                        WHERE task_id = $1 
+                            AND attempt_count = $3
+                        """,
+                        task_id,
+                        json.dumps(checkpoint),
+                        expected_version,
+                    )
+                else:
+                    result = await conn.execute(
+                        """
+                        UPDATE task_state 
+                        SET checkpoint = $2, updated_at = NOW()
+                        WHERE task_id = $1
+                        """,
+                        task_id,
+                        json.dumps(checkpoint),
+                    )
+                return result == "UPDATE 1"
+
+        return await self._with_pg_retry("update_checkpoint", update)
 
     async def transition_status(
         self,
@@ -510,22 +605,25 @@ class PostgresTaskStore:
             if new_status == TaskStatus.COMPLETED
             else None
         )
-        async with self._pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE task_state
-                SET status = $2,
-                    updated_at = NOW(),
-                    completed_at = $4,
-                    error_message = $3
-                WHERE task_id = $1
-                """,
-                task_id,
-                new_status.value,
-                error_message,
-                completed_at,
-            )
-            return result == "UPDATE 1"
+        async def transition() -> bool:
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    """
+                    UPDATE task_state
+                    SET status = $2,
+                        updated_at = NOW(),
+                        completed_at = $4,
+                        error_message = $3
+                    WHERE task_id = $1
+                    """,
+                    task_id,
+                    new_status.value,
+                    error_message,
+                    completed_at,
+                )
+                return result == "UPDATE 1"
+
+        return await self._with_pg_retry("transition_status", transition)
 
     async def claim_pending_tasks(
         self, task_type: str, worker_id: str, limit: int = 10
@@ -536,27 +634,64 @@ class PostgresTaskStore:
         Uses SELECT FOR UPDATE SKIP LOCKED to enable multiple
         workers to claim tasks without conflicts.
         """
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                rows = await conn.fetch(
-                    """
-                    UPDATE task_state
-                    SET status = 'running',
-                        updated_at = NOW(),
-                        attempt_count = attempt_count + 1
-                    WHERE task_id IN (
-                        SELECT task_id FROM task_state
-                        WHERE task_type = $1 AND status = 'pending'
-                        ORDER BY created_at
-                        LIMIT $2
-                        FOR UPDATE SKIP LOCKED
+        async def claim() -> list[TaskState]:
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    rows = await conn.fetch(
+                        """
+                        UPDATE task_state
+                        SET status = 'running',
+                            updated_at = NOW(),
+                            attempt_count = attempt_count + 1
+                        WHERE task_id IN (
+                            SELECT task_id FROM task_state
+                            WHERE task_type = $1 AND status = 'pending'
+                            ORDER BY created_at
+                            LIMIT $2
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        RETURNING *
+                        """,
+                        task_type,
+                        limit,
                     )
-                    RETURNING *
-                    """,
-                    task_type,
-                    limit,
-                )
+                    return [self._row_to_task(row) for row in rows]
+
+        return await self._with_pg_retry("claim_pending_tasks", claim)
+
+    async def find_stale_running_tasks(
+        self,
+        task_types: Optional[list[str]],
+        stale_after: timedelta,
+    ) -> list[TaskState]:
+        """Find running tasks older than the stale threshold."""
+        async def fetch_stale() -> list[TaskState]:
+            async with self._pool.acquire() as conn:
+                if task_types:
+                    rows = await conn.fetch(
+                        """
+                        SELECT * FROM task_state
+                        WHERE status = 'running'
+                        AND task_type = ANY($1)
+                        AND updated_at < NOW() - $2::interval
+                        ORDER BY updated_at
+                        """,
+                        task_types,
+                        stale_after,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT * FROM task_state
+                        WHERE status = 'running'
+                        AND updated_at < NOW() - $1::interval
+                        ORDER BY updated_at
+                        """,
+                        stale_after,
+                    )
                 return [self._row_to_task(row) for row in rows]
+
+        return await self._with_pg_retry("find_stale_running_tasks", fetch_stale)
 
     def _row_to_task(self, row: asyncpg.Record) -> TaskState:
         return TaskState(
@@ -1499,30 +1634,9 @@ class RecoveryCoordinator:
         self, task_types: Optional[list[str]]
     ) -> list[TaskState]:
         """Find tasks that were interrupted mid-execution."""
-        async with self._tasks._pool.acquire() as conn:
-            if task_types:
-                rows = await conn.fetch(
-                    """
-                    SELECT * FROM task_state
-                    WHERE status = 'running'
-                    AND task_type = ANY($1)
-                    AND updated_at < NOW() - $2::interval
-                    ORDER BY updated_at
-                    """,
-                    task_types,
-                    self._stale_task_after,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT * FROM task_state
-                    WHERE status = 'running'
-                    AND updated_at < NOW() - $1::interval
-                    ORDER BY updated_at
-                    """,
-                    self._stale_task_after,
-                )
-            return [self._tasks._row_to_task(r) for r in rows]
+        return await self._tasks.find_stale_running_tasks(
+            task_types, self._stale_task_after
+        )
 
     async def _recover_task(self, task: TaskState) -> RecoveryResult:
         """Attempt to recover a single interrupted task."""

@@ -314,8 +314,16 @@ class AgentConfig:
     confidence_threshold: float = 0.7
     escalation_threshold: int = 3  # Failed attempts before escalation
     timeout_seconds: float = 30.0
+    max_transient_retries: int = 1
+    llm_retry_backoff_seconds: float = 1.5
     tools: list[str] = field(default_factory=list)
     system_prompt_template: str = ""
+
+    def __post_init__(self) -> None:
+        if self.max_transient_retries < 0:
+            raise ValueError("max_transient_retries must be >= 0")
+        if self.llm_retry_backoff_seconds < 0:
+            raise ValueError("llm_retry_backoff_seconds must be >= 0")
 
 
 @dataclass
@@ -456,7 +464,7 @@ Provides a consistent interface for all tool implementations.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, ParamSpec, TypeVar
 import json
 import logging
 import functools
@@ -464,6 +472,9 @@ import asyncio
 import httpx
 
 logger = logging.getLogger(__name__)
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 @dataclass
@@ -575,7 +586,9 @@ class Tool(ABC):
         return None
 
 
-def with_retry(max_attempts: int = 3, backoff_seconds: float = 1.0):
+def with_retry(
+    max_attempts: int = 3, backoff_seconds: float = 1.0
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
     """Decorator for retrying failed tool executions.
 
     Only retries on transient failures (timeouts, connection errors,
@@ -610,9 +623,9 @@ def with_retry(max_attempts: int = 3, backoff_seconds: float = 1.0):
             return 500 <= exc.response.status_code < 600
         return False
 
-    def decorator(func: Callable):
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             last_error = None
             for attempt in range(max_attempts):
                 try:
@@ -1928,8 +1941,8 @@ class BaseAgent(ABC):
         # warrant a single retry within this turn, (b) permanent
         # caller-side errors (auth, malformed request) that must
         # escalate without retry, and (c) genuine unknowns.
-        max_transient_retries = 1
-        backoff_seconds = 1.5
+        max_transient_retries = self.config.max_transient_retries
+        backoff_seconds = self.config.llm_retry_backoff_seconds
         last_exc: Optional[Exception] = None
 
         response = None
@@ -2257,7 +2270,8 @@ class BaseAgent(ABC):
             }
         )
 
-        max_transient_retries = 1
+        max_transient_retries = self.config.max_transient_retries
+        backoff_seconds = self.config.llm_retry_backoff_seconds
         for attempt in range(max_transient_retries + 1):
             try:
                 response = await asyncio.wait_for(
@@ -2284,7 +2298,7 @@ class BaseAgent(ABC):
                     self.agent_type,
                     exc,
                 )
-                await asyncio.sleep(1.5 * (2**attempt))
+                await asyncio.sleep(backoff_seconds * (2**attempt))
 
         raise RuntimeError("final-response retry loop exhausted")
 
@@ -2843,10 +2857,16 @@ class ConversationManager:
     MAX_ACTIVE_CONVERSATIONS = 10_000
 
     def __init__(
-        self, config: PlatformConfig, agents: dict[AgentType, BaseAgent]
+        self,
+        config: PlatformConfig,
+        agents: dict[AgentType, BaseAgent],
+        max_active_conversations: int = MAX_ACTIVE_CONVERSATIONS,
     ):
+        if max_active_conversations < 1:
+            raise ValueError("max_active_conversations must be >= 1")
         self.config = config
         self.agents = agents
+        self.max_active_conversations = max_active_conversations
         self.active_conversations: "OrderedDict[str, Conversation]" = (
             OrderedDict()
         )
@@ -2865,7 +2885,7 @@ class ConversationManager:
         self.conversation_metrics.move_to_end(conv_id)
         self._conversation_locks.setdefault(conv_id, asyncio.Lock())
         self._conversation_locks.move_to_end(conv_id)
-        while len(self.active_conversations) > self.MAX_ACTIVE_CONVERSATIONS:
+        while len(self.active_conversations) > self.max_active_conversations:
             evicted_id, _ = self.active_conversations.popitem(last=False)
             self.conversation_metrics.pop(evicted_id, None)
             self._conversation_locks.pop(evicted_id, None)

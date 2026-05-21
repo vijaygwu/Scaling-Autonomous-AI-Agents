@@ -107,9 +107,10 @@ class StatefulAgent:
 
 import json
 import redis
+from redis.exceptions import RedisError
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Callable, Optional
 import hashlib
 
 
@@ -144,8 +145,14 @@ class StateManager:
     """Manages externalized agent state in Redis."""
 
     def __init__(
-        self, redis_url: str = "redis://localhost:6379", state_ttl: int = 86400
+        self,
+        redis_url: str = "redis://localhost:6379",
+        state_ttl: int = 86400,
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
     ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         # Explicit timeouts + health-check + bounded pool. The default
         # ``redis.from_url(...)`` produces a client that blocks
         # indefinitely on a hung server; in a worker pool that
@@ -159,11 +166,26 @@ class StateManager:
             max_connections=50,
         )
         self.state_ttl = state_ttl
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+
+    def _redis_call(self, operation: Callable[..., Any], *args: Any) -> Any:
+        """Run a Redis operation with bounded retry/backoff."""
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.max_retries):
+            try:
+                return operation(*args)
+            except (RedisError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+                if attempt == self.max_retries - 1:
+                    break
+                time.sleep(self.retry_backoff * (2**attempt))
+        raise RuntimeError("Redis operation failed after retries") from last_error
 
     def get_state(self, conversation_id: str) -> Optional[ConversationState]:
         """Retrieve conversation state from Redis."""
         key = f"conversation:{conversation_id}"
-        data = self.redis.get(key)
+        data = self._redis_call(self.redis.get, key)
 
         if data is None:
             return None
@@ -177,17 +199,17 @@ class StateManager:
             state.created_at = state.updated_at
 
         key = f"conversation:{state.conversation_id}"
-        self.redis.setex(key, self.state_ttl, state.to_json())
+        self._redis_call(self.redis.setex, key, self.state_ttl, state.to_json())
 
     def delete_state(self, conversation_id: str) -> None:
         """Remove conversation state."""
         key = f"conversation:{conversation_id}"
-        self.redis.delete(key)
+        self._redis_call(self.redis.delete, key)
 
     def extend_ttl(self, conversation_id: str) -> None:
         """Extend the TTL for an active conversation."""
         key = f"conversation:{conversation_id}"
-        self.redis.expire(key, self.state_ttl)
+        self._redis_call(self.redis.expire, key, self.state_ttl)
 
 
 class StatelessAgent:
@@ -270,8 +292,14 @@ class VersionedStateManager:
     """State manager with optimistic locking for conflict detection."""
 
     def __init__(
-        self, redis_url: str = "redis://localhost:6379", state_ttl: int = 86400
+        self,
+        redis_url: str = "redis://localhost:6379",
+        state_ttl: int = 86400,
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
     ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         # Mirror StateManager's production timeouts/pool; a flaky Redis
         # would otherwise wedge every version check behind the default
         # unbounded socket timeout.
@@ -284,6 +312,20 @@ class VersionedStateManager:
             max_connections=50,
         )
         self.state_ttl = state_ttl
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+
+    def _redis_call(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except (RedisError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+                if attempt == self.max_retries - 1:
+                    break
+                time.sleep(self.retry_backoff * (2**attempt))
+        raise RuntimeError("Versioned Redis operation failed after retries") from last_error
 
     def get_state_with_version(
         self, conversation_id: str
@@ -292,10 +334,13 @@ class VersionedStateManager:
         key = f"conversation:{conversation_id}"
         version_key = f"conversation:{conversation_id}:version"
 
-        pipe = self.redis.pipeline()
-        pipe.get(key)
-        pipe.get(version_key)
-        data, version = pipe.execute()
+        def read_versioned_state() -> tuple[Optional[str], Optional[str]]:
+            pipe = self.redis.pipeline()
+            pipe.get(key)
+            pipe.get(version_key)
+            return pipe.execute()
+
+        data, version = self._redis_call(read_versioned_state)
 
         if data is None:
             return None, 0
@@ -328,7 +373,8 @@ class VersionedStateManager:
         return 1
         """
 
-        result = self.redis.eval(
+        result = self._redis_call(
+            self.redis.eval,
             lua_script,
             2,
             key,
@@ -384,7 +430,10 @@ class WorkerInfo:
 class LeastConnectionsBalancer:
     """Load balancer using least connections algorithm."""
 
-    def __init__(self):
+    def __init__(self, max_workers: int = 10_000):
+        if max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        self.max_workers = max_workers
         self.workers: dict[str, WorkerInfo] = {}
         self.lock = threading.Lock()
 
@@ -393,6 +442,8 @@ class LeastConnectionsBalancer:
     ) -> None:
         """Add a worker to the pool."""
         with self.lock:
+            if worker_id not in self.workers and len(self.workers) >= self.max_workers:
+                raise RuntimeError("worker registry is at capacity")
             self.workers[worker_id] = WorkerInfo(
                 worker_id=worker_id,
                 address=address,
@@ -465,7 +516,10 @@ class WeightedBalancer:
     current performance metrics.
     """
 
-    def __init__(self):
+    def __init__(self, max_workers: int = 10_000):
+        if max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        self.max_workers = max_workers
         self.workers: dict[str, WorkerInfo] = {}
         self.history_window = 100  # Keep last 100 latencies
         # ``deque(maxlen=...)`` makes the bound automatic and avoids an
@@ -477,6 +531,29 @@ class WeightedBalancer:
         # then calls ``get_average_latency``, which also takes it. A
         # plain ``Lock`` would deadlock on that second acquire.
         self.lock = threading.RLock()
+
+    def register_worker(
+        self, worker_id: str, address: str, weight: float = 1.0
+    ) -> None:
+        """Add a worker to the weighted pool."""
+        with self.lock:
+            if worker_id not in self.workers and len(self.workers) >= self.max_workers:
+                raise RuntimeError("worker registry is at capacity")
+            self.workers[worker_id] = WorkerInfo(
+                worker_id=worker_id,
+                address=address,
+                weight=weight,
+                last_health_check=time.time(),
+            )
+            self.latency_history.setdefault(
+                worker_id, deque(maxlen=self.history_window)
+            )
+
+    def unregister_worker(self, worker_id: str) -> None:
+        """Remove a worker and its latency history."""
+        with self.lock:
+            self.workers.pop(worker_id, None)
+            self.latency_history.pop(worker_id, None)
 
     def record_latency(self, worker_id: str, latency_ms: float) -> None:
         """Record request latency for a worker."""
@@ -529,6 +606,7 @@ class WeightedBalancer:
 
 import json
 import redis
+from redis.exceptions import RedisError
 import time
 import uuid
 from dataclasses import dataclass, asdict
@@ -582,9 +660,13 @@ class RedisTaskQueue:
         visibility_timeout: int = 300,  # 5 minutes
         body_ttl_seconds: int = 7 * 24 * 3600,  # 7 days
         max_queue_size: int = 100_000,
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
     ):
         if max_queue_size < 1:
             raise ValueError("max_queue_size must be >= 1")
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         self.redis = redis.from_url(
             redis_url,
             decode_responses=True,
@@ -598,6 +680,8 @@ class RedisTaskQueue:
         self.dead_letter_queue = f"{queue_name}:dlq"
         self.visibility_timeout = visibility_timeout
         self.max_queue_size = max_queue_size
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         # Body TTL must comfortably exceed the worst-case queue
         # residence (queue depth × visibility timeout + retries).
         # A 24-hour TTL on the body but multi-day queue residence
@@ -615,13 +699,27 @@ class RedisTaskQueue:
         """
         self.logger = logging.getLogger(__name__)
 
+    def _redis_call(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run Redis I/O with bounded retry for transient failures."""
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except (RedisError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+                if attempt == self.max_retries - 1:
+                    break
+                time.sleep(self.retry_backoff * (2**attempt))
+        raise RuntimeError("Redis task queue operation failed after retries") from last_error
+
     def enqueue(self, task: AgentTask) -> str:
         """Add a task to the queue."""
         task.created_at = time.time()
 
         # Store task details
         task_key = f"task:{task.task_id}"
-        inserted = self.redis.eval(
+        inserted = self._redis_call(
+            self.redis.eval,
             self._enqueue_script,
             2,
             self.queue_name,
@@ -643,7 +741,8 @@ class RedisTaskQueue:
         Uses BLMOVE for reliable processing (Redis 6.2+).
         """
         # Move task from main queue to processing queue atomically
-        task_id = self.redis.blmove(
+        task_id = self._redis_call(
+            self.redis.blmove,
             self.queue_name,
             self.processing_queue,
             timeout=timeout,
@@ -656,11 +755,11 @@ class RedisTaskQueue:
 
         # Retrieve task details
         task_key = f"task:{task_id}"
-        task_data = self.redis.get(task_key)
+        task_data = self._redis_call(self.redis.get, task_key)
 
         if task_data is None:
             # Task expired, remove from processing queue
-            self.redis.lrem(self.processing_queue, 1, task_id)
+            self._redis_call(self.redis.lrem, self.processing_queue, 1, task_id)
             return None
 
         task = AgentTask.from_json(task_data)
@@ -668,7 +767,9 @@ class RedisTaskQueue:
         task.attempt += 1
 
         # Update task status
-        self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
+        self._redis_call(
+            self.redis.setex, task_key, self.body_ttl_seconds, task.to_json()
+        )
 
         # Set visibility timeout
         self._set_visibility_timeout(task_id)
@@ -681,10 +782,12 @@ class RedisTaskQueue:
         task.result = result
 
         task_key = f"task:{task.task_id}"
-        self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
+        self._redis_call(
+            self.redis.setex, task_key, self.body_ttl_seconds, task.to_json()
+        )
 
         # Remove from processing queue
-        self.redis.lrem(self.processing_queue, 1, task.task_id)
+        self._redis_call(self.redis.lrem, self.processing_queue, 1, task.task_id)
         self._clear_visibility_timeout(task.task_id)
 
         self.logger.info(f"Completed task {task.task_id}")
@@ -697,15 +800,17 @@ class RedisTaskQueue:
             # Requeue for retry
             task.status = TaskStatus.RETRYING
             task_key = f"task:{task.task_id}"
-            self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
+            self._redis_call(
+                self.redis.setex, task_key, self.body_ttl_seconds, task.to_json()
+            )
 
             # Remove from processing and re-enqueue. The submit path uses
             # lpush + a right-side dequeue (BLMOVE from RIGHT), giving FIFO
             # order with the oldest task at the right end. Match that
             # convention here so retries are treated like fresh arrivals
             # rather than jumping the queue.
-            self.redis.lrem(self.processing_queue, 1, task.task_id)
-            self.redis.lpush(self.queue_name, task.task_id)
+            self._redis_call(self.redis.lrem, self.processing_queue, 1, task.task_id)
+            self._redis_call(self.redis.lpush, self.queue_name, task.task_id)
 
             self.logger.warning(
                 f"Task {task.task_id} failed, requeueing "
@@ -715,10 +820,12 @@ class RedisTaskQueue:
             # Move to dead letter queue
             task.status = TaskStatus.FAILED
             task_key = f"task:{task.task_id}"
-            self.redis.setex(task_key, self.body_ttl_seconds, task.to_json())
+            self._redis_call(
+                self.redis.setex, task_key, self.body_ttl_seconds, task.to_json()
+            )
 
-            self.redis.lrem(self.processing_queue, 1, task.task_id)
-            self.redis.lpush(self.dead_letter_queue, task.task_id)
+            self._redis_call(self.redis.lrem, self.processing_queue, 1, task.task_id)
+            self._redis_call(self.redis.lpush, self.dead_letter_queue, task.task_id)
 
             self.logger.error(
                 f"Task {task.task_id} permanently failed after "
@@ -730,22 +837,23 @@ class RedisTaskQueue:
     def get_queue_depth(self) -> dict[str, int]:
         """Get the current depth of all queues."""
         return {
-            "pending": self.redis.llen(self.queue_name),
-            "processing": self.redis.llen(self.processing_queue),
-            "dead_letter": self.redis.llen(self.dead_letter_queue),
+            "pending": self._redis_call(self.redis.llen, self.queue_name),
+            "processing": self._redis_call(self.redis.llen, self.processing_queue),
+            "dead_letter": self._redis_call(self.redis.llen, self.dead_letter_queue),
         }
 
     def _set_visibility_timeout(self, task_id: str) -> None:
         """Set a timeout for task processing."""
         timeout_key = f"task:{task_id}:timeout"
-        self.redis.setex(
+        self._redis_call(
+            self.redis.setex,
             timeout_key, self.visibility_timeout, str(time.time())
         )
 
     def _clear_visibility_timeout(self, task_id: str) -> None:
         """Clear the visibility timeout."""
         timeout_key = f"task:{task_id}:timeout"
-        self.redis.delete(timeout_key)
+        self._redis_call(self.redis.delete, timeout_key)
 
     def recover_stale_tasks(self) -> int:
         """
@@ -753,14 +861,16 @@ class RedisTaskQueue:
         Should be called periodically by a maintenance process.
         """
         recovered = 0
-        processing_tasks = self.redis.lrange(self.processing_queue, 0, -1)
+        processing_tasks = self._redis_call(
+            self.redis.lrange, self.processing_queue, 0, -1
+        )
 
         for task_id in processing_tasks:
             timeout_key = f"task:{task_id}:timeout"
-            if not self.redis.exists(timeout_key):
+            if not self._redis_call(self.redis.exists, timeout_key):
                 # Timeout expired, requeue the task
-                self.redis.lrem(self.processing_queue, 1, task_id)
-                self.redis.lpush(self.queue_name, task_id)
+                self._redis_call(self.redis.lrem, self.processing_queue, 1, task_id)
+                self._redis_call(self.redis.lpush, self.queue_name, task_id)
                 recovered += 1
                 self.logger.warning(f"Recovered stale task {task_id}")
 
@@ -1821,9 +1931,11 @@ class AutoScaler:
 # ============================================================================
 
 import hashlib
-from typing import Optional
+from typing import Optional, Callable, Any
 import redis
+from redis.exceptions import RedisError
 from dataclasses import dataclass
+import time
 
 
 @dataclass
@@ -1838,9 +1950,17 @@ class ShardConfig:
 class ShardedStateManager:
     """State manager that distributes data across multiple shards."""
 
-    def __init__(self, shards: list[ShardConfig], state_ttl: int = 86400):
+    def __init__(
+        self,
+        shards: list[ShardConfig],
+        state_ttl: int = 86400,
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
+    ):
         if not shards:
             raise ValueError("ShardedStateManager requires at least one shard")
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
 
         self.shards = {s.shard_id: s for s in shards}
         if len(self.shards) != len(shards):
@@ -1848,6 +1968,8 @@ class ShardedStateManager:
         self.shard_ids = sorted(self.shards)
         self.shard_count = len(self.shard_ids)
         self.state_ttl = state_ttl
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
 
         # Initialize connections to each shard
         self.redis_clients: dict[int, redis.Redis] = {}
@@ -1882,12 +2004,25 @@ class ShardedStateManager:
         shard_id = self._get_shard_id(conversation_id)
         return self.redis_clients[shard_id]
 
+    def _redis_call(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run shard Redis I/O with bounded retry for transient failures."""
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except (RedisError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+                if attempt == self.max_retries - 1:
+                    break
+                time.sleep(self.retry_backoff * (2**attempt))
+        raise RuntimeError("Shard Redis operation failed after retries") from last_error
+
     def get_state(self, conversation_id: str) -> Optional[ConversationState]:
         """Retrieve conversation state from the appropriate shard."""
         client = self._get_client(conversation_id)
         key = f"conversation:{conversation_id}"
 
-        data = client.get(key)
+        data = self._redis_call(client.get, key)
         if data is None:
             return None
 
@@ -1898,23 +2033,21 @@ class ShardedStateManager:
         client = self._get_client(state.conversation_id)
         key = f"conversation:{state.conversation_id}"
 
-        import time
-
         state.updated_at = time.time()
         if state.created_at == 0.0:
             state.created_at = state.updated_at
 
-        client.setex(key, self.state_ttl, state.to_json())
+        self._redis_call(client.setex, key, self.state_ttl, state.to_json())
 
     def get_shard_stats(self) -> dict[int, dict]:
         """Get statistics from each shard."""
         stats = {}
         for shard_id, client in self.redis_clients.items():
-            info = client.info()
+            info = self._redis_call(client.info)
             stats[shard_id] = {
                 "used_memory": info["used_memory_human"],
                 "connected_clients": info["connected_clients"],
-                "keys": client.dbsize(),
+                "keys": self._redis_call(client.dbsize),
             }
         return stats
 
@@ -2144,7 +2277,17 @@ class PriorityTaskQueue:
     concurrent workers.
     """
 
-    def __init__(self, redis_url: str):
+    def __init__(
+        self,
+        redis_url: str,
+        task_ttl_seconds: int = 86400,
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
+    ):
+        if task_ttl_seconds < 1:
+            raise ValueError("task_ttl_seconds must be >= 1")
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         # Same production timeouts as RedisTaskQueue; a flaky Redis
         # would otherwise hang priority dequeue indefinitely.
         self.redis = redis.from_url(
@@ -2161,6 +2304,9 @@ class PriorityTaskQueue:
             "normal": "tasks:normal",
             "low": "tasks:low",
         }
+        self.task_ttl_seconds = task_ttl_seconds
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         self._priority_order = ["critical", "high", "normal", "low"]
         self._dequeue_script = """
         for i = 1, #KEYS do
@@ -2179,6 +2325,18 @@ class PriorityTaskQueue:
         return nil
         """
 
+    def _redis_call(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except (RedisError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+                if attempt == self.max_retries - 1:
+                    break
+                time.sleep(self.retry_backoff * (2**attempt))
+        raise RuntimeError("Priority queue Redis operation failed after retries") from last_error
+
     def enqueue(
         self, task: AgentTask, priority: str = "normal"
     ) -> None:
@@ -2186,17 +2344,22 @@ class PriorityTaskQueue:
             priority, self.queues["normal"]
         )
         task_key = f"task:{task.task_id}"
-        pipe = self.redis.pipeline(transaction=True)
-        pipe.setex(task_key, 86400, task.to_json())
-        pipe.lpush(queue_name, task.task_id)
-        pipe.execute()
+
+        def write_task() -> list[Any]:
+            pipe = self.redis.pipeline(transaction=True)
+            pipe.setex(task_key, self.task_ttl_seconds, task.to_json())
+            pipe.lpush(queue_name, task.task_id)
+            return pipe.execute()
+
+        self._redis_call(write_task)
 
     def dequeue(self, timeout: int = 5) -> Optional[AgentTask]:
         queues = [self.queues[p] for p in self._priority_order]
         deadline = time.monotonic() + max(timeout, 0)
 
         while True:
-            data = self.redis.eval(
+            data = self._redis_call(
+                self.redis.eval,
                 self._dequeue_script,
                 len(queues),
                 *queues,
