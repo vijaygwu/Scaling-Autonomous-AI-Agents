@@ -73,11 +73,17 @@ class MultiModalAgent:
         max_llm_retries: int = 3,
         llm_retry_backoff: float = 0.25,
         retryable_llm_errors: tuple[type[BaseException], ...] = (),
+        max_encoder_pool_rotations: int = 2,
+        max_llm_pool_rotations: int = 2,
     ) -> None:
         if max_llm_retries < 1:
             raise ValueError("max_llm_retries must be >= 1")
         if max_encoder_workers < 1:
             raise ValueError("max_encoder_workers must be >= 1")
+        if max_encoder_pool_rotations < 0:
+            raise ValueError("max_encoder_pool_rotations must be >= 0")
+        if max_llm_pool_rotations < 0:
+            raise ValueError("max_llm_pool_rotations must be >= 0")
         self.llm_client = llm_client
         self.vision_encoder = vision_encoder
         self.audio_encoder = audio_encoder
@@ -87,6 +93,10 @@ class MultiModalAgent:
         self.max_audio_bytes = max_audio_bytes
         self.max_llm_retries = max_llm_retries
         self.llm_retry_backoff = llm_retry_backoff
+        self.max_encoder_pool_rotations = max_encoder_pool_rotations
+        self.max_llm_pool_rotations = max_llm_pool_rotations
+        self._encoder_pool_rotations = 0
+        self._llm_pool_rotations = 0
         self.retryable_llm_errors = (
             TimeoutError,
             ConnectionError,
@@ -143,8 +153,11 @@ class MultiModalAgent:
                 future = self._encoder_pool.submit(encoder.encode, payload)
             return future.result(timeout=self.timeout_seconds)
         except concurrent.futures.TimeoutError as exc:
-            future.cancel()
-            self._replace_encoder_pool()
+            if not future.cancel() and not self._replace_encoder_pool():
+                self.logger.error(
+                    "multimodal encoder rotation cap reached",
+                    extra={"modality": modality, "bytes": len(payload)},
+                )
             self.logger.warning(
                 "multimodal encoder timed out",
                 extra={"modality": modality, "bytes": len(payload)},
@@ -167,25 +180,33 @@ class MultiModalAgent:
                 },
             )
 
-    def _replace_encoder_pool(self) -> None:
+    def _replace_encoder_pool(self) -> bool:
         """Rotate the pool after a stuck encoder exceeds the timeout."""
         with self._encoder_pool_lock:
+            if self._encoder_pool_rotations >= self.max_encoder_pool_rotations:
+                return False
             old_pool = self._encoder_pool
             self._encoder_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.max_encoder_workers,
                 thread_name_prefix="multimodal-encoder",
             )
+            self._encoder_pool_rotations += 1
         old_pool.shutdown(wait=False, cancel_futures=True)
+        return True
 
-    def _replace_llm_pool(self) -> None:
+    def _replace_llm_pool(self) -> bool:
         """Rotate the single-worker LLM pool after a stuck call times out."""
         with self._llm_pool_lock:
+            if self._llm_pool_rotations >= self.max_llm_pool_rotations:
+                return False
             old_pool = self._llm_pool
             self._llm_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="multimodal-llm",
             )
+            self._llm_pool_rotations += 1
         old_pool.shutdown(wait=False, cancel_futures=True)
+        return True
 
     def perceive(self, turn: MultiModalInput) -> dict[str, Any]:
         """Convert raw modalities into model-ready representations."""
@@ -237,8 +258,8 @@ class MultiModalAgent:
                             )
                             return getattr(response, "text", str(response))
                         except concurrent.futures.TimeoutError as exc:
-                            future.cancel()
-                            self._replace_llm_pool()
+                            if not future.cancel():
+                                self._replace_llm_pool()
                             raise TimeoutError("LLM complete timed out") from exc
                     if callable(self.llm_client):
                         with self._llm_pool_lock:
@@ -250,8 +271,8 @@ class MultiModalAgent:
                                 future.result(timeout=self.timeout_seconds)
                             )
                         except concurrent.futures.TimeoutError as exc:
-                            future.cancel()
-                            self._replace_llm_pool()
+                            if not future.cancel():
+                                self._replace_llm_pool()
                             raise TimeoutError("LLM callable timed out") from exc
                     raise TypeError("llm_client must expose complete() or be callable")
                 except self.retryable_llm_errors as exc:
