@@ -16,6 +16,7 @@ provide the surrounding context (imports, dependencies) as needed.
 """
 
 import logging
+import os
 import random
 import threading
 import time
@@ -36,6 +37,11 @@ else:
         APITimeoutError,
         RateLimitError,
     )
+_RETRIEVER_OPERATION_EXCEPTIONS = _TRANSIENT_LLM_EXCEPTIONS + (
+    RuntimeError,
+    ValueError,
+    TypeError,
+)
 
 
 # ============================================================================
@@ -46,17 +52,22 @@ else:
 # pgvector) and reference placeholder vectors. Real callers should supply an
 # embedding model output; for syntactic completeness we define stand-in
 # vectors here so the module is importable without external services.
-embedding_vector = [0.0] * 1536  # placeholder: replace with real embedding
-query_embedding = [0.0] * 1536  # placeholder: replace with real embedding
+# 1536 matches OpenAI ``text-embedding-3-small``; replace the constant
+# below with whatever your embedding model produces (768 for many MiniLM
+# variants, 3072 for ``text-embedding-3-large``, etc.).
+_PLACEHOLDER_EMBEDDING_DIM = 1536
+embedding_vector = [0.0] * _PLACEHOLDER_EMBEDDING_DIM  # placeholder: replace with real embedding
+query_embedding = [0.0] * _PLACEHOLDER_EMBEDDING_DIM  # placeholder: replace with real embedding
 
 # Guarded so import-time code does not require the Pinecone SDK,
 # credentials, or a live network. Reading the block teaches the API;
 # to run it, install ``pinecone-client`` and replace api_key.
 if False:  # pragma: no cover -- illustrative; install SDK + set api_key
+    import os
     import pinecone
     from pinecone import Pinecone, ServerlessSpec
 
-    pc = Pinecone(api_key="your-api-key")
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
 
     # Create index for 1536-dimension OpenAI embeddings
     pc.create_index(
@@ -284,7 +295,7 @@ if False:  # pragma: no cover -- illustrative; requires pgvector-enabled Postgre
 # ============================================================================
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, List, Optional
 import numpy as np
 
 
@@ -308,6 +319,17 @@ class EmbeddingModel(ABC):
         pass
 
 
+_OPENAI_EMBEDDING_DIMENSIONS = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+}
+_OPENAI_CONFIGURABLE_DIMENSION_MODELS = {
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+}
+
+
 class OpenAIEmbedding(EmbeddingModel):
     """OpenAI embedding model implementation."""
 
@@ -315,41 +337,103 @@ class OpenAIEmbedding(EmbeddingModel):
         self,
         model: str = "text-embedding-3-small",
         api_key: Optional[str] = None,
-    ):
+        timeout_seconds: float = 30.0,
+        max_retries: int = 3,
+        retry_backoff: float = 0.25,
+        embed_batch_size: int = 100,
+        max_texts_per_call: int = 10_000,
+        dimension: Optional[int] = None,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if retry_backoff < 0:
+            raise ValueError("retry_backoff must be >= 0")
+        if embed_batch_size < 1:
+            raise ValueError("embed_batch_size must be >= 1")
+        if max_texts_per_call < 1:
+            raise ValueError("max_texts_per_call must be >= 1")
+        if dimension is not None and dimension < 1:
+            raise ValueError("dimension must be >= 1")
+        model_dimension = _OPENAI_EMBEDDING_DIMENSIONS.get(model)
+        if dimension is None:
+            if model_dimension is None:
+                raise ValueError(
+                    "dimension is required for unknown embedding model"
+                )
+            dimension = model_dimension
+        elif model_dimension is not None:
+            if dimension > model_dimension:
+                raise ValueError(
+                    f"dimension must be <= {model_dimension} for {model}"
+                )
+            if (
+                dimension != model_dimension
+                and model not in _OPENAI_CONFIGURABLE_DIMENSION_MODELS
+            ):
+                raise ValueError(f"{model} does not support custom dimensions")
         from openai import OpenAI
 
-        # Explicit timeout + retries so a stalled provider doesn't hang
-        # embed_text/embed_batch indefinitely; the SDK default is no
-        # bound on the request.
         self.client = OpenAI(
             api_key=api_key,
-            timeout=30.0,
-            max_retries=3,
+            timeout=timeout_seconds,
+            max_retries=max_retries,
         )
         self.model = model
-        self._dimension = 1536 if "small" in model else 3072
+        self._dimension = dimension
+        self._request_dimension = (
+            dimension
+            if model in _OPENAI_CONFIGURABLE_DIMENSION_MODELS
+            and dimension != model_dimension
+            else None
+        )
+        self._max_retries = max_retries
+        self._retry_backoff = retry_backoff
+        self._embed_batch_size = embed_batch_size
+        self._max_texts_per_call = max_texts_per_call
 
     @property
     def dimension(self) -> int:
         return self._dimension
 
     def embed_text(self, text: str) -> List[float]:
-        response = self.client.embeddings.create(model=self.model, input=text)
+        response = self._embedding_request(text)
         return response.data[0].embedding
 
-    # Conservative per-request batch size. OpenAI accepts up to 2048
-    # inputs but also caps total tokens per batch (~300K), and very large
-    # batches inflate p99 latency. 100 keeps round-trip latency
-    # predictable and stays well inside any per-batch token budget.
-    EMBED_BATCH_SIZE = 100
+    def _embedding_request(self, payload: Any) -> Any:
+        last_error: Optional[BaseException] = None
+        attempts = max(1, self._max_retries + 1)
+        for attempt in range(attempts):
+            try:
+                kwargs = {"model": self.model, "input": payload}
+                if self._request_dimension is not None:
+                    kwargs["dimensions"] = self._request_dimension
+                return self.client.embeddings.create(
+                    **kwargs
+                )
+            except _TRANSIENT_LLM_EXCEPTIONS as exc:
+                last_error = exc
+                if attempt == attempts - 1:
+                    break
+                time.sleep(self._retry_backoff * (2**attempt))
+        raise RuntimeError("embedding request failed after retries") from last_error
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        out: List[List[float]] = []
-        for i in range(0, len(texts), self.EMBED_BATCH_SIZE):
-            chunk = texts[i : i + self.EMBED_BATCH_SIZE]
-            response = self.client.embeddings.create(
-                model=self.model, input=chunk
+        if len(texts) > self._max_texts_per_call:
+            raise ValueError(
+                f"embed_batch received {len(texts)} texts; "
+                f"max_texts_per_call is {self._max_texts_per_call}"
             )
+        out: List[List[float]] = []
+        for i in range(0, len(texts), self._embed_batch_size):
+            chunk = texts[i : i + self._embed_batch_size]
+            response = self._embedding_request(chunk)
+            if len(response.data) != len(chunk):
+                raise ValueError(
+                    f"embedding provider returned {len(response.data)} "
+                    f"embeddings for {len(chunk)} input texts"
+                )
             out.extend(item.embedding for item in response.data)
         return out
 
@@ -369,14 +453,41 @@ class SentenceTransformerEmbedding(EmbeddingModel):
         self,
         model_name: str = "BAAI/bge-large-en-v1.5",
         device: Optional[str] = None,
-    ):
+        batch_size: int = 32,
+        lazy_load: bool = False,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
         from sentence_transformers import SentenceTransformer
 
-        self.model = SentenceTransformer(model_name, device=device)
-        self._dimension = self.model.get_sentence_embedding_dimension()
+        self._model_name = model_name
+        self._device = device
+        self._SentenceTransformer = SentenceTransformer
+        self.batch_size = batch_size
+        if lazy_load:
+            # Defer the ~1.3 GiB weight load to first embed_* call so
+            # worker startup is fast and unused replicas stay slim.
+            self._model: Optional[Any] = None
+            self._dimension = 0
+        else:
+            self._model = SentenceTransformer(model_name, device=device)
+            self._dimension = self._model.get_sentence_embedding_dimension()
+
+    @property
+    def model(self) -> Any:
+        if self._model is None:
+            self._model = self._SentenceTransformer(
+                self._model_name, device=self._device
+            )
+            self._dimension = self._model.get_sentence_embedding_dimension()
+        return self._model
 
     @property
     def dimension(self) -> int:
+        if self._model is None:
+            # Force load so callers observing the dimension before the
+            # first embed call still see the model-defined value.
+            _ = self.model
         return self._dimension
 
     def embed_text(self, text: str) -> List[float]:
@@ -387,7 +498,7 @@ class SentenceTransformerEmbedding(EmbeddingModel):
         embeddings = self.model.encode(
             texts,
             normalize_embeddings=True,
-            batch_size=32,
+            batch_size=self.batch_size,
             show_progress_bar=False,
         )
         return embeddings.tolist()
@@ -397,9 +508,17 @@ class SentenceTransformerEmbedding(EmbeddingModel):
 # ============================================================================
 
 class InstructorEmbedding(EmbeddingModel):
-    """Instructor embedding with task-specific prefixes."""
+    """Instructor embedding with task-specific prefixes.
 
-    def __init__(self, model_name: str = "hkunlp/instructor-large"):
+    This is a pure-local model: the INSTRUCTOR weights are loaded into
+    process on construction and ``encode`` runs entirely on CPU/GPU
+    with no outbound network I/O. Unlike :class:`OpenAIEmbedding`, the
+    class therefore does not expose ``timeout_seconds`` /
+    ``max_retries`` / ``retry_backoff_seconds`` knobs because there is
+    no remote call path to time out or retry.
+    """
+
+    def __init__(self, model_name: str = "hkunlp/instructor-large") -> None:
         from InstructorEmbedding import INSTRUCTOR
 
         self.model = INSTRUCTOR(model_name)
@@ -510,22 +629,47 @@ class DocumentChunker(ABC):
 class FixedSizeChunker(DocumentChunker):
     """Chunk documents by fixed character count with overlap."""
 
-    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
+    def __init__(
+        self,
+        chunk_size: int = 1000,
+        chunk_overlap: int = 200,
+        max_document_chars: int = 2_000_000,
+        max_chunks: int = 10_000,
+    ) -> None:
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be >= 1")
+        if chunk_overlap < 0:
+            raise ValueError("chunk_overlap must be >= 0")
         if chunk_overlap >= chunk_size:
             raise ValueError(
                 "chunk_overlap must be strictly less than chunk_size "
                 f"(got chunk_size={chunk_size}, chunk_overlap={chunk_overlap})"
             )
+        if max_document_chars < 1:
+            raise ValueError("max_document_chars must be >= 1")
+        if max_chunks < 1:
+            raise ValueError("max_chunks must be >= 1")
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.max_document_chars = max_document_chars
+        self.max_chunks = max_chunks
 
     def chunk(self, document: Document) -> List[DocumentChunk]:
         chunks = []
         text = document.content
+        if len(text) > self.max_document_chars:
+            raise ValueError(
+                f"document has {len(text)} chars; "
+                f"max_document_chars is {self.max_document_chars}"
+            )
         start = 0
         chunk_index = 0
 
         while start < len(text):
+            if chunk_index >= self.max_chunks:
+                raise ValueError(
+                    f"document would exceed max_chunks={self.max_chunks}"
+                )
             end = start + self.chunk_size
             chunk_text = text[start:end]
 
@@ -571,10 +715,28 @@ class SentenceChunker(DocumentChunker):
         min_chunk_size: int = 500,
         max_chunk_size: int = 1500,
         sentence_overlap: int = 1,
-    ):
+        max_document_chars: int = 1_000_000,
+        max_sentences: int = 50_000,
+        max_chunks: int = 10_000,
+    ) -> None:
+        if min_chunk_size < 1:
+            raise ValueError("min_chunk_size must be >= 1")
+        if max_chunk_size < min_chunk_size:
+            raise ValueError("max_chunk_size must be >= min_chunk_size")
+        if sentence_overlap < 0:
+            raise ValueError("sentence_overlap must be >= 0")
+        if max_document_chars < 1:
+            raise ValueError("max_document_chars must be >= 1")
+        if max_sentences < 1:
+            raise ValueError("max_sentences must be >= 1")
+        if max_chunks < 1:
+            raise ValueError("max_chunks must be >= 1")
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
         self.sentence_overlap = sentence_overlap
+        self.max_document_chars = max_document_chars
+        self.max_sentences = max_sentences
+        self.max_chunks = max_chunks
         self._sentence_pattern = re.compile(
             r"(?<=[.!?])\s+(?=[A-Z])|(?<=\n)\n+"
         )
@@ -585,7 +747,17 @@ class SentenceChunker(DocumentChunker):
         return [s.strip() for s in sentences if s.strip()]
 
     def chunk(self, document: Document) -> List[DocumentChunk]:
+        if len(document.content) > self.max_document_chars:
+            raise ValueError(
+                "document content exceeds max_document_chars "
+                f"({self.max_document_chars})"
+            )
         sentences = self._split_sentences(document.content)
+        if len(sentences) > self.max_sentences:
+            raise ValueError(
+                f"document has {len(sentences)} sentences; "
+                f"limit is {self.max_sentences}"
+            )
         chunks = []
         current_chunk_sentences = []
         current_size = 0
@@ -606,6 +778,10 @@ class SentenceChunker(DocumentChunker):
                     current_chunk_sentences[0], char_position
                 )
 
+                if len(chunks) >= self.max_chunks:
+                    raise ValueError(
+                        f"chunk count exceeds max_chunks ({self.max_chunks})"
+                    )
                 chunks.append(
                     DocumentChunk(
                         content=chunk_text,
@@ -643,6 +819,10 @@ class SentenceChunker(DocumentChunker):
                 current_chunk_sentences[0], char_position
             )
 
+            if len(chunks) >= self.max_chunks:
+                raise ValueError(
+                    f"chunk count exceeds max_chunks ({self.max_chunks})"
+                )
             chunks.append(
                 DocumentChunk(
                     content=chunk_text,
@@ -671,11 +851,33 @@ class SemanticChunker(DocumentChunker):
         similarity_threshold: float = 0.75,
         min_chunk_size: int = 200,
         max_chunk_size: int = 2000,
-    ):
+        embedding_batch_size: int = 128,
+        max_sentences: int = 10_000,
+        max_document_chars: int = 2_000_000,
+        max_chunks: int = 10_000,
+    ) -> None:
+        if not 0.0 <= similarity_threshold <= 1.0:
+            raise ValueError("similarity_threshold must be between 0.0 and 1.0")
+        if min_chunk_size < 1:
+            raise ValueError("min_chunk_size must be >= 1")
+        if max_chunk_size < min_chunk_size:
+            raise ValueError("max_chunk_size must be >= min_chunk_size")
+        if embedding_batch_size < 1:
+            raise ValueError("embedding_batch_size must be >= 1")
+        if max_sentences < 1:
+            raise ValueError("max_sentences must be >= 1")
+        if max_document_chars < 1:
+            raise ValueError("max_document_chars must be >= 1")
+        if max_chunks < 1:
+            raise ValueError("max_chunks must be >= 1")
         self.embedding_model = embedding_model
         self.similarity_threshold = similarity_threshold
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
+        self.embedding_batch_size = embedding_batch_size
+        self.max_sentences = max_sentences
+        self.max_document_chars = max_document_chars
+        self.max_chunks = max_chunks
 
     def _cosine_similarity(
         self, vec1: List[float], vec2: List[float]
@@ -699,6 +901,11 @@ class SemanticChunker(DocumentChunker):
         return float(np.dot(a, b) / denom)
 
     def chunk(self, document: Document) -> List[DocumentChunk]:
+        if len(document.content) > self.max_document_chars:
+            raise ValueError(
+                f"Document has {len(document.content)} characters; "
+                f"max_document_chars is {self.max_document_chars}"
+            )
         # First, split into sentences
         sentence_pattern = re.compile(r"(?<=[.!?])\s+")
         sentences = sentence_pattern.split(document.content)
@@ -706,9 +913,18 @@ class SemanticChunker(DocumentChunker):
 
         if not sentences:
             return []
+        if len(sentences) > self.max_sentences:
+            raise ValueError(
+                f"Document has {len(sentences)} sentences; "
+                f"max_sentences is {self.max_sentences}"
+            )
 
-        # Get embeddings for all sentences
-        embeddings = self.embedding_model.embed_batch(sentences)
+        # Get embeddings in bounded batches so a long document does not
+        # exceed provider limits or force one large in-memory request.
+        embeddings: list[List[float]] = []
+        for start in range(0, len(sentences), self.embedding_batch_size):
+            batch = sentences[start : start + self.embedding_batch_size]
+            embeddings.extend(self.embedding_model.embed_batch(batch))
         if len(embeddings) != len(sentences):
             raise ValueError(
                 f"Embedding model returned {len(embeddings)} embeddings "
@@ -718,6 +934,10 @@ class SemanticChunker(DocumentChunker):
         chunks = []
         current_chunk_sentences = [sentences[0]]
         current_chunk_embedding = embeddings[0]
+        # Track how many sentences contribute to the running mean so
+        # that each addition is weighted 1/N rather than 1/2; see the
+        # else-branch below for the incremental-mean update.
+        current_chunk_count = 1
         sentence_starts = []
         search_offset = 0
         for sentence in sentences:
@@ -751,6 +971,10 @@ class SemanticChunker(DocumentChunker):
                 chunk_text = " ".join(current_chunk_sentences)
                 start_char = current_chunk_start
 
+                if len(chunks) >= self.max_chunks:
+                    raise ValueError(
+                        f"chunk count exceeds max_chunks ({self.max_chunks})"
+                    )
                 chunks.append(
                     DocumentChunk(
                         content=chunk_text,
@@ -768,23 +992,31 @@ class SemanticChunker(DocumentChunker):
 
                 current_chunk_sentences = [sentence]
                 current_chunk_embedding = sentence_embedding
+                current_chunk_count = 1
                 current_chunk_start = sentence_starts[i]
                 chunk_index += 1
             else:
                 current_chunk_sentences.append(sentence)
-                # Update chunk embedding as average
+                # Incremental mean: weight the new sentence 1/(N+1)
+                # rather than 1/2, so older sentences are not
+                # geometrically downweighted as the chunk grows.
                 current_chunk_embedding = [
-                    (a + b) / 2
+                    (a * current_chunk_count + b) / (current_chunk_count + 1)
                     for a, b in zip(
                         current_chunk_embedding, sentence_embedding
                     )
                 ]
+                current_chunk_count += 1
 
         # Save final chunk
         if current_chunk_sentences:
             chunk_text = " ".join(current_chunk_sentences)
             start_char = current_chunk_start
 
+            if len(chunks) >= self.max_chunks:
+                raise ValueError(
+                    f"chunk count exceeds max_chunks ({self.max_chunks})"
+                )
             chunks.append(
                 DocumentChunk(
                     content=chunk_text,
@@ -818,13 +1050,21 @@ class HierarchicalChunk(DocumentChunk):
 class HierarchicalChunker(DocumentChunker):
     """Create multi-level chunk hierarchy."""
 
-    def __init__(self, level_configs: List[Dict[str, int]] = None):
+    def __init__(
+        self, level_configs: Optional[List[Dict[str, int]]] = None
+    ) -> None:
         # Default: sections -> paragraphs -> sentences
-        self.level_configs = level_configs or [
+        configs = level_configs or [
             {"min_size": 2000, "max_size": 5000},  # Level 0: Sections
             {"min_size": 500, "max_size": 1500},  # Level 1: Paragraphs
             {"min_size": 100, "max_size": 400},  # Level 2: Sentences
         ]
+        if len(configs) != 3:
+            raise ValueError("level_configs must define exactly 3 levels")
+        for config in configs:
+            if config["min_size"] < 1 or config["max_size"] < config["min_size"]:
+                raise ValueError("invalid hierarchical chunk size bounds")
+        self.level_configs = configs
 
     def chunk(self, document: Document) -> List[HierarchicalChunk]:
         all_chunks = []
@@ -926,26 +1166,48 @@ class VectorRetriever(Retriever):
     """Semantic retrieval using vector similarity."""
 
     def __init__(
-        self, vector_store: "VectorStore", embedding_model: EmbeddingModel
-    ):
+        self,
+        vector_store: "VectorStore",
+        embedding_model: EmbeddingModel,
+        metrics: Optional[Any] = None,
+        max_top_k: int = 100,
+    ) -> None:
+        if max_top_k < 1:
+            raise ValueError("max_top_k must be >= 1")
         self.vector_store = vector_store
         self.embedding_model = embedding_model
+        self.metrics = metrics
+        self.max_top_k = max_top_k
 
     def retrieve(
         self,
         query: str,
         top_k: int = 5,
-        filter_metadata: Dict[str, Any] = None,
         metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalResult]:
-        query_embedding = self.embedding_model.embed_text(query)
-        effective_filter = metadata_filter or filter_metadata
+        if top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        if top_k > self.max_top_k:
+            raise ValueError(f"top_k must be <= {self.max_top_k}")
+        started = time.monotonic()
+        try:
+            query_embedding = self.embedding_model.embed_text(query)
 
-        results = self.vector_store.search(
-            query_vector=query_embedding,
-            top_k=top_k,
-            filter_metadata=effective_filter,
-        )
+            results = self.vector_store.search(
+                query_vector=query_embedding,
+                top_k=top_k,
+                metadata_filter=metadata_filter,
+            )
+        except _RETRIEVER_OPERATION_EXCEPTIONS:
+            if self.metrics and hasattr(self.metrics, "increment"):
+                self.metrics.increment("retriever.error")
+            raise
+        finally:
+            if self.metrics and hasattr(self.metrics, "record_timing"):
+                self.metrics.record_timing(
+                    "retriever.latency_ms",
+                    (time.monotonic() - started) * 1000,
+                )
 
         return [
             RetrievalResult(
@@ -976,6 +1238,8 @@ class BM25Retriever(Retriever):
     # on every add. Beyond ~100K chunks, back BM25 with Elasticsearch or
     # OpenSearch rather than hot-rebuilding in process memory.
     MAX_IN_MEMORY_DOCUMENTS = 100_000
+    MAX_TOKENS_PER_DOCUMENT = 10_000
+    MAX_QUERY_TERMS = 256
 
     def __init__(
         self,
@@ -983,24 +1247,51 @@ class BM25Retriever(Retriever):
         k1: float = 1.5,
         b: float = 0.75,
         max_documents: int = MAX_IN_MEMORY_DOCUMENTS,
-    ):
+        max_tokens_per_document: int = MAX_TOKENS_PER_DOCUMENT,
+        max_query_terms: int = MAX_QUERY_TERMS,
+    ) -> None:
+        if max_documents < 1:
+            raise ValueError("max_documents must be >= 1")
+        if max_tokens_per_document < 1:
+            raise ValueError("max_tokens_per_document must be >= 1")
+        if max_query_terms < 1:
+            raise ValueError("max_query_terms must be >= 1")
         # The default values k1=1.5 and b=0.75 were empirically derived by
         # Robertson et al. and remain effective across diverse corpora.
         self.k1 = k1
         self.b = b
         self.max_documents = max_documents
+        self.max_tokens_per_document = max_tokens_per_document
+        self.max_query_terms = max_query_terms
         if len(documents) > self.max_documents:
             raise ValueError(
                 f"BM25Retriever received {len(documents)} chunks "
                 f"(hard cap {self.max_documents}). For larger corpora, "
                 "use Elasticsearch/OpenSearch or another external keyword index."
             )
+        # Soft warning at 80% of the cap: gives operators a runway to
+        # plan the migration to an external index before the next ingest
+        # batch hits the hard cap.
+        soft_threshold = int(self.max_documents * 0.8)
+        if len(documents) >= soft_threshold:
+            logging.getLogger(__name__).warning(
+                "BM25Retriever at %d/%d documents (>=80%% of cap); "
+                "plan migration to external keyword index "
+                "(Elasticsearch/OpenSearch) before the next ingest.",
+                len(documents),
+                self.max_documents,
+            )
         self.documents = {doc.chunk_id: doc for doc in documents}
         self._build_index(documents)
 
-    def _tokenize(self, text: str) -> List[str]:
+    def _tokenize(self, text: str, max_tokens: Optional[int] = None) -> List[str]:
         """Simple tokenization."""
-        return re.findall(r"\b\w+\b", text.lower())
+        tokens: List[str] = []
+        for match in re.finditer(r"\b\w+\b", text.lower()):
+            tokens.append(match.group(0))
+            if max_tokens is not None and len(tokens) >= max_tokens:
+                break
+        return tokens
 
     def _build_index(self, documents: List[DocumentChunk]) -> None:
         """Build inverted index and document statistics."""
@@ -1010,7 +1301,14 @@ class BM25Retriever(Retriever):
         total_length = 0
 
         for doc in documents:
-            tokens = self._tokenize(doc.content)
+            tokens = self._tokenize(
+                doc.content, self.max_tokens_per_document + 1
+            )
+            if len(tokens) > self.max_tokens_per_document:
+                raise ValueError(
+                    f"BM25Retriever document {doc.chunk_id} has more than "
+                    f"{self.max_tokens_per_document} tokens; chunk it before indexing."
+                )
             self.doc_lengths[doc.chunk_id] = len(tokens)
             total_length += len(tokens)
 
@@ -1051,7 +1349,11 @@ class BM25Retriever(Retriever):
             if tf == 0:
                 continue
 
-            # IDF calculation
+            # Shifted IDF form used in Lucene / rank_bm25 (avoids negative IDF
+            # for very common terms). Classical Robertson-Sparck Jones (1976)
+            # gives the unshifted log(N/df); the shift is a practical
+            # adjustment, not BM25+ (which is a separate TF lower-bound
+            # contribution by Lv & Zhai, 2011).
             df = self.doc_freqs[term]
             idf = math.log((self.num_docs - df + 0.5) / (df + 0.5) + 1)
 
@@ -1070,7 +1372,9 @@ class BM25Retriever(Retriever):
         top_k: int = 5,
         metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalResult]:
-        query_terms = self._tokenize(query)
+        if top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        query_terms = self._tokenize(query, self.max_query_terms)
 
         # Get candidate documents (those containing at least one query term)
         candidates = set()
@@ -1117,7 +1421,11 @@ class HybridRetriever(Retriever):
         keyword_retriever: BM25Retriever,
         alpha: float = 0.5,
         fusion_method: str = "rrf",
-    ):
+    ) -> None:
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be between 0.0 and 1.0")
+        if fusion_method not in {"rrf", "linear"}:
+            raise ValueError("fusion_method must be 'rrf' or 'linear'")
         self.vector_retriever = vector_retriever
         self.keyword_retriever = keyword_retriever
         self.alpha = alpha  # Weight for vector results (1-alpha for keyword)
@@ -1262,18 +1570,37 @@ class IndexManager:
         embedding_model: EmbeddingModel,
         chunker: DocumentChunker,
         max_tracked_documents: int = 100_000,
-    ):
+        embedding_batch_size: int = 128,
+    ) -> None:
         if max_tracked_documents < 1:
             raise ValueError("max_tracked_documents must be >= 1")
+        if embedding_batch_size < 1:
+            raise ValueError("embedding_batch_size must be >= 1")
         self.vector_store = vector_store
         self.embedding_model = embedding_model
         self.chunker = chunker
         self._max_tracked_documents = max_tracked_documents
+        self._embedding_batch_size = embedding_batch_size
+        # Complete bounded manifest of documents this manager has indexed.
+        # Hashes support change detection; the ID set supports
+        # delete_missing=True without confusing an LRU cache for a full
+        # index inventory.
         self._document_hashes: OrderedDict[str, str] = OrderedDict()
+        self._indexed_document_ids: set[str] = set()
 
     def _compute_hash(self, content: str) -> str:
         """Compute content hash for change detection."""
         return hashlib.sha256(content.encode()).hexdigest()
+
+    def _ensure_document_capacity(self, document_id: str) -> None:
+        if (
+            document_id not in self._indexed_document_ids
+            and len(self._indexed_document_ids) >= self._max_tracked_documents
+        ):
+            raise RuntimeError(
+                "indexed document manifest is full; raise "
+                "max_tracked_documents or provide a persistent manifest"
+            )
 
     def _get_existing_chunk_ids(self, document_id: str) -> Set[str]:
         """Get all chunk IDs for a document."""
@@ -1285,14 +1612,15 @@ class IndexManager:
     def _remember_document_hash(
         self, document_id: str, content_hash: str
     ) -> None:
-        """Track recent document hashes without unbounded memory growth."""
+        """Track document hashes without losing the deletion manifest."""
+        self._ensure_document_capacity(document_id)
+        self._indexed_document_ids.add(document_id)
         self._document_hashes[document_id] = content_hash
         self._document_hashes.move_to_end(document_id)
-        while len(self._document_hashes) > self._max_tracked_documents:
-            self._document_hashes.popitem(last=False)
 
     def add_document(self, document: Document) -> int:
         """Add new document to the index."""
+        self._ensure_document_capacity(document.document_id)
         content_hash = self._compute_hash(document.content)
 
         # Check if document already exists
@@ -1311,19 +1639,20 @@ class IndexManager:
         if not chunks:
             return 0
 
-        # Generate embeddings
-        contents = [chunk.content for chunk in chunks]
-        embeddings = self.embedding_model.embed_batch(contents)
-        if len(embeddings) != len(chunks):
-            raise ValueError(
-                f"Embedding model returned {len(embeddings)} embeddings "
-                f"for {len(chunks)} chunks"
+        inserted = 0
+        indexed_at = datetime.now(timezone.utc).isoformat()
+        for start in range(0, len(chunks), self._embedding_batch_size):
+            batch = chunks[start : start + self._embedding_batch_size]
+            embeddings = self.embedding_model.embed_batch(
+                [chunk.content for chunk in batch]
             )
+            if len(embeddings) != len(batch):
+                raise ValueError(
+                    f"Embedding model returned {len(embeddings)} embeddings "
+                    f"for {len(batch)} chunks"
+                )
 
-        # Insert into vector store
-        vectors_to_insert = []
-        for chunk, embedding in zip(chunks, embeddings):
-            vectors_to_insert.append(
+            vectors_to_insert = [
                 {
                     "id": chunk.chunk_id,
                     "vector": embedding,
@@ -1331,16 +1660,18 @@ class IndexManager:
                     "metadata": {
                         **chunk.metadata,
                         "document_id": document.document_id,
-                        "indexed_at": datetime.now(timezone.utc).isoformat(),
+                        "indexed_at": indexed_at,
                         "content_hash": content_hash,
                     },
                 }
-            )
+                for chunk, embedding in zip(batch, embeddings)
+            ]
+            self.vector_store.upsert(vectors_to_insert)
+            inserted += len(batch)
 
-        self.vector_store.upsert(vectors_to_insert)
         self._remember_document_hash(document.document_id, content_hash)
 
-        return len(chunks)
+        return inserted
 
     def update_document(self, document: Document) -> int:
         """Update existing document in the index."""
@@ -1363,6 +1694,7 @@ class IndexManager:
             self.vector_store.delete(list(chunk_ids))
 
         self._document_hashes.pop(document_id, None)
+        self._indexed_document_ids.discard(document_id)
 
         return len(chunk_ids)
 
@@ -1391,7 +1723,7 @@ class IndexManager:
 
         # Delete documents no longer in collection
         if delete_missing:
-            indexed_doc_ids = set(self._document_hashes.keys())
+            indexed_doc_ids = set(self._indexed_document_ids)
             removed_ids = indexed_doc_ids - current_doc_ids
 
             for doc_id in removed_ids:
@@ -1410,7 +1742,7 @@ class IndexHealth:
 
     total_vectors: int
     total_documents: int
-    index_size_bytes: int
+    index_size_bytes: Optional[int]
     last_updated: datetime
     fragmentation_ratio: float
     query_latency_p50_ms: float
@@ -1422,7 +1754,7 @@ class IndexMonitor:
 
     LATENCY_WINDOW = 1000
 
-    def __init__(self, vector_store: "VectorStore"):
+    def __init__(self, vector_store: "VectorStore") -> None:
         from collections import deque
         import threading
 
@@ -1436,7 +1768,7 @@ class IndexMonitor:
         )
         self._latency_lock = threading.Lock()
 
-    def record_query_latency(self, latency_ms: float):
+    def record_query_latency(self, latency_ms: float) -> None:
         """Record a query latency measurement."""
         with self._latency_lock:
             self._query_latencies.append(latency_ms)
@@ -1468,7 +1800,7 @@ class IndexMonitor:
         return IndexHealth(
             total_vectors=stats.get("vector_count", 0),
             total_documents=stats.get("document_count", 0),
-            index_size_bytes=stats.get("size_bytes", 0),
+            index_size_bytes=stats.get("size_bytes"),
             last_updated=datetime.fromisoformat(
                 stats.get(
                     "last_updated", datetime.now(timezone.utc).isoformat()
@@ -1549,18 +1881,27 @@ class RAGPipeline:
         timeout_seconds: float = 30.0,
         max_retries: int = 3,
         retry_backoff: float = 0.25,
-        model: str = "gpt-4o",
+        model: Optional[str] = None,
         temperature: float = 0.1,
-    ):
+    ) -> None:
+        if max_context_tokens < 1:
+            raise ValueError("max_context_tokens must be >= 1")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
+        if retry_backoff < 0:
+            raise ValueError("retry_backoff must be >= 0")
+        resolved_model = model or os.getenv("RAG_MODEL", "gpt-4o")
+        if not resolved_model:
+            raise ValueError("model must be non-empty")
         self.retriever = retriever
         self.llm_client = llm_client
         self.max_context_tokens = max_context_tokens
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
-        self.model = model
+        self.model = resolved_model
         self.temperature = temperature
         self.system_prompt = system_prompt or (
             "You are a helpful assistant that answers questions based on "
@@ -1601,40 +1942,13 @@ class RAGPipeline:
 
         return truncated
 
-    def query(
+    def _generate_answer(
         self,
+        results: List[RetrievalResult],
+        context: str,
         question: str,
-        top_k: int = 5,
-        metadata_filter: Dict[str, Any] = None,
     ) -> RAGResponse:
-        """Execute RAG query."""
-        # Retrieve relevant context
-        results = self.retriever.retrieve(
-            query=question,
-            top_k=top_k,
-            metadata_filter=metadata_filter,
-        )
-
-        if not results:
-            return RAGResponse(
-                answer="I couldn't find any relevant information to answer your question.",
-                sources=[],
-                confidence=0.0,
-                metadata={"retrieval_count": 0},
-            )
-
-        # Truncate to fit context window
-        results = self._truncate_context(results)
-        if not results:
-            return RAGResponse(
-                answer="Retrieved documents exceeded the context budget.",
-                sources=[],
-                confidence=0.0,
-                metadata={"retrieval_count": 0, "context_truncated": True},
-            )
-        context = self._format_context(results)
-
-        # Construct prompt
+        """Generate an answer for already-retrieved context."""
         user_message = f"""Context information:
 {context}
 
@@ -1685,8 +1999,6 @@ Please answer the question based on the context provided. Cite specific sources 
             )
 
         answer = response.choices[0].message.content
-
-        # Calculate confidence based on retrieval scores
         avg_score = sum(r.score for r in results) / len(results)
 
         return RAGResponse(
@@ -1695,10 +2007,44 @@ Please answer the question based on the context provided. Cite specific sources 
             confidence=min(avg_score, 1.0),
             metadata={
                 "retrieval_count": len(results),
-                "model": "gpt-4o",
+                "model": self.model,
                 "tokens_used": response.usage.total_tokens,
             },
         )
+
+    def query(
+        self,
+        question: str,
+        top_k: int = 5,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> RAGResponse:
+        """Execute RAG query."""
+        # Retrieve relevant context
+        results = self.retriever.retrieve(
+            query=question,
+            top_k=top_k,
+            metadata_filter=metadata_filter,
+        )
+
+        if not results:
+            return RAGResponse(
+                answer="I couldn't find any relevant information to answer your question.",
+                sources=[],
+                confidence=0.0,
+                metadata={"retrieval_count": 0},
+            )
+
+        # Truncate to fit context window
+        results = self._truncate_context(results)
+        if not results:
+            return RAGResponse(
+                answer="Retrieved documents exceeded the context budget.",
+                sources=[],
+                confidence=0.0,
+                metadata={"retrieval_count": 0, "context_truncated": True},
+            )
+        context = self._format_context(results)
+        return self._generate_answer(results, context, question)
 
 # ============================================================================
 # Block 14 (chapter listing #14)
@@ -1713,19 +2059,27 @@ class QueryExpander:
         timeout_seconds: float = 30.0,
         max_retries: int = 3,
         retry_backoff: float = 0.25,
-    ):
+        model: str = "gpt-4o-mini",
+        max_variations: int = 5,
+    ) -> None:
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
+        if not model:
+            raise ValueError("model must be non-empty")
+        if max_variations < 1:
+            raise ValueError("max_variations must be >= 1")
         self.llm_client = llm_client
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        self.model = model
+        self.max_variations = max_variations
 
-    def _completion(self, prompt: str, temperature: float):
+    def _completion(self, prompt: str, temperature: float) -> Any:
         for attempt in range(self.max_retries):
             try:
                 return self.llm_client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temperature,
                     timeout=self.timeout_seconds,
@@ -1734,15 +2088,28 @@ class QueryExpander:
                 if attempt == self.max_retries - 1:
                     raise
                 time.sleep(self.retry_backoff * (2**attempt))
+        # Defensive: with max_retries >= 1 (enforced in __init__), the
+        # loop either returns a response or raises. This explicit return
+        # documents the intent and prevents an implicit ``None`` from
+        # silently propagating if future edits change the loop structure.
+        return None
 
     def expand(self, query: str, num_variations: int = 3) -> List[str]:
         """Generate query variations."""
-        prompt = f"""Generate {num_variations} alternative phrasings of this search query.
-Each variation should capture the same intent but use different words.
-
-Original query: {query}
-
-Return only the variations, one per line."""
+        if num_variations < 1:
+            raise ValueError("num_variations must be >= 1")
+        if num_variations > self.max_variations:
+            raise ValueError(
+                f"num_variations must be <= {self.max_variations}"
+            )
+        prompt = (
+            f"Generate {num_variations} alternative phrasings of "
+            "this search query.\n"
+            "Each variation should capture the same intent but use "
+            "different words.\n\n"
+            f"Original query: {query}\n\n"
+            "Return only the variations, one per line."
+        )
 
         response = self._completion(prompt, temperature=0.7)
 
@@ -1759,34 +2126,26 @@ Return only the variations, one per line."""
 class MultiQueryRAG(RAGPipeline):
     """RAG with query expansion for better recall."""
 
-    def __init__(self, retriever: Retriever, llm_client: LLMClient, **kwargs):
+    def __init__(
+        self, retriever: Retriever, llm_client: LLMClient, **kwargs: Any
+    ) -> None:
         super().__init__(retriever, llm_client, **kwargs)
-        self.query_expander = QueryExpander(llm_client)
+        self.query_expander = QueryExpander(
+            llm_client,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
+            retry_backoff=self.retry_backoff,
+        )
 
     def query(
         self,
         question: str,
         top_k: int = 5,
         expand_queries: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> RAGResponse:
         if not expand_queries:
             return super().query(question, top_k, **kwargs)
-
-        # Fail FAST before spending retrieval tokens. Expansion + per-variant
-        # retrieval are not free: query_expander.expand() issues an LLM call,
-        # and each variant then triggers N embedding + search calls. If the
-        # generation step is not wired up (this listing omits it), we want
-        # the caller to learn that BEFORE paying for retrieval, not after.
-        if not hasattr(self, "_generate_answer"):
-            raise NotImplementedError(
-                "MultiQueryRAG.query is a chapter sketch: the generation "
-                "step is intentionally omitted. To use this class, "
-                "subclass and override ``_generate_answer(results, question)`` "
-                "with your provider's chat-completion call. Refusing to "
-                "expand and retrieve now so we do not burn embedding "
-                "API quota on a path that has no generation wired."
-            )
 
         # Expand query
         queries = self.query_expander.expand(question)
@@ -1808,7 +2167,28 @@ class MultiQueryRAG(RAGPipeline):
         # Continue with standard RAG pipeline. ``_generate_answer`` is the
         # extension point subclasses provide; the hasattr guard above
         # ensures it exists by the time we reach this point.
+        if not all_results:
+            return RAGResponse(
+                answer="I couldn't find any relevant information to answer your question.",
+                sources=[],
+                confidence=0.0,
+                metadata={
+                    "retrieval_count": 0,
+                    "expanded_queries": len(queries),
+                },
+            )
         results = self._truncate_context(all_results[: top_k * 2])
+        if not results:
+            return RAGResponse(
+                answer="Retrieved documents exceeded the context budget.",
+                sources=[],
+                confidence=0.0,
+                metadata={
+                    "retrieval_count": len(all_results),
+                    "expanded_queries": len(queries),
+                    "context_truncated": True,
+                },
+            )
         context = self._format_context(results)
         return self._generate_answer(results, context, question)
 
@@ -1821,31 +2201,60 @@ class CrossEncoderReranker:
     """Re-rank results using cross-encoder model."""
 
     def __init__(
-        self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-12-v2"
-    ):
+        self,
+        model_name: str = "cross-encoder/ms-marco-MiniLM-L-12-v2",
+        max_candidates: int = 200,
+        batch_size: int = 32,
+        max_concurrency: int = 1,
+    ) -> None:
+        if max_candidates < 1:
+            raise ValueError("max_candidates must be >= 1")
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be >= 1")
         from sentence_transformers import CrossEncoder
 
         self.model = CrossEncoder(model_name)
+        self.max_candidates = max_candidates
+        self.batch_size = batch_size
+        # Most cross-encoder backends are not thread-safe for inference
+        # and the model itself is 100-500MB, so we serialize predict()
+        # calls by default. Operators with a thread-safe backend or
+        # dedicated GPU may raise ``max_concurrency`` to permit burst
+        # parallelism without contention.
+        self.max_concurrency = max_concurrency
+        self._predict_semaphore = threading.Semaphore(max_concurrency)
 
     def rerank(
-        self, query: str, results: List[RetrievalResult], top_k: int = None
+        self,
+        query: str,
+        results: List[RetrievalResult],
+        top_k: Optional[int] = None,
     ) -> List[RetrievalResult]:
         """Re-rank results based on query relevance."""
         if not results:
             return results
+        if top_k is not None and top_k < 1:
+            return []
 
-        # Score all query-document pairs
-        pairs = [(query, r.content) for r in results]
-        scores = self.model.predict(pairs)
+        candidates = results[: self.max_candidates]
+        scores: List[float] = []
+        for start in range(0, len(candidates), self.batch_size):
+            batch = candidates[start : start + self.batch_size]
+            pairs = [(query, r.content) for r in batch]
+            with self._predict_semaphore:
+                batch_scores = self.model.predict(pairs)
+            scores.extend(float(score) for score in batch_scores)
 
         # Create new results with updated scores
         reranked = []
-        for result, score in zip(results, scores):
+        for result, score in zip(candidates, scores):
             reranked.append(
                 RetrievalResult(
                     chunk_id=result.chunk_id,
                     content=result.content,
-                    score=float(score),
+                    score=score,
                     metadata={
                         **result.metadata,
                         "original_score": result.score,
@@ -1861,6 +2270,16 @@ class CrossEncoderReranker:
 
         return reranked
 
+    def unload(self) -> None:
+        """Release the cross-encoder model reference.
+
+        Long-lived processes can call this when reranking traffic stops
+        to free model memory (the cross-encoder weights are typically
+        100MB-500MB). After ``unload()`` the instance must not be used
+        for further ``rerank`` calls.
+        """
+        self.model = None
+
 # ============================================================================
 # Block 16 (chapter listing #16)
 # ============================================================================
@@ -1874,68 +2293,179 @@ class SelfRAGPipeline:
         llm_client: LLMClient,
         confidence_threshold: float = 0.7,
         timeout_seconds: float = 30.0,
+        request_timeout_seconds: float = 60.0,
         max_retries: int = 3,
         retry_backoff: float = 0.25,
-    ):
+        circuit_breaker_failures: int = 3,
+        circuit_open_seconds: float = 30.0,
+    ) -> None:
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        if request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be > 0")
+        if circuit_breaker_failures < 1:
+            raise ValueError("circuit_breaker_failures must be >= 1")
+        if not 0.0 <= confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be between 0.0 and 1.0")
+        if retry_backoff < 0:
+            raise ValueError("retry_backoff must be >= 0")
+        if circuit_open_seconds <= 0:
+            raise ValueError("circuit_open_seconds must be > 0")
         self.retriever = retriever
         self.llm_client = llm_client
         self.confidence_threshold = confidence_threshold
         self.timeout_seconds = timeout_seconds
+        self.request_timeout_seconds = request_timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        self.circuit_breaker_failures = circuit_breaker_failures
+        self.circuit_open_seconds = circuit_open_seconds
+        self._llm_failures = 0
+        self._llm_circuit_open_until = 0.0
 
-    def _completion(self, prompt: str, temperature: float, model: str = "gpt-4o-mini"):
+    def _completion(
+        self,
+        prompt: str,
+        temperature: float,
+        model: str = "gpt-4o-mini",
+        deadline: Optional[float] = None,
+    ) -> Any:
+        now = time.monotonic()
+        if now < self._llm_circuit_open_until:
+            raise RuntimeError("LLM circuit breaker is open")
         for attempt in range(self.max_retries):
             try:
-                return self.llm_client.chat.completions.create(
+                remaining = (
+                    self.timeout_seconds
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                if remaining <= 0:
+                    raise TimeoutError("SelfRAG request deadline exceeded")
+                response = self.llm_client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temperature,
-                    timeout=self.timeout_seconds,
+                    timeout=min(self.timeout_seconds, remaining),
                 )
+                self._llm_failures = 0
+                self._llm_circuit_open_until = 0.0
+                return response
             except _TRANSIENT_LLM_EXCEPTIONS:
+                self._llm_failures += 1
+                if self._llm_failures >= self.circuit_breaker_failures:
+                    self._llm_circuit_open_until = (
+                        time.monotonic() + self.circuit_open_seconds
+                    )
                 if attempt == self.max_retries - 1:
                     raise
                 time.sleep(self.retry_backoff * (2**attempt))
+        raise RuntimeError("completion loop exited without returning")
 
     def _generate_answer_with_retry(
-        self, results: List[RetrievalResult], question: str
+        self,
+        results: List[RetrievalResult],
+        question: str,
+        deadline: Optional[float] = None,
     ) -> RAGResponse:
         for attempt in range(self.max_retries):
             try:
-                return self._generate_answer(results, question)
+                return self._generate_answer(results, question, deadline)
             except _TRANSIENT_LLM_EXCEPTIONS:
                 if attempt == self.max_retries - 1:
                     raise
                 time.sleep(self.retry_backoff * (2**attempt))
+        raise RuntimeError(
+            "generate_answer_with_retry exhausted all attempts without returning"
+        )
 
-    def _needs_retrieval(self, question: str) -> bool:
+    def _generate_answer(
+        self,
+        results: List[RetrievalResult],
+        question: str,
+        deadline: Optional[float] = None,
+    ) -> RAGResponse:
+        """Generate an answer from retrieved context."""
+        if not results:
+            return RAGResponse(
+                answer="I couldn't find relevant context to answer the question.",
+                sources=[],
+                confidence=0.0,
+                metadata={"retrieval_used": True, "retrieval_count": 0},
+            )
+
+        context = "\n\n".join(
+            f"[Source {i}] {r.content}" for i, r in enumerate(results, 1)
+        )
+        prompt = (
+            "Answer the question using the retrieved context.\n"
+            "Cite the source numbers when they support the answer."
+            "\n\nContext:\n"
+            f"{context}\n\n"
+            f"Question: {question}"
+        )
+
+        response = self._completion(
+            prompt, temperature=0.1, model="gpt-4o", deadline=deadline
+        )
+        avg_score = sum(r.score for r in results) / len(results)
+        return RAGResponse(
+            answer=response.choices[0].message.content,
+            sources=results,
+            confidence=min(avg_score, 1.0),
+            metadata={
+                "retrieval_used": True,
+                "retrieval_count": len(results),
+                "model": "gpt-4o",
+            },
+        )
+
+    def _needs_retrieval(
+        self, question: str, deadline: Optional[float] = None
+    ) -> bool:
         """Determine if question requires retrieval."""
-        prompt = f"""Determine if answering this question requires looking up specific information 
-or if it can be answered from general knowledge.
+        import textwrap
 
-Question: {question}
+        prompt = textwrap.dedent(
+            f"""\
+            Determine if answering this question requires looking up specific
+            information or if it can be answered from general knowledge.
 
-Respond with only "RETRIEVE" or "GENERAL"."""
+            Question: {question}
 
-        response = self._completion(prompt, temperature=0)
+            Respond with only "RETRIEVE" or "GENERAL".
+            """
+        ).rstrip("\n")
+
+        response = self._completion(prompt, temperature=0, deadline=deadline)
 
         return "RETRIEVE" in response.choices[0].message.content.upper()
 
-    def _evaluate_relevance(self, question: str, context: str) -> float:
+    def _evaluate_relevance(
+        self,
+        question: str,
+        context: str,
+        deadline: Optional[float] = None,
+    ) -> float:
         """Evaluate if retrieved context is relevant."""
-        prompt = f"""Rate how relevant this context is for answering the question.
-Scale: 0.0 (completely irrelevant) to 1.0 (perfectly relevant)
+        import textwrap
 
-Question: {question}
+        prompt = textwrap.dedent(
+            f"""\
+            Rate how relevant this context is for answering the question.
+            Scale: 0.0 (completely irrelevant) to 1.0 (perfectly relevant)
 
-Context: {context}
+            Question: {question}
 
-Respond with only a number between 0.0 and 1.0."""
+            Context: {context}
 
-        response = self._completion(prompt, temperature=0)
+            Respond with only a number between 0.0 and 1.0.
+            """
+        ).rstrip("\n")
+
+        response = self._completion(prompt, temperature=0, deadline=deadline)
 
         try:
             return float(response.choices[0].message.content.strip())
@@ -1944,29 +2474,16 @@ Respond with only a number between 0.0 and 1.0."""
 
     def query(self, question: str, top_k: int = 5) -> RAGResponse:
         """Execute self-evaluated RAG query."""
-
-        # Fail FAST before spending decision/retrieval/evaluation tokens.
-        # _needs_retrieval and _evaluate_relevance each issue LLM calls;
-        # the retrieval itself triggers embedding + search. If the
-        # generation step is not wired up (this listing omits it),
-        # learn that BEFORE paying for any of the upstream work.
-        if not hasattr(self, "_generate_answer"):
-            raise NotImplementedError(
-                "SelfRAGPipeline.query is a chapter sketch: the "
-                "generation step is intentionally omitted. To use this "
-                "class, subclass and override "
-                "``_generate_answer(results, question)`` with your "
-                "provider's chat-completion call. Refusing to run the "
-                "needs-retrieval probe + retrieval + relevance probe "
-                "now so we do not burn LLM quota on a path that has "
-                "no final generation wired."
-            )
+        deadline = time.monotonic() + self.request_timeout_seconds
 
         # Check if retrieval is needed
-        if not self._needs_retrieval(question):
+        if not self._needs_retrieval(question, deadline):
             # Answer directly without retrieval
             response = self._completion(
-                question, temperature=0.1, model="gpt-4o"
+                question,
+                temperature=0.1,
+                model="gpt-4o",
+                deadline=deadline,
             )
 
             return RAGResponse(
@@ -1977,14 +2494,18 @@ Respond with only a number between 0.0 and 1.0."""
             )
 
         # Retrieve and evaluate
+        if time.monotonic() >= deadline:
+            raise TimeoutError("SelfRAG request deadline exceeded")
         results = self.retriever.retrieve(query=question, top_k=top_k)
 
         if results:
             context = "\n".join(r.content for r in results[:3])
-            relevance = self._evaluate_relevance(question, context)
+            relevance = self._evaluate_relevance(question, context, deadline)
 
             if relevance < self.confidence_threshold:
                 # Context not relevant enough, try broader retrieval
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("SelfRAG request deadline exceeded")
                 results = self.retriever.retrieve(
                     query=question, top_k=top_k * 2
                 )
@@ -1992,7 +2513,7 @@ Respond with only a number between 0.0 and 1.0."""
         # Generate answer with context using the subclass's hook.
         # The hasattr guard at function entry ensures _generate_answer
         # exists by the time we reach this point.
-        return self._generate_answer_with_retry(results, question)
+        return self._generate_answer_with_retry(results, question, deadline)
 
 
 # ============================================================================
@@ -2011,7 +2532,9 @@ Code Navigation (line numbers are approximate):
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable, TypeVar
+
+_QdrantResult = TypeVar("_QdrantResult")
 from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 import hashlib
@@ -2031,7 +2554,7 @@ class VectorStore(ABC):
         self,
         query_vector: List[float],
         top_k: int = 5,
-        filter_metadata: Dict[str, Any] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Search for similar vectors."""
         pass
@@ -2069,7 +2592,11 @@ class QdrantVectorStore(VectorStore):
         dimension: int = 1536,
         timeout: float = 10.0,
         max_retries: int = 3,
-    ):
+        retry_backoff: float = 0.1,
+        retry_jitter: float = 0.05,
+        max_batch_size: int = 512,
+        max_top_k: int = 100,
+    ) -> None:
         from qdrant_client import QdrantClient
         from qdrant_client.models import Distance, VectorParams
 
@@ -2078,7 +2605,19 @@ class QdrantVectorStore(VectorStore):
         self.dimension = dimension
         if max_retries < 1:
             raise ValueError("max_retries must be at least 1")
+        if retry_backoff < 0:
+            raise ValueError("retry_backoff must be >= 0")
+        if retry_jitter < 0:
+            raise ValueError("retry_jitter must be >= 0")
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be >= 1")
+        if max_top_k < 1:
+            raise ValueError("max_top_k must be >= 1")
         self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+        self.retry_jitter = retry_jitter
+        self.max_batch_size = max_batch_size
+        self.max_top_k = max_top_k
 
         # Create collection if it doesn't exist
         collections = self._with_retry(self.client.get_collections).collections
@@ -2091,7 +2630,12 @@ class QdrantVectorStore(VectorStore):
                 ),
             )
 
-    def _with_retry(self, operation, *args, **kwargs):
+    def _with_retry(
+        self,
+        operation: Callable[..., _QdrantResult],
+        *args: Any,
+        **kwargs: Any,
+    ) -> _QdrantResult:
         """Run a Qdrant operation with bounded transient retries."""
         last_error = None
         transient_errors = (TimeoutError, ConnectionError, OSError)
@@ -2113,41 +2657,60 @@ class QdrantVectorStore(VectorStore):
                 last_error = exc
                 if attempt == self.max_retries - 1:
                     break
-                time.sleep((0.1 * (2**attempt)) + random.uniform(0, 0.05))
+                time.sleep(
+                    (self.retry_backoff * (2**attempt))
+                    + random.uniform(0, self.retry_jitter)
+                )
+        if last_error is None:
+            # Should not happen: __init__ enforces max_retries >= 1, so the
+            # loop above ran at least one attempt and either returned or
+            # populated last_error. Raise an explicit RuntimeError so the
+            # failure mode is loud rather than masquerading as ``raise None``.
+            raise RuntimeError(
+                "retry loop exited without attempting any call"
+            )
         raise last_error
 
     def upsert(self, vectors: List[Dict[str, Any]]) -> int:
         from qdrant_client.models import PointStruct
 
-        points = [
-            PointStruct(
-                id=v["id"],
-                vector=v["vector"],
-                payload={"content": v["content"], **v.get("metadata", {})},
+        inserted = 0
+        for start in range(0, len(vectors), self.max_batch_size):
+            batch = vectors[start : start + self.max_batch_size]
+            points = [
+                PointStruct(
+                    id=v["id"],
+                    vector=v["vector"],
+                    payload={"content": v["content"], **v.get("metadata", {})},
+                )
+                for v in batch
+            ]
+            self._with_retry(
+                self.client.upsert,
+                collection_name=self.collection_name,
+                points=points,
             )
-            for v in vectors
-        ]
+            inserted += len(points)
 
-        self._with_retry(
-            self.client.upsert,
-            collection_name=self.collection_name, points=points
-        )
-
-        return len(points)
+        return inserted
 
     def search(
         self,
         query_vector: List[float],
         top_k: int = 5,
-        filter_metadata: Dict[str, Any] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
+        if top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        if top_k > self.max_top_k:
+            raise ValueError(f"top_k must be <= {self.max_top_k}")
         query_filter = None
-        if filter_metadata:
+        if metadata_filter:
             conditions = [
                 FieldCondition(key=k, match=MatchValue(value=v))
-                for k, v in filter_metadata.items()
+                for k, v in metadata_filter.items()
             ]
             query_filter = Filter(must=conditions)
 
@@ -2190,9 +2753,10 @@ class QdrantVectorStore(VectorStore):
             # Qdrant's Python client does not expose disk byte size
             # directly; the previous version mislabeled payload_schema
             # (a dict of field types) as size_bytes. Surface both
-            # fields with their real names instead.
+            # fields with their real names instead. ``size_bytes`` is
+            # ``None`` to signal "unavailable" rather than "zero".
             "payload_schema": info.payload_schema,
-            "size_bytes": 0,
+            "size_bytes": None,
             "last_updated": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -2227,7 +2791,12 @@ class QdrantVectorStore(VectorStore):
         ids: set[str] = set()
         next_offset = None
         while True:
-            limit = min(page_size, max_results - len(ids) + 1)
+            # Compute remaining capacity; add 1 so the next iteration
+            # can detect a single overflow point and raise rather than
+            # silently truncate. ``max(..., 1)`` ensures the request is
+            # always valid even when remaining is 0.
+            remaining = max_results - len(ids)
+            limit = min(page_size, max(remaining + 1, 1))
             points, next_offset = self._with_retry(
                 self.client.scroll,
                 collection_name=self.collection_name,
@@ -2250,6 +2819,17 @@ class QdrantVectorStore(VectorStore):
                     "narrow the filter or raise max_results"
                 )
         return ids
+
+    def close(self) -> None:
+        """Release the underlying Qdrant client, if it supports closing.
+
+        Older versions of ``qdrant-client`` did not expose ``close``,
+        so we guard with ``hasattr`` to stay compatible. Calling this
+        from application shutdown lets the HTTP/gRPC transport drop
+        its sockets promptly instead of waiting for GC.
+        """
+        if hasattr(self.client, "close"):
+            self.client.close()
 
 
 @dataclass
@@ -2294,12 +2874,24 @@ class KnowledgeBase:
         vector_store: VectorStore,
         embedding_model: EmbeddingModel,
         llm_client: LLMClient,
-        chunker: DocumentChunker = None,
-    ):
+        chunker: Optional[DocumentChunker] = None,
+        max_in_memory_chunks: int = MAX_IN_MEMORY_CHUNKS,
+        max_in_memory_documents: int = MAX_IN_MEMORY_DOCUMENTS,
+        ingest_batch_size: int = 64,
+    ) -> None:
+        if max_in_memory_chunks < 1:
+            raise ValueError("max_in_memory_chunks must be >= 1")
+        if max_in_memory_documents < 1:
+            raise ValueError("max_in_memory_documents must be >= 1")
+        if ingest_batch_size < 1:
+            raise ValueError("ingest_batch_size must be >= 1")
         self.vector_store = vector_store
         self.embedding_model = embedding_model
         self.llm_client = llm_client
         self.chunker = chunker or SentenceChunker()
+        self.max_in_memory_chunks = max_in_memory_chunks
+        self.max_in_memory_documents = max_in_memory_documents
+        self.ingest_batch_size = ingest_batch_size
 
         # Initialize retrievers
         self._documents: Dict[str, KnowledgeDocument] = {}
@@ -2336,38 +2928,39 @@ class KnowledgeBase:
         if not chunks:
             return 0
 
-        # Generate embeddings
-        contents = [chunk.content for chunk in chunks]
-        embeddings = self.embedding_model.embed_batch(contents)
-        if len(embeddings) != len(chunks):
-            raise ValueError(
-                f"Embedding model returned {len(embeddings)} embeddings "
-                f"for {len(chunks)} chunks"
-            )
+        # Generate embeddings and upsert in bounded batches so a large
+        # source document cannot allocate every vector at once.
+        stored_chunks = 0
+        for start in range(0, len(chunks), self.ingest_batch_size):
+            batch = chunks[start : start + self.ingest_batch_size]
+            contents = [chunk.content for chunk in batch]
+            embeddings = self.embedding_model.embed_batch(contents)
+            if len(embeddings) != len(batch):
+                raise ValueError(
+                    f"Embedding model returned {len(embeddings)} "
+                    f"embeddings for {len(batch)} chunks"
+                )
 
-        # Prepare vectors for storage
-        vectors = []
-        for chunk, embedding in zip(chunks, embeddings):
-            vectors.append(
+            vectors = [
                 {
                     "id": chunk.chunk_id,
                     "vector": embedding,
                     "content": chunk.content,
                     "metadata": chunk.metadata,
                 }
-            )
-
-        # Store in vector database
-        self.vector_store.upsert(vectors)
+                for chunk, embedding in zip(batch, embeddings)
+            ]
+            self.vector_store.upsert(vectors)
+            stored_chunks += len(batch)
 
         # Track locally. Keep all in-process indexes under one lock so a
         # reader cannot observe documents/chunks while the BM25 index still
         # represents a previous snapshot.
         with self._index_lock:
             self._documents[document.document_id] = document
-            while len(self._documents) > self.MAX_IN_MEMORY_DOCUMENTS:
+            while len(self._documents) > self.max_in_memory_documents:
                 self._documents.pop(next(iter(self._documents)))
-            available_slots = self.MAX_IN_MEMORY_CHUNKS - len(self._chunks)
+            available_slots = self.max_in_memory_chunks - len(self._chunks)
             if available_slots > 0:
                 self._chunks.extend(chunks[:available_slots])
 
@@ -2375,7 +2968,7 @@ class KnowledgeBase:
                 import warnings
                 warnings.warn(
                     f"KnowledgeBase reached its in-memory keyword cap "
-                    f"({self.MAX_IN_MEMORY_CHUNKS} chunks). Additional chunks "
+                    f"({self.max_in_memory_chunks} chunks). Additional chunks "
                     "were written to the vector store only; use an external "
                     "keyword index for full-corpus BM25 at this scale.",
                     stacklevel=2,
@@ -2387,7 +2980,7 @@ class KnowledgeBase:
                 self._rebuild_keyword_index_locked()
                 self._keyword_index_dirty = False
 
-        return len(chunks)
+        return stored_chunks
 
     def _mark_keyword_index_dirty(self) -> None:
         """Rebuild keyword indexes unless a bulk import is deferring work."""
@@ -2397,7 +2990,7 @@ class KnowledgeBase:
                 self._rebuild_keyword_index_locked()
                 self._keyword_index_dirty = False
 
-    def _rebuild_keyword_index(self):
+    def _rebuild_keyword_index(self) -> None:
         """Rebuild keyword search index after document changes."""
         with self._index_lock:
             self._rebuild_keyword_index_locked()
@@ -2466,6 +3059,8 @@ class KnowledgeBase:
         logged with stack traces via ``logger.exception`` rather than
         printed.
         """
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
         stats = {"total": len(documents), "chunks": 0, "failed": 0}
 
         with self._index_lock:
@@ -2488,6 +3083,16 @@ class KnowledgeBase:
                         logging.getLogger(__name__).exception(
                             "Failed to import document %s", doc.document_id
                         )
+                    except Exception:
+                        # Generic fallback so an unexpected exception
+                        # class on a single document does not abort the
+                        # whole bulk import. Returns a partial-failure
+                        # summary via the ``stats`` dict.
+                        stats["failed"] += 1
+                        logging.getLogger(__name__).exception(
+                            "Unexpected failure importing document %s",
+                            doc.document_id,
+                        )
         finally:
             with self._index_lock:
                 self._defer_keyword_rebuilds -= 1
@@ -2498,6 +3103,18 @@ class KnowledgeBase:
                 if should_rebuild:
                     self._rebuild_keyword_index_locked()
                     self._keyword_index_dirty = False
+
+        if stats["failed"] > 0:
+            # Structured counter event for ops dashboards. Production
+            # callers should route this through their metrics client
+            # (StatsD, OpenTelemetry, etc.); we emit a logger record with
+            # an explicit metric name and value so the event can be
+            # scraped from logs even without a metrics SDK installed.
+            logging.getLogger(__name__).warning(
+                "metric=bulk_import.failure value=%d total=%d",
+                stats["failed"],
+                stats["total"],
+            )
 
         return stats
 
@@ -2515,7 +3132,7 @@ class KnowledgeBase:
         }
 
 
-def create_knowledge_base_example():
+def create_knowledge_base_example() -> KnowledgeBase:
     """Example of setting up and using the knowledge base."""
 
     # Initialize components

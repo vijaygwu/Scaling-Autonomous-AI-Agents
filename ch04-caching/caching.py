@@ -50,6 +50,7 @@ from typing import Optional, Any
 import hashlib
 import asyncio
 import json
+import math
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -68,7 +69,7 @@ class CachedResponse:
     def is_expired(self, ttl: timedelta) -> bool:
         return datetime.now(timezone.utc) - self.created_at > ttl
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-safe dict (datetime → ISO 8601 string)."""
         return {
             "response": self.response,
@@ -79,7 +80,7 @@ class CachedResponse:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "CachedResponse":
+    def from_dict(cls, data: dict[str, Any]) -> "CachedResponse":
         """Inverse of ``to_dict``; restores datetime from ISO 8601."""
         return cls(
             response=data["response"],
@@ -103,11 +104,14 @@ class LLMResponseCache:
         self,
         backend: "CacheBackend",
         default_ttl: timedelta = timedelta(hours=24),
-    ):
+    ) -> None:
+        if default_ttl is not None and default_ttl.total_seconds() <= 0:
+            raise ValueError("default_ttl must be > 0")
         self.backend = backend
         self.default_ttl = default_ttl
         self._hits = 0
         self._misses = 0
+        self._stats_lock = threading.Lock()
 
     def _generate_key(
         self,
@@ -147,16 +151,16 @@ class LLMResponseCache:
 
         data = self.backend.get(key)
         if data is None:
-            self._misses += 1
+            self._record_miss()
             return None
 
         cached = CachedResponse.from_dict(data)
         if cached.is_expired(self.default_ttl):
             self.backend.delete(key)
-            self._misses += 1
+            self._record_miss()
             return None
 
-        self._hits += 1
+        self._record_hit()
         return cached
 
     def set(
@@ -190,8 +194,17 @@ class LLMResponseCache:
     @property
     def hit_rate(self) -> float:
         """Calculate cache hit rate."""
-        total = self._hits + self._misses
-        return self._hits / total if total > 0 else 0.0
+        with self._stats_lock:
+            total = self._hits + self._misses
+            return self._hits / total if total > 0 else 0.0
+
+    def _record_hit(self) -> None:
+        with self._stats_lock:
+            self._hits += 1
+
+    def _record_miss(self) -> None:
+        with self._stats_lock:
+            self._misses += 1
 
 # ============================================================================
 # Block 4 (chapter listing #4)
@@ -215,7 +228,7 @@ class EmbeddingCache:
         backend: "CacheBackend",
         model_version: str,
         default_ttl: timedelta = timedelta(days=30),
-    ):
+    ) -> None:
         self.backend = backend
         self.model_version = model_version
         self.default_ttl = default_ttl
@@ -348,17 +361,17 @@ class ToolResultCache:
 
     def __init__(
         self, backend: "CacheBackend", policies: Dict[str, CachePolicy]
-    ):
+    ) -> None:
         self.backend = backend
         self.policies = policies
 
-    def _generate_key(self, tool_name: str, arguments: dict) -> str:
+    def _generate_key(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Generate cache key from tool name and arguments."""
         args_canonical = json.dumps(arguments, sort_keys=True)
         args_hash = hashlib.sha256(args_canonical.encode()).hexdigest()[:16]
         return f"tool:{tool_name}:{args_hash}"
 
-    def get(self, tool_name: str, arguments: dict) -> Optional[Any]:
+    def get(self, tool_name: str, arguments: dict[str, Any]) -> Optional[Any]:
         """Retrieve cached tool result if available."""
         policy = self.policies.get(tool_name, CachePolicy.NO_CACHE)
 
@@ -368,7 +381,9 @@ class ToolResultCache:
         key = self._generate_key(tool_name, arguments)
         return self.backend.get(key)
 
-    def set(self, tool_name: str, arguments: dict, result: Any) -> None:
+    def set(
+        self, tool_name: str, arguments: dict[str, Any], result: Any
+    ) -> None:
         """Store tool result with appropriate TTL based on policy."""
         policy = self.policies.get(tool_name, CachePolicy.NO_CACHE)
 
@@ -416,7 +431,7 @@ class CacheKeyGenerator:
     parameters, and non-serializable objects.
     """
 
-    def __init__(self, namespace: str = ""):
+    def __init__(self, namespace: str = "") -> None:
         """
         Initialize with optional namespace prefix.
 
@@ -425,7 +440,9 @@ class CacheKeyGenerator:
         """
         self.namespace = namespace
 
-    def generate(self, *args, include_none: bool = False, **kwargs) -> str:
+    def generate(
+        self, *args: Any, include_none: bool = False, **kwargs: Any
+    ) -> str:
         """
         Generate a cache key from arbitrary arguments.
 
@@ -488,7 +505,11 @@ class CacheKeyGenerator:
             }
 
         if isinstance(value, (set, frozenset)):
-            return sorted(self._normalize(item) for item in value)
+            normalized_items = [self._normalize(item) for item in value]
+            return sorted(
+                normalized_items,
+                key=lambda item: json.dumps(item, sort_keys=True, default=str),
+            )
 
         if isinstance(value, datetime):
             return value.isoformat()
@@ -521,7 +542,7 @@ class LLMKeyGenerator(CacheKeyGenerator):
     model, temperature, system prompt, and user prompt.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(namespace="llm")
 
     def for_completion(
@@ -591,7 +612,7 @@ class SemanticKeyGenerator(CacheKeyGenerator):
         embedding_model: "EmbeddingModel",
         similarity_threshold: float = 0.95,
         bucket_size: int = 1000,
-    ):
+    ) -> None:
         super().__init__(namespace="semantic")
         self.embedding_model = embedding_model
         self.similarity_threshold = similarity_threshold
@@ -673,7 +694,7 @@ class AdaptiveTTLManager:
         max_ttl: timedelta = timedelta(hours=24),
         base_ttl: timedelta = timedelta(minutes=15),
         max_tracked_keys: int = 10_000,
-    ):
+    ) -> None:
         self.min_ttl = min_ttl
         self.max_ttl = max_ttl
         self.base_ttl = base_ttl
@@ -767,7 +788,17 @@ class TTLPolicy:
     Declarative TTL policies for different content types.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        max_policies: int = 1_000,
+        default_ttl: timedelta = timedelta(hours=1),
+    ) -> None:
+        if max_policies < 1:
+            raise ValueError("max_policies must be >= 1")
+        if default_ttl.total_seconds() <= 0:
+            raise ValueError("default_ttl must be > 0")
+        self._max_policies = max_policies
+        self.default_ttl = default_ttl
         self._policies: Dict[str, Callable[[dict], timedelta]] = {}
 
     def register(
@@ -778,6 +809,11 @@ class TTLPolicy:
 
         ttl_func receives the cached data and returns appropriate TTL.
         """
+        if (
+            pattern not in self._policies
+            and len(self._policies) >= self._max_policies
+        ):
+            raise ValueError("TTL policy registry is full")
         self._policies[pattern] = ttl_func
 
     def get_ttl(self, key: str, data: dict) -> timedelta:
@@ -786,28 +822,41 @@ class TTLPolicy:
             if key.startswith(pattern):
                 return ttl_func(data)
 
-        return timedelta(hours=1)  # Default TTL
+        return self.default_ttl
 
 
-ttl_policy = TTLPolicy()
+def build_default_ttl_policy(
+    embedding_ttl: timedelta = timedelta(days=30),
+    deterministic_llm_ttl: timedelta = timedelta(hours=24),
+    tool_ttl: timedelta = timedelta(minutes=10),
+    default_ttl: timedelta = timedelta(hours=1),
+    max_policies: int = 1_000,
+) -> TTLPolicy:
+    """Build the chapter's default TTL policy with configurable durations."""
+    for name, ttl in {
+        "embedding_ttl": embedding_ttl,
+        "deterministic_llm_ttl": deterministic_llm_ttl,
+        "tool_ttl": tool_ttl,
+        "default_ttl": default_ttl,
+    }.items():
+        if ttl.total_seconds() <= 0:
+            raise ValueError(f"{name} must be > 0")
 
-# Embeddings: long TTL, but include model version check
-ttl_policy.register("emb:", lambda data: timedelta(days=30))
+    policy = TTLPolicy(max_policies=max_policies, default_ttl=default_ttl)
+    policy.register("emb:", lambda data: embedding_ttl)
+    policy.register(
+        "llm:",
+        lambda data: (
+            deterministic_llm_ttl
+            if data.get("temperature", 0) == 0
+            else timedelta(seconds=0)
+        ),
+    )
+    policy.register("tool:", lambda data: tool_ttl)
+    return policy
 
-# LLM responses: TTL based on temperature
-ttl_policy.register(
-    "llm:",
-    lambda data: (
-        timedelta(hours=24)
-        if data.get("temperature", 0) == 0
-        else timedelta(seconds=0)
-    ),
-)
 
-# Tool results: TTL based on tool type (would look up policy)
-ttl_policy.register(
-    "tool:", lambda data: timedelta(minutes=10)
-)  # Default for tools
+ttl_policy = build_default_ttl_policy()
 
 # ============================================================================
 # Block 9 (chapter listing #9)
@@ -815,8 +864,11 @@ ttl_policy.register(
 
 from typing import Set, List, Callable
 from abc import ABC, abstractmethod
+import logging
 import threading
 import weakref
+
+_invalidation_logger = logging.getLogger(__name__)
 
 
 class InvalidationStrategy(ABC):
@@ -840,16 +892,27 @@ class TTLInvalidation(InvalidationStrategy):
 class VersionInvalidation(InvalidationStrategy):
     """Version-based invalidation."""
 
-    def __init__(self):
-        self._versions: Dict[str, int] = {}
+    def __init__(self, max_namespaces: int = 10_000) -> None:
+        if max_namespaces < 1:
+            raise ValueError("max_namespaces must be >= 1")
+        from collections import OrderedDict
+
+        self._versions: "OrderedDict[str, int]" = OrderedDict()
+        self._max_namespaces = max_namespaces
 
     def set_version(self, namespace: str, version: int) -> None:
         """Set current version for a namespace."""
         self._versions[namespace] = version
+        self._versions.move_to_end(namespace)
+        while len(self._versions) > self._max_namespaces:
+            self._versions.popitem(last=False)
 
     def get_version(self, namespace: str) -> int:
         """Get current version for a namespace."""
-        return self._versions.get(namespace, 0)
+        version = self._versions.get(namespace, 0)
+        if namespace in self._versions:
+            self._versions.move_to_end(namespace)
+        return version
 
     def should_invalidate(self, key: str, data: Any, metadata: dict) -> bool:
         namespace = key.split(":")[0] if ":" in key else "default"
@@ -871,11 +934,30 @@ class DependencyTracker:
     memory in long-lived deployments.
     """
 
-    def __init__(self, max_keys: int = 100_000):
+    def __init__(
+        self,
+        max_keys: int = 100_000,
+        max_edges: int = 1_000_000,
+        max_dependencies_per_key: int = 1_000,
+    ) -> None:
+        from collections import OrderedDict
+
+        if max_keys < 1:
+            raise ValueError("max_keys must be >= 1")
+        if max_edges < 1:
+            raise ValueError("max_edges must be >= 1")
+        if max_dependencies_per_key < 1:
+            raise ValueError("max_dependencies_per_key must be >= 1")
         self._dependencies: Dict[str, Set[str]] = defaultdict(set)
         self._dependents: Dict[str, Set[str]] = defaultdict(set)
-        self._key_order: deque[str] = deque()
+        # OrderedDict gives O(1) insertion-order removal, which matters
+        # when remove_key is called per-eviction in high-churn caches;
+        # the previous deque-backed implementation was O(n) per removal.
+        self._key_order: "OrderedDict[str, None]" = OrderedDict()
         self._max_keys = max_keys
+        self._max_edges = max_edges
+        self._max_dependencies_per_key = max_dependencies_per_key
+        self._edge_count = 0
         self._lock = threading.RLock()
 
     def add_dependency(self, key: str, depends_on: str) -> None:
@@ -891,17 +973,32 @@ class DependencyTracker:
                 and depends_on not in self._dependents
             )
             if is_new_key:
-                self._key_order.append(key)
+                self._key_order[key] = None
             if is_new_dep:
-                self._key_order.append(depends_on)
-            self._dependencies[key].add(depends_on)
-            self._dependents[depends_on].add(key)
+                self._key_order[depends_on] = None
+            if depends_on not in self._dependencies[key]:
+                if self._edge_count >= self._max_edges:
+                    raise ValueError("dependency edge limit reached")
+                if (
+                    len(self._dependencies[key])
+                    >= self._max_dependencies_per_key
+                ):
+                    raise ValueError("too many dependencies for key")
+                if (
+                    len(self._dependents[depends_on])
+                    >= self._max_dependencies_per_key
+                ):
+                    raise ValueError("too many dependents for key")
+                self._dependencies[key].add(depends_on)
+                self._dependents[depends_on].add(key)
+                self._edge_count += 1
             self._enforce_size_limit()
 
     def _enforce_size_limit(self) -> None:
         """Evict oldest graph nodes when the tracker exceeds its cap."""
         while len(self._key_order) > self._max_keys:
-            self.remove_key(self._key_order.popleft())
+            oldest_key, _ = self._key_order.popitem(last=False)
+            self.remove_key(oldest_key)
 
     def get_cascade(self, key: str) -> Set[str]:
         """
@@ -926,6 +1023,13 @@ class DependencyTracker:
     def remove_key(self, key: str) -> None:
         """Remove a key and its dependency relationships."""
         with self._lock:
+            removed_edges = {
+                (key, dep) for dep in self._dependencies.get(key, set())
+            }
+            removed_edges.update(
+                (dependent, key)
+                for dependent in self._dependents.get(key, set())
+            )
             # Remove from dependents of its dependencies
             for dep in self._dependencies.get(key, set()):
                 self._dependents[dep].discard(key)
@@ -937,11 +1041,10 @@ class DependencyTracker:
             # Remove the key itself
             self._dependencies.pop(key, None)
             self._dependents.pop(key, None)
-            self._key_order = deque(
-                existing_key
-                for existing_key in self._key_order
-                if existing_key != key
-            )
+            # O(1) removal from the ordering structure, vs. the
+            # previous O(n) deque rebuild.
+            self._key_order.pop(key, None)
+            self._edge_count = max(0, self._edge_count - len(removed_edges))
 
 
 class CacheInvalidator:
@@ -955,7 +1058,7 @@ class CacheInvalidator:
         strategies: List[InvalidationStrategy],
         dependency_tracker: Optional[DependencyTracker] = None,
         max_listeners: int = 1000,
-    ):
+    ) -> None:
         self.backend = backend
         self.strategies = strategies
         self.dependency_tracker = dependency_tracker or DependencyTracker()
@@ -1012,8 +1115,7 @@ class CacheInvalidator:
                         # Don't let one bad listener break invalidation
                         # for the rest, but surface the failure rather
                         # than silently swallowing it.
-                        _log = __import__("logging").getLogger(__name__)
-                        _log.warning(
+                        _invalidation_logger.warning(
                             "Cache invalidator listener %r failed for key %r: %s",
                             getattr(listener, "__qualname__", listener), k, exc,
                         )
@@ -1041,14 +1143,39 @@ from abc import ABC, abstractmethod
 from typing import Optional, Any, Dict, List, Union, Callable
 from datetime import timedelta
 import logging
-import redis
-from redis.cluster import RedisCluster
+try:
+    import redis
+    from redis.cluster import RedisCluster
+except ImportError:
+    redis = None  # type: ignore[assignment]
+    RedisCluster = None  # type: ignore[assignment]
 import json
 import threading
 import time
 from functools import lru_cache
 
 _redis_logger = logging.getLogger("agent.cache.redis")
+_CACHE_BACKEND_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    AttributeError,
+    TypeError,
+    ValueError,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+_CACHE_CLOSE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    AttributeError,
+    TypeError,
+    RuntimeError,
+    OSError,
+)
+if redis is not None:
+    _CACHE_BACKEND_EXCEPTIONS += (redis.RedisError,)
+    _CACHE_CLOSE_EXCEPTIONS += (redis.RedisError,)
+
+
+class CacheBackendError(RuntimeError):
+    """Raised when the cache backend is unavailable outside fail-open mode."""
 
 
 class CacheBackend(ABC):
@@ -1094,6 +1221,15 @@ class CacheBackend(ABC):
         """Get metadata for a cached item."""
         return None
 
+    @abstractmethod
+    def remaining_ttl(self, key: str) -> Optional[timedelta]:
+        """
+        Return the remaining TTL for a key.
+
+        ``None`` means the key exists without an expiry or does not exist.
+        """
+        pass
+
 
 class InMemoryBackend(CacheBackend):
     """
@@ -1103,14 +1239,14 @@ class InMemoryBackend(CacheBackend):
     Not suitable for production multi-instance deployments.
     """
 
-    def __init__(self, max_size: int = 10000):
+    def __init__(self, max_size: int = 10000) -> None:
         # OrderedDict gives us O(1) LRU: ``move_to_end`` on access,
         # ``popitem(last=False)`` to evict the least recently used entry.
         from collections import OrderedDict
 
         if max_size < 1:
             raise ValueError("max_size must be at least 1")
-        self._cache: "OrderedDict[str, tuple[Any, float]]" = OrderedDict()
+        self._cache: "OrderedDict[str, tuple[Any, Optional[float]]]" = OrderedDict()
         self._max_size = max_size
         self._lock = threading.RLock()
 
@@ -1137,7 +1273,12 @@ class InMemoryBackend(CacheBackend):
             if len(self._cache) >= self._max_size and key not in self._cache:
                 self._cache.popitem(last=False)
 
-            expires_at = time.time() + ttl.total_seconds() if ttl else None
+            expires_at = None
+            if ttl is not None:
+                ttl_total_seconds = ttl.total_seconds()
+                if ttl_total_seconds <= 0:
+                    return False
+                expires_at = time.time() + ttl_total_seconds
             self._cache[key] = (value, expires_at)
             # Touch on insert so an update keeps the entry "hot".
             self._cache.move_to_end(key)
@@ -1152,6 +1293,19 @@ class InMemoryBackend(CacheBackend):
 
     def exists(self, key: str) -> bool:
         return self.get(key) is not None
+
+    def remaining_ttl(self, key: str) -> Optional[timedelta]:
+        with self._lock:
+            if key not in self._cache:
+                return None
+            _, expires_at = self._cache[key]
+            if expires_at is None:
+                return None
+            remaining = expires_at - time.time()
+            if remaining <= 0:
+                del self._cache[key]
+                return timedelta(seconds=0)
+            return timedelta(seconds=remaining)
 
     def delete_pattern(self, pattern: str) -> int:
         """Simple glob-style pattern matching."""
@@ -1185,30 +1339,77 @@ class RedisBackend(CacheBackend):
         metrics: Optional[Any] = None,
         max_retries: int = 3,
         retry_backoff: float = 0.05,
-    ):
+        socket_timeout: float = 1.0,
+        socket_connect_timeout: float = 1.0,
+        health_check_interval: int = 30,
+        max_connections: int = 50,
+        blocking_pool_timeout: float = 0.25,
+        max_batch_keys: int = 500,
+        max_bulk_keys: int = 10_000,
+        fail_open: bool = False,
+    ) -> None:
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
+        if retry_backoff < 0:
+            raise ValueError("retry_backoff must be >= 0")
+        if socket_timeout <= 0:
+            raise ValueError("socket_timeout must be > 0")
+        if socket_connect_timeout <= 0:
+            raise ValueError("socket_connect_timeout must be > 0")
+        if health_check_interval < 1:
+            raise ValueError("health_check_interval must be >= 1")
+        if max_connections < 1:
+            raise ValueError("max_connections must be >= 1")
+        if blocking_pool_timeout <= 0:
+            raise ValueError("blocking_pool_timeout must be > 0")
+        if max_batch_keys < 1:
+            raise ValueError("max_batch_keys must be >= 1")
+        if max_bulk_keys < max_batch_keys:
+            raise ValueError("max_bulk_keys must be >= max_batch_keys")
+        if redis is None:
+            raise ImportError("redis is required for RedisBackend")
+        if cluster_mode and RedisCluster is None:
+            raise ImportError(
+                "redis.cluster.RedisCluster is required for cluster mode"
+            )
         self.key_prefix = key_prefix
         self._max_retries = max_retries
         self._retry_backoff = retry_backoff
+        self._max_batch_keys = max_batch_keys
+        self._max_bulk_keys = max_bulk_keys
         # Optional metrics sink with an ``increment(name, tags=...)``
         # method (statsd / OpenTelemetry / Datadog all expose this
         # shape). If supplied, Redis-error paths bump a counter so
         # ops dashboards can alert on degraded cache. Without it, the
         # logger.warning calls below carry the signal alone.
         self._metrics = metrics
+        self._fail_open = fail_open
+        # One-shot WARNING for the metrics sink so a broken collector
+        # raises a single alertable log; subsequent failures stay at
+        # DEBUG to avoid flooding logs while the sink is wedged.
+        self._metric_sink_warned: bool = False
 
         # Production timeouts: a flaky Redis would otherwise block every
         # cache lookup behind the default (unbounded) socket timeout.
         # health_check_interval pings every 30s to evict dead connections
         # from the pool before they're handed to callers.
+        #
+        # The default ``socket_timeout=1`` is deliberately fail-fast on the hot
+        # path: for a cache, a slow read is almost always strictly worse
+        # than a miss (the miss path has its own LLM SLO). If your
+        # Redis ops show GC pauses or replication-lag stalls above one
+        # second, raise this to 2--3 s and let ``_redis_call``'s
+        # retry/backoff absorb the variance. The metrics sink wired
+        # below surfaces the trade-off: rising ``cache.redis.error`` is
+        # the paging signal that the timeout is set too tight.
         _common_kw = dict(
             password=password,
             decode_responses=False,
-            socket_timeout=1,
-            socket_connect_timeout=1,
+            socket_timeout=socket_timeout,
+            socket_connect_timeout=socket_connect_timeout,
             retry_on_timeout=True,
-            health_check_interval=30,
+            health_check_interval=health_check_interval,
+            max_connections=max_connections,
         )
         if cluster_mode:
             if cluster_nodes:
@@ -1223,11 +1424,21 @@ class RedisBackend(CacheBackend):
                     **_common_kw,
                 )
         else:
-            self._client = redis.Redis(
+            pool = redis.BlockingConnectionPool(
                 host=host,
                 port=port,
                 db=db,
-                **_common_kw,
+                password=password,
+                decode_responses=False,
+                socket_timeout=socket_timeout,
+                socket_connect_timeout=socket_connect_timeout,
+                retry_on_timeout=True,
+                health_check_interval=health_check_interval,
+                max_connections=max_connections,
+                timeout=blocking_pool_timeout,
+            )
+            self._client = redis.Redis(
+                connection_pool=pool,
             )
 
     def _prefixed_key(self, key: str) -> str:
@@ -1253,14 +1464,16 @@ class RedisBackend(CacheBackend):
                     break
                 time.sleep(self._retry_backoff * (2**attempt))
         self._bump_error_metric(op)
-        raise RuntimeError(f"Redis {op} failed after retries") from last_error
+        raise CacheBackendError(f"Redis {op} failed after retries") from last_error
 
     def get(self, key: str) -> Optional[Any]:
         prefixed = self._prefixed_key(key)
         try:
             data = self._redis_call("get", self._client.get, prefixed)
-        except RuntimeError as exc:
+        except CacheBackendError as exc:
             _redis_logger.warning("Redis GET failed for %s: %s", key, exc)
+            if not self._fail_open:
+                raise
             return None
         if data is None:
             return None
@@ -1273,7 +1486,7 @@ class RedisBackend(CacheBackend):
             self._bump_error_metric("deserialize")
             try:
                 self._redis_call("delete_corrupt", self._client.delete, prefixed)
-            except RuntimeError as delete_exc:
+            except CacheBackendError as delete_exc:
                 _redis_logger.warning(
                     "Redis DELETE failed for corrupt %s: %s", key, delete_exc
                 )
@@ -1284,7 +1497,12 @@ class RedisBackend(CacheBackend):
     ) -> bool:
         serialized = self._serialize(value)
         prefixed = self._prefixed_key(key)
-        ttl_seconds = int(ttl.total_seconds()) if ttl else None
+        ttl_seconds = None
+        if ttl is not None:
+            ttl_total_seconds = ttl.total_seconds()
+            if ttl_total_seconds <= 0:
+                return False
+            ttl_seconds = max(1, math.ceil(ttl_total_seconds))
 
         try:
             if ttl_seconds:
@@ -1294,8 +1512,10 @@ class RedisBackend(CacheBackend):
                     )
                 )
             return bool(self._redis_call("set", self._client.set, prefixed, serialized))
-        except RuntimeError as exc:
+        except CacheBackendError as exc:
             _redis_logger.warning("Redis SET failed for %s: %s", key, exc)
+            if not self._fail_open:
+                raise
             return False
 
     def delete(self, key: str) -> bool:
@@ -1303,8 +1523,10 @@ class RedisBackend(CacheBackend):
             return bool(
                 self._redis_call("delete", self._client.delete, self._prefixed_key(key))
             )
-        except RuntimeError as exc:
+        except CacheBackendError as exc:
             _redis_logger.warning("Redis DELETE failed for %s: %s", key, exc)
+            if not self._fail_open:
+                raise
             return False
 
     def exists(self, key: str) -> bool:
@@ -1312,9 +1534,29 @@ class RedisBackend(CacheBackend):
             return bool(
                 self._redis_call("exists", self._client.exists, self._prefixed_key(key))
             )
-        except RuntimeError as exc:
+        except CacheBackendError as exc:
             _redis_logger.warning("Redis EXISTS failed for %s: %s", key, exc)
+            if not self._fail_open:
+                raise
             return False
+
+    def remaining_ttl(self, key: str) -> Optional[timedelta]:
+        try:
+            ttl_seconds = self._redis_call(
+                "ttl", self._client.ttl, self._prefixed_key(key)
+            )
+        except CacheBackendError as exc:
+            _redis_logger.warning("Redis TTL failed for %s: %s", key, exc)
+            if not self._fail_open:
+                raise
+            return None
+        if ttl_seconds == -2:
+            return timedelta(seconds=0)
+        if ttl_seconds == -1:
+            return None
+        if ttl_seconds <= 0:
+            return timedelta(seconds=0)
+        return timedelta(seconds=ttl_seconds)
 
     def _bump_error_metric(self, op: str) -> None:
         """Increment an error counter on the optional metrics sink.
@@ -1322,50 +1564,81 @@ class RedisBackend(CacheBackend):
         Distinguishing 'cache miss' from 'cache backend broken' matters
         for SLO reasoning: a sudden swing in the error rate is a paging
         signal, while a miss-rate swing is a load-pattern signal.
-        Both currently look the same to callers (get returns None).
+        The default raises ``CacheBackendError``; callers must opt in to
+        fail-open behavior if a backend outage should become a miss.
         """
         if self._metrics is None:
             return
         try:
             self._metrics.increment("cache.redis.error", tags={"op": op})
-        except (AttributeError, TypeError, RuntimeError) as exc:
-            # Metrics sink must not itself fail the cache path.
-            _redis_logger.debug("cache metrics sink failed: %s", exc)
+        except (
+            AttributeError,
+            TypeError,
+            RuntimeError,
+            OSError,
+            ConnectionError,
+        ) as exc:
+            # Metrics sink must not itself fail the cache path; emit a
+            # single WARNING on first failure so a wedged collector is
+            # visible in dashboards, then fall back to DEBUG noise.
+            if not self._metric_sink_warned:
+                self._metric_sink_warned = True
+                _redis_logger.warning(
+                    "cache metrics sink failed: %s", exc
+                )
+            else:
+                _redis_logger.debug("cache metrics sink failed: %s", exc)
 
     def get_many(self, keys: List[str]) -> Dict[str, Any]:
         if not keys:
             return {}
-
-        prefixed_keys = [self._prefixed_key(k) for k in keys]
-        try:
-            values = self._redis_call("get_many", self._client.mget, prefixed_keys)
-        except RuntimeError as exc:
-            # Distinguish backend failure from cache miss; logging +
-            # error-metric bump preserves SLO-relevant signal that a
-            # silent empty-dict return would lose.
-            _redis_logger.warning("Redis MGET failed: %s", exc)
-            return {}
+        if len(keys) > self._max_bulk_keys:
+            raise ValueError(
+                f"get_many accepts at most {self._max_bulk_keys} keys"
+            )
 
         result = {}
-        for key, prefixed_key, value in zip(keys, prefixed_keys, values):
-            if value is not None:
-                try:
-                    result[key] = self._deserialize(value)
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                    _redis_logger.warning(
-                        "Redis cached value for %s is corrupt: %s", key, exc
-                    )
-                    self._bump_error_metric("get_many_deserialize")
+        for start in range(0, len(keys), self._max_batch_keys):
+            batch_keys = keys[start : start + self._max_batch_keys]
+            prefixed_keys = [self._prefixed_key(k) for k in batch_keys]
+            try:
+                values = self._redis_call(
+                    "get_many", self._client.mget, prefixed_keys
+                )
+            except CacheBackendError as exc:
+                # Distinguish backend failure from cache miss; logging +
+                # error-metric bump preserves SLO-relevant signal that a
+                # silent empty-dict return would lose.
+                _redis_logger.warning("Redis MGET failed: %s", exc)
+                if not self._fail_open:
+                    raise
+                continue
+
+            for key, prefixed_key, value in zip(
+                batch_keys, prefixed_keys, values
+            ):
+                if value is not None:
                     try:
-                        self._redis_call(
-                            "delete_corrupt", self._client.delete, prefixed_key
-                        )
-                    except RuntimeError as delete_exc:
-                        _redis_logger.debug(
-                            "failed deleting corrupt cache key %s: %s",
+                        result[key] = self._deserialize(value)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        _redis_logger.warning(
+                            "Redis cached value for %s is corrupt: %s",
                             key,
-                            delete_exc,
+                            exc,
                         )
+                        self._bump_error_metric("get_many_deserialize")
+                        try:
+                            self._redis_call(
+                                "delete_corrupt",
+                                self._client.delete,
+                                prefixed_key,
+                            )
+                        except CacheBackendError as delete_exc:
+                            _redis_logger.debug(
+                                "failed deleting corrupt cache key %s: %s",
+                                key,
+                                delete_exc,
+                            )
 
         return result
 
@@ -1374,28 +1647,45 @@ class RedisBackend(CacheBackend):
     ) -> bool:
         if not items:
             return True
+        if len(items) > self._max_bulk_keys:
+            raise ValueError(
+                f"set_many accepts at most {self._max_bulk_keys} items"
+            )
 
-        ttl_seconds = int(ttl.total_seconds()) if ttl else None
-        def execute_pipeline() -> list[Any]:
-            pipe = self._client.pipeline()
+        ttl_seconds = None
+        if ttl is not None:
+            ttl_total_seconds = ttl.total_seconds()
+            if ttl_total_seconds <= 0:
+                return False
+            ttl_seconds = max(1, math.ceil(ttl_total_seconds))
+        ok = True
+        entries = list(items.items())
+        for start in range(0, len(entries), self._max_batch_keys):
+            batch = entries[start : start + self._max_batch_keys]
 
-            for key, value in items.items():
-                prefixed = self._prefixed_key(key)
-                serialized = self._serialize(value)
+            def execute_pipeline(batch: list[tuple[str, Any]] = batch) -> list[Any]:
+                pipe = self._client.pipeline()
 
-                if ttl_seconds:
-                    pipe.setex(prefixed, ttl_seconds, serialized)
-                else:
-                    pipe.set(prefixed, serialized)
+                for key, value in batch:
+                    prefixed = self._prefixed_key(key)
+                    serialized = self._serialize(value)
 
-            return pipe.execute()
+                    if ttl_seconds:
+                        pipe.setex(prefixed, ttl_seconds, serialized)
+                    else:
+                        pipe.set(prefixed, serialized)
 
-        try:
-            results = self._redis_call("set_many", execute_pipeline)
-            return all(results)
-        except RuntimeError as exc:
-            _redis_logger.warning("Redis pipeline SET failed: %s", exc)
-            return False
+                return pipe.execute()
+
+            try:
+                results = self._redis_call("set_many", execute_pipeline)
+                ok = ok and all(results)
+            except CacheBackendError as exc:
+                _redis_logger.warning("Redis pipeline SET failed: %s", exc)
+                if not self._fail_open:
+                    raise
+                ok = False
+        return ok
 
     # Cap DEL batches so a single SCAN cursor that returns thousands
     # of matches cannot block Redis with one huge DEL command.
@@ -1435,10 +1725,26 @@ class RedisBackend(CacheBackend):
                         )
                 if cursor == 0:
                     break
-        except RuntimeError as exc:
+        except CacheBackendError as exc:
             _redis_logger.warning("delete_pattern SCAN failed: %s", exc)
+            if not self._fail_open:
+                raise
 
         return count
+
+    def close(self) -> None:
+        """Close the underlying connection pool. Safe to call multiple times.
+
+        Long-lived runtimes that recycle their cache layer (e.g. on config
+        reload) otherwise leak Redis connections; the pool keeps file
+        descriptors open until GC eventually runs.
+        """
+        try:
+            self._client.connection_pool.disconnect()
+        except AttributeError:
+            # Older redis-py releases or cluster clients without a
+            # single pool attribute. Nothing to clean up explicitly.
+            pass
 
 
 class TieredCacheBackend(CacheBackend):
@@ -1447,6 +1753,11 @@ class TieredCacheBackend(CacheBackend):
 
     Reads check L1 first, then L2. Writes go to both.
     L1 hits avoid network round-trip to L2.
+
+    Note: when a get() falls through to L2, we re-populate L1 using the
+    smaller of ``self.l1_ttl`` and L2's remaining TTL. The shared
+    ``CacheBackend.remaining_ttl`` contract keeps L1 from outliving an
+    expiring L2 source.
     """
 
     def __init__(
@@ -1454,7 +1765,7 @@ class TieredCacheBackend(CacheBackend):
         l1: CacheBackend,
         l2: CacheBackend,
         l1_ttl: timedelta = timedelta(minutes=5),
-    ):
+    ) -> None:
         self.l1 = l1
         self.l2 = l2
         self.l1_ttl = l1_ttl
@@ -1462,23 +1773,39 @@ class TieredCacheBackend(CacheBackend):
         self._l1_hits = 0
         self._l2_hits = 0
         self._misses = 0
+        self._stats_lock = threading.Lock()
+
+    def _l2_remaining_ttl(self, key: str) -> Optional[timedelta]:
+        """Lookup L2's remaining TTL for ``key`` through the backend API."""
+        return self.l2.remaining_ttl(key)
 
     def get(self, key: str) -> Optional[Any]:
         # Check L1 first
         value = self.l1.get(key)
         if value is not None:
-            self._l1_hits += 1
+            with self._stats_lock:
+                self._l1_hits += 1
             return value
 
         # Check L2
         value = self.l2.get(key)
         if value is not None:
-            self._l2_hits += 1
-            # Populate L1 for next time
-            self.l1.set(key, value, self.l1_ttl)
+            with self._stats_lock:
+                self._l2_hits += 1
+            # Populate L1 for next time. Clamp to L2's remaining TTL
+            # when the backend exposes it, so the L1 copy cannot outlive
+            # the L2 source it was promoted from.
+            remaining = self._l2_remaining_ttl(key)
+            if remaining is not None and remaining <= timedelta(seconds=0):
+                return value
+            l1_ttl_used = (
+                min(self.l1_ttl, remaining) if remaining else self.l1_ttl
+            )
+            self.l1.set(key, value, l1_ttl_used)
             return value
 
-        self._misses += 1
+        with self._stats_lock:
+            self._misses += 1
         return None
 
     def set(
@@ -1502,19 +1829,32 @@ class TieredCacheBackend(CacheBackend):
     def exists(self, key: str) -> bool:
         return self.l1.exists(key) or self.l2.exists(key)
 
+    def remaining_ttl(self, key: str) -> Optional[timedelta]:
+        # ``or`` treats ``timedelta(0)`` as falsy, which would silently
+        # promote an L1 entry that is in its final second to the L2
+        # value. Check for ``None`` explicitly and only fall through
+        # when the L1 lookup yields no usable TTL.
+        l1 = self.l1.remaining_ttl(key)
+        if l1 is not None and l1 > timedelta(0):
+            return l1
+        return self.l2.remaining_ttl(key)
+
     @property
     def stats(self) -> dict:
-        total = self._l1_hits + self._l2_hits + self._misses
-        return {
-            "l1_hits": self._l1_hits,
-            "l2_hits": self._l2_hits,
-            "misses": self._misses,
-            "l1_hit_rate": self._l1_hits / total if total > 0 else 0,
-            "l2_hit_rate": self._l2_hits / total if total > 0 else 0,
-            "total_hit_rate": (
-                (self._l1_hits + self._l2_hits) / total if total > 0 else 0
-            ),
-        }
+        with self._stats_lock:
+            total = self._l1_hits + self._l2_hits + self._misses
+            return {
+                "l1_hits": self._l1_hits,
+                "l2_hits": self._l2_hits,
+                "misses": self._misses,
+                "l1_hit_rate": self._l1_hits / total if total > 0 else 0,
+                "l2_hit_rate": self._l2_hits / total if total > 0 else 0,
+                "total_hit_rate": (
+                    (self._l1_hits + self._l2_hits) / total
+                    if total > 0
+                    else 0
+                ),
+            }
 
 
 class CacheManager:
@@ -1531,7 +1871,7 @@ class CacheManager:
         llm_ttl: timedelta = timedelta(hours=24),
         embedding_ttl: timedelta = timedelta(days=30),
         tool_ttl: timedelta = timedelta(minutes=10),
-    ):
+    ) -> None:
         self.backend = backend
         self.llm_ttl = llm_ttl
         self.embedding_ttl = embedding_ttl
@@ -1638,7 +1978,7 @@ class CacheManager:
         return key
 
     def get_tool_result(
-        self, tool_name: str, arguments: dict
+        self, tool_name: str, arguments: dict[str, Any]
     ) -> Optional[Any]:
         """Retrieve cached tool result."""
         key = self._tool_key_gen.generate(tool=tool_name, args=arguments)
@@ -1722,7 +2062,7 @@ class SemanticCacheEntry:
     query: str
     embedding: np.ndarray
     response: str
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     access_count: int = 0
 
@@ -1777,8 +2117,9 @@ class SemanticCache:
         similarity_threshold: float = 0.95,
         max_entries: int = 1000,
         ttl: timedelta = timedelta(hours=24),
+        evict_interval: int = 100,
         linear_scan_ok: bool = False,
-    ):
+    ) -> None:
         """
         Initialize semantic cache.
 
@@ -1787,15 +2128,26 @@ class SemanticCache:
             similarity_threshold: Minimum similarity for cache hit (0.0-1.0)
             max_entries: Maximum number of entries to store
             ttl: Time-to-live for cache entries
+            evict_interval: Run expired-entry cleanup every N lookups
             linear_scan_ok: Acknowledge the O(n) lookup cost when
                 ``max_entries`` exceeds the cutover threshold. Subclasses
                 that replace ``get`` with an indexed lookup
                 (``ProductionSemanticCache``) set this to True.
         """
+        if evict_interval < 1:
+            raise ValueError("evict_interval must be >= 1")
+        if max_entries < 1:
+            raise ValueError("max_entries must be >= 1")
+        if not 0.0 <= similarity_threshold <= 1.0:
+            raise ValueError("similarity_threshold must be between 0.0 and 1.0")
+        if ttl.total_seconds() <= 0:
+            raise ValueError("ttl must be > 0")
         self.embedding_model = embedding_model
         self.similarity_threshold = similarity_threshold
         self.max_entries = max_entries
         self.ttl = ttl
+        self._evict_interval = evict_interval
+        self._gets_since_evict = 0
 
         if max_entries > self.LINEAR_SCAN_CUTOVER_ENTRIES and not linear_scan_ok:
             import warnings
@@ -1844,12 +2196,8 @@ class SemanticCache:
             # every ``_evict_interval`` calls; expired entries that
             # remain in the meantime are filtered by ``is_expired``
             # inside the similarity loop below.
-            self._gets_since_evict = (
-                getattr(self, "_gets_since_evict", 0) + 1
-            )
-            if self._gets_since_evict >= getattr(
-                self, "_evict_interval", 100
-            ):
+            self._gets_since_evict += 1
+            if self._gets_since_evict >= self._evict_interval:
                 self._evict_expired()
                 self._gets_since_evict = 0
 
@@ -1922,7 +2270,9 @@ class SemanticCache:
             metadata: Optional metadata to store
         """
         text = f"{query}\n{context}" if context else query
-        embedding = self.embedding_model.embed_text(text)
+        embedding = np.asarray(
+            self.embedding_model.embed_text(text), dtype=np.float32
+        )
 
         entry = SemanticCacheEntry(
             query=query,
@@ -1932,12 +2282,17 @@ class SemanticCache:
         )
 
         with self._lock:
+            self._evict_expired()
             # Check if very similar entry already exists
             for existing in self._entries:
                 if existing.similarity(embedding) > 0.99:
                     # Update existing entry instead of adding duplicate
+                    existing.query = query
+                    existing.embedding = embedding
                     existing.response = response
                     existing.metadata.update(metadata or {})
+                    existing.created_at = time.time()
+                    existing.access_count = 0
                     return
 
             # Evict if at capacity
@@ -1945,6 +2300,11 @@ class SemanticCache:
                 self._evict_lfu()
 
             self._entries.append(entry)
+            # Guard against the rare case where _evict_lfu evicts fewer
+            # entries than required (e.g., concurrent inserts elsewhere)
+            # and we still overflow the cap after appending.
+            if len(self._entries) > self.max_entries:
+                self._evict_lfu()
 
     def _evict_expired(self) -> int:
         """Remove expired entries. Returns count of removed entries."""
@@ -2004,11 +2364,14 @@ class SemanticCache:
 
 class ProductionSemanticCache(SemanticCache):
     """
-    Production-ready semantic cache with vector index for efficient lookup.
+    Production-oriented semantic cache with vector index for efficient lookup.
 
     Uses an HNSW approximate nearest-neighbor index when FAISS exposes
     the required constructor, with an exact inner-product index fallback
-    for smaller deployments.
+    for smaller deployments. The optional backend is a write-through
+    metadata sink in this listing; production services that need warm
+    restarts should add bounded startup hydration or rebuild the FAISS
+    index from an external vector store.
     """
 
     def __init__(
@@ -2018,7 +2381,10 @@ class ProductionSemanticCache(SemanticCache):
         max_entries: int = 100000,
         ttl: timedelta = timedelta(hours=24),
         backend: Optional[CacheBackend] = None,
-    ):
+        linear_fallback_max_entries: int = 1000,
+    ) -> None:
+        if linear_fallback_max_entries < 1:
+            raise ValueError("linear_fallback_max_entries must be >= 1")
         super().__init__(
             embedding_model=embedding_model,
             similarity_threshold=similarity_threshold,
@@ -2033,6 +2399,7 @@ class ProductionSemanticCache(SemanticCache):
         self._index = None  # FAISS HNSW/flat index when available
         self._index_kind = "linear"
         self._embedding_dim = None
+        self._linear_fallback_max_entries = linear_fallback_max_entries
 
     def _normalize_embedding(self, embedding: Any) -> np.ndarray:
         """Convert model output to a normalized float32 vector."""
@@ -2072,6 +2439,17 @@ class ProductionSemanticCache(SemanticCache):
             # back this class with an external vector database.
             self._index = None
             self._index_kind = "linear"
+            if self.max_entries > self._linear_fallback_max_entries:
+                import warnings
+
+                warnings.warn(
+                    "FAISS is unavailable; capping ProductionSemanticCache "
+                    f"max_entries at {self._linear_fallback_max_entries} "
+                    "to avoid an unbounded linear scan.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.max_entries = self._linear_fallback_max_entries
 
     def _rebuild_index_locked(self) -> None:
         """Rebuild the ANN index after entries are evicted."""
@@ -2090,6 +2468,8 @@ class ProductionSemanticCache(SemanticCache):
         """
         Look up query using efficient ANN search.
         """
+        if k < 1:
+            raise ValueError("k must be >= 1")
         text = f"{query}\n{context}" if context else query
         query_embedding = self._normalize_embedding(
             self.embedding_model.embed_text(text)
@@ -2223,11 +2603,20 @@ class ProductionSemanticCache(SemanticCache):
 
             # Persist to backend if available
             if self.backend:
-                key = f"semantic:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
+                key_payload = json.dumps(
+                    {"query": query, "context": context},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                key = (
+                    "semantic:"
+                    f"{hashlib.sha256(key_payload.encode()).hexdigest()[:16]}"
+                )
                 self.backend.set(
                     key,
                     {
                         "query": query,
+                        "context": context,
                         "embedding": embedding.tolist(),
                         "response": response,
                         "metadata": metadata,
@@ -2247,7 +2636,7 @@ class ThresholdTuner:
     to recommend an appropriate threshold for your workload.
     """
 
-    def __init__(self, max_samples: int = 10_000):
+    def __init__(self, max_samples: int = 10_000) -> None:
         # Bounded ring buffer: long-running deployments would otherwise
         # accumulate samples indefinitely.
         self._samples: "deque[dict]" = deque(maxlen=max_samples)
@@ -2304,6 +2693,17 @@ class ThresholdTuner:
 
         best_threshold = 0.95  # Default
         best_f1 = 0
+        total_correct = sum(
+            1 for sample in self._samples if sample["was_correct"]
+        )
+        if total_correct == 0:
+            return {
+                "recommended_threshold": 1.0,
+                "expected_f1": 0.0,
+                "sample_count": len(self._samples),
+                "no_positive_samples": True,
+                "buckets": dict(buckets),
+            }
 
         for threshold in thresholds:
             # Count hits and correctness at this threshold
@@ -2320,9 +2720,7 @@ class ThresholdTuner:
                 continue
 
             precision = correct_above / hits_above
-            recall = correct_above / sum(
-                s["was_correct"] for s in self._samples
-            )
+            recall = correct_above / total_correct
 
             if precision + recall > 0:
                 f1 = 2 * (precision * recall) / (precision + recall)
@@ -2380,7 +2778,7 @@ def semantic_lookup_with_quality(
 # Block 14 (chapter listing #14)
 # ============================================================================
 
-from typing import List, Callable, Iterator
+from typing import List, Callable, Iterator, Optional
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -2412,13 +2810,34 @@ class CacheWarmer:
         llm_retry_backoff: float = 0.25,
         embedding_max_retries: int = 3,
         embedding_retry_backoff: float = 0.25,
-    ):
+        embedding_batch_size: int = 100,
+        max_history_warm_queries: int = 10_000,
+        llm_retryable_exceptions: Optional[
+            tuple[type[BaseException], ...]
+        ] = None,
+    ) -> None:
         if max_workers < 1:
             raise ValueError("max_workers must be >= 1")
+        if warm_timeout_seconds <= 0:
+            raise ValueError("warm_timeout_seconds must be > 0")
         if llm_max_retries < 1:
             raise ValueError("llm_max_retries must be >= 1")
+        if llm_retry_backoff < 0:
+            raise ValueError("llm_retry_backoff must be >= 0")
         if embedding_max_retries < 1:
             raise ValueError("embedding_max_retries must be >= 1")
+        if embedding_retry_backoff < 0:
+            raise ValueError("embedding_retry_backoff must be >= 0")
+        if embedding_batch_size < 1:
+            raise ValueError("embedding_batch_size must be >= 1")
+        if max_history_warm_queries < 1:
+            raise ValueError("max_history_warm_queries must be >= 1")
+        extra_retryable = llm_retryable_exceptions or ()
+        if not all(
+            isinstance(exc_type, type) and issubclass(exc_type, BaseException)
+            for exc_type in extra_retryable
+        ):
+            raise TypeError("llm_retryable_exceptions must be exception classes")
         self.cache_manager = cache_manager
         self.llm_client = llm_client
         self.embedding_model = embedding_model
@@ -2428,6 +2847,14 @@ class CacheWarmer:
         self.llm_retry_backoff = llm_retry_backoff
         self.embedding_max_retries = embedding_max_retries
         self.embedding_retry_backoff = embedding_retry_backoff
+        self.embedding_batch_size = embedding_batch_size
+        self.max_history_warm_queries = max_history_warm_queries
+        self.llm_retryable_exceptions = (
+            TimeoutError,
+            ConnectionError,
+            OSError,
+            *extra_retryable,
+        )
 
     def warm_from_history(
         self, query_log: Iterator[dict], limit: int = 1000
@@ -2443,19 +2870,15 @@ class CacheWarmer:
             Statistics about the warming process
         """
         stats = {"processed": 0, "cached": 0, "errors": 0}
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        limit = min(limit, self.max_history_warm_queries)
 
-        queries = []
-        for record in query_log:
-            queries.append(record)
-            if len(queries) >= limit:
-                break
-
-        logger.info(f"Warming cache with {len(queries)} historical queries")
+        logger.info(f"Warming cache with up to {limit} historical queries")
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = []
-
-            for record in queries:
+            for record in query_log:
                 future = executor.submit(
                     self._warm_single_query,
                     record.get("prompt", ""),
@@ -2463,6 +2886,8 @@ class CacheWarmer:
                     record.get("system_prompt"),
                 )
                 futures.append(future)
+                if len(futures) >= limit:
+                    break
 
             try:
                 for future in as_completed(
@@ -2475,11 +2900,7 @@ class CacheWarmer:
                             stats["cached"] += 1
                     except (
                         FuturesTimeoutError,
-                        TimeoutError,
-                        ConnectionError,
-                        OSError,
-                        RuntimeError,
-                        ValueError,
+                        *self.llm_retryable_exceptions,
                     ) as e:
                         logger.warning(f"Error warming query: {e}")
                         stats["errors"] += 1
@@ -2519,7 +2940,7 @@ class CacheWarmer:
                     timeout=self.warm_timeout_seconds,
                 )
                 break
-            except (TimeoutError, ConnectionError, OSError) as exc:
+            except self.llm_retryable_exceptions as exc:
                 if attempt == self.llm_max_retries - 1:
                     raise
                 logger.warning("Transient warm-cache failure: %s", exc)
@@ -2544,26 +2965,12 @@ class CacheWarmer:
         """
         Pre-compute and cache embeddings for a list of texts.
         """
-        stats = {"processed": 0, "cached": 0, "skipped": 0}
+        stats = {"processed": 0, "cached": 0, "skipped": 0, "errors": 0}
+        batch_size = self.embedding_batch_size
 
-        # Check which texts need embedding
-        texts_to_embed = []
-        for text in texts:
-            cached = self.cache_manager.get_embedding(text, model)
-            if cached is None:
-                texts_to_embed.append(text)
-            else:
-                stats["skipped"] += 1
-
-        logger.info(
-            f"Computing {len(texts_to_embed)} embeddings ({stats['skipped']} already cached)"
-        )
-
-        # Batch compute embeddings
-        batch_size = 100
-        for i in range(0, len(texts_to_embed), batch_size):
-            batch = texts_to_embed[i : i + batch_size]
-
+        def flush_batch(batch: list[str]) -> None:
+            if not batch:
+                return
             try:
                 embeddings = None
                 for attempt in range(self.embedding_max_retries):
@@ -2594,9 +3001,23 @@ class CacheWarmer:
 
             except (TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as e:
                 logger.error(f"Error computing embeddings: {e}")
+                stats["errors"] += len(batch)
 
             stats["processed"] += len(batch)
 
+        logger.info("Computing embeddings in batches of %d", batch_size)
+        batch: list[str] = []
+        for text in texts:
+            cached = self.cache_manager.get_embedding(text, model)
+            if cached is not None:
+                stats["skipped"] += 1
+                continue
+            batch.append(text)
+            if len(batch) >= batch_size:
+                flush_batch(batch)
+                batch.clear()
+
+        flush_batch(batch)
         return stats
 
     def warm_semantic_cache(
@@ -2631,12 +3052,20 @@ class ScheduledCacheWarmer:
     """
 
     def __init__(
-        self, warmer: CacheWarmer, schedule: str = "0 3 * * *"  # 3 AM daily
-    ):
+        self,
+        warmer: CacheWarmer,
+        schedule: str = "0 3 * * *",  # 3 AM daily
+        query_source: Optional[Callable[[], Iterator[dict]]] = None,
+        poll_interval_seconds: float = 60.0,
+    ) -> None:
         import threading
 
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be > 0")
         self.warmer = warmer
         self.schedule = schedule
+        self.query_source = query_source
+        self.poll_interval_seconds = poll_interval_seconds
         # ``threading.Event`` instead of a polled boolean so stop()
         # interrupts the sleep promptly instead of waiting up to 60s
         # for the next loop iteration to notice _running=False.
@@ -2660,8 +3089,8 @@ class ScheduledCacheWarmer:
         while not self._stop_event.is_set():
             sched.run_pending()
             # Event.wait interrupts cleanly on stop(); plain sleep
-            # would force a full 60s shutdown delay.
-            self._stop_event.wait(timeout=60)
+            # would force a full poll interval shutdown delay.
+            self._stop_event.wait(timeout=self.poll_interval_seconds)
 
     def stop(self) -> None:
         """Stop the scheduled warmer."""
@@ -2712,9 +3141,13 @@ class ScheduledCacheWarmer:
 
     def _get_recent_queries(self) -> Iterator[dict]:
         """Retrieve recent queries from your logging system."""
-        # Implement based on your logging infrastructure
-        # Could be from Elasticsearch, CloudWatch, etc.
-        raise NotImplementedError("Implement based on your logging system")
+        if self.query_source is None:
+            logger.warning(
+                "No query_source configured for ScheduledCacheWarmer; "
+                "skipping this warming cycle"
+            )
+            return iter(())
+        return self.query_source()
 
 # ============================================================================
 # Block 15 (chapter block #15) — Python fragment (incomplete, depends on surrounding context)
@@ -2786,41 +3219,54 @@ class CacheMetrics:
     Exposes metrics in Prometheus format for dashboarding and alerting.
     """
 
-    def __init__(self, cache_manager: CacheManager):
+    def __init__(
+        self, cache_manager: CacheManager, max_latency_samples: int = 10_000
+    ) -> None:
+        if max_latency_samples < 1:
+            raise ValueError("max_latency_samples must be >= 1")
         self.cache_manager = cache_manager
+        self._lock = threading.Lock()
 
         # Track costs
         self._cost_saved = 0.0
         self._cost_incurred = 0.0
 
         # Track latencies. Bounded ring buffers keep the last
-        # MAX_LATENCY_SAMPLES measurements per category so memory
+        # max_latency_samples measurements per category so memory
         # does not grow unboundedly. Percentile estimates remain
         # accurate so long as the buffer is large compared to the
         # serving timescale.
-        MAX_LATENCY_SAMPLES = 10_000
         self._cache_latencies: deque[float] = deque(
-            maxlen=MAX_LATENCY_SAMPLES
+            maxlen=max_latency_samples
         )
-        self._llm_latencies: deque[float] = deque(maxlen=MAX_LATENCY_SAMPLES)
+        self._llm_latencies: deque[float] = deque(
+            maxlen=max_latency_samples
+        )
 
     def record_cache_hit(
         self, category: str, latency_ms: float, estimated_cost_saved: float
     ) -> None:
         """Record a cache hit."""
-        self._cost_saved += estimated_cost_saved
-        self._cache_latencies.append(latency_ms)
+        with self._lock:
+            self._cost_saved += estimated_cost_saved
+            self._cache_latencies.append(latency_ms)
 
     def record_cache_miss(
         self, category: str, latency_ms: float, cost_incurred: float
     ) -> None:
         """Record a cache miss."""
-        self._cost_incurred += cost_incurred
-        self._llm_latencies.append(latency_ms)
+        with self._lock:
+            self._cost_incurred += cost_incurred
+            self._llm_latencies.append(latency_ms)
 
     def get_prometheus_metrics(self) -> str:
         """Export metrics in Prometheus format."""
         stats = self.cache_manager.get_stats()
+        with self._lock:
+            cost_saved = self._cost_saved
+            cost_incurred = self._cost_incurred
+            cache_latencies = list(self._cache_latencies)
+            llm_latencies = list(self._llm_latencies)
 
         lines = []
 
@@ -2837,38 +3283,42 @@ class CacheMetrics:
             )
 
         # Cost metrics
-        lines.append(f"cache_cost_saved_dollars {self._cost_saved:.2f}")
-        lines.append(f"cache_cost_incurred_dollars {self._cost_incurred:.2f}")
+        lines.append(f"cache_cost_saved_dollars {cost_saved:.2f}")
+        lines.append(f"cache_cost_incurred_dollars {cost_incurred:.2f}")
 
         # Latency metrics
-        if self._cache_latencies:
+        if cache_latencies:
             lines.append(
-                f"cache_latency_p50_ms {np.percentile(self._cache_latencies, 50):.2f}"
+                f"cache_latency_p50_ms {np.percentile(cache_latencies, 50):.2f}"
             )
             lines.append(
-                f"cache_latency_p99_ms {np.percentile(self._cache_latencies, 99):.2f}"
+                f"cache_latency_p99_ms {np.percentile(cache_latencies, 99):.2f}"
             )
 
-        if self._llm_latencies:
+        if llm_latencies:
             lines.append(
-                f"llm_latency_p50_ms {np.percentile(self._llm_latencies, 50):.2f}"
+                f"llm_latency_p50_ms {np.percentile(llm_latencies, 50):.2f}"
             )
             lines.append(
-                f"llm_latency_p99_ms {np.percentile(self._llm_latencies, 99):.2f}"
+                f"llm_latency_p99_ms {np.percentile(llm_latencies, 99):.2f}"
             )
 
         return "\n".join(lines)
 
     def get_savings_report(self) -> dict:
         """Generate a cost savings report."""
+        stats = self.cache_manager.get_stats()
+        with self._lock:
+            cost_saved = self._cost_saved
+            cost_incurred = self._cost_incurred
+            cache_latencies = list(self._cache_latencies)
+            llm_latencies = list(self._llm_latencies)
+
         total_requests = sum(
-            data["hits"] + data["misses"]
-            for data in self.cache_manager.get_stats().values()
+            data["hits"] + data["misses"] for data in stats.values()
         )
 
-        total_hits = sum(
-            data["hits"] for data in self.cache_manager.get_stats().values()
-        )
+        total_hits = sum(data["hits"] for data in stats.values())
 
         return {
             "total_requests": total_requests,
@@ -2876,22 +3326,22 @@ class CacheMetrics:
             "overall_hit_rate": (
                 total_hits / total_requests if total_requests > 0 else 0
             ),
-            "cost_saved": self._cost_saved,
-            "cost_incurred": self._cost_incurred,
+            "cost_saved": cost_saved,
+            "cost_incurred": cost_incurred,
             "savings_percentage": (
-                self._cost_saved / (self._cost_saved + self._cost_incurred)
-                if (self._cost_saved + self._cost_incurred) > 0
+                cost_saved / (cost_saved + cost_incurred)
+                if (cost_saved + cost_incurred) > 0
                 else 0
             ),
             "avg_cache_latency_ms": (
-                np.mean(self._cache_latencies) if self._cache_latencies else 0
+                np.mean(cache_latencies) if cache_latencies else 0
             ),
             "avg_llm_latency_ms": (
-                np.mean(self._llm_latencies) if self._llm_latencies else 0
+                np.mean(llm_latencies) if llm_latencies else 0
             ),
             "latency_improvement_factor": (
-                np.mean(self._llm_latencies) / np.mean(self._cache_latencies)
-                if self._cache_latencies and self._llm_latencies
+                np.mean(llm_latencies) / np.mean(cache_latencies)
+                if cache_latencies and llm_latencies
                 else 0
             ),
         }
@@ -2921,13 +3371,19 @@ class CachedAgentRuntime:
         tool_retry_backoff: float = 0.25,
         l1_cache_max_size: int = 1000,
         semantic_similarity_threshold: float = 0.95,
-    ):
+        semantic_cache_timeout_seconds: float = 0.5,
+        semantic_cache_workers: int = 2,
+    ) -> None:
         if llm_max_retries < 1:
             raise ValueError("llm_max_retries must be >= 1")
         if tool_max_retries < 1:
             raise ValueError("tool_max_retries must be >= 1")
         if l1_cache_max_size < 1:
             raise ValueError("l1_cache_max_size must be >= 1")
+        if semantic_cache_timeout_seconds <= 0:
+            raise ValueError("semantic_cache_timeout_seconds must be > 0")
+        if semantic_cache_workers < 1:
+            raise ValueError("semantic_cache_workers must be >= 1")
         self.agent = agent
         self.llm_client = llm_client
         self.embedding_model = embedding_model
@@ -2939,6 +3395,12 @@ class CachedAgentRuntime:
         self.tool_retry_backoff = tool_retry_backoff
         self.l1_cache_max_size = l1_cache_max_size
         self.semantic_similarity_threshold = semantic_similarity_threshold
+        self.semantic_cache_timeout_seconds = semantic_cache_timeout_seconds
+        self._closed = False
+        self._semantic_cache_executor = ThreadPoolExecutor(
+            max_workers=semantic_cache_workers,
+            thread_name_prefix="semantic-cache",
+        )
 
         # Initialize cache backends
         l1_cache = InMemoryBackend(max_size=self.l1_cache_max_size)
@@ -2950,6 +3412,9 @@ class CachedAgentRuntime:
             db=int(parsed_redis.path.lstrip("/") or 0),
             password=parsed_redis.password,
         )
+        # Keep a direct handle to the L2 backend so close() can
+        # release its connection pool deterministically.
+        self.l2_cache = l2_cache
         tiered_backend = TieredCacheBackend(l1_cache, l2_cache)
 
         # Initialize cache manager
@@ -2970,16 +3435,88 @@ class CachedAgentRuntime:
         # Metrics
         self.metrics = CacheMetrics(self.cache_manager)
 
+    def close(self, drain_timeout_seconds: float = 5.0) -> None:
+        """Release background executor and Redis pool resources.
+
+        ``drain_timeout_seconds`` bounds how long we wait for in-flight
+        semantic-cache work to finish. The executor is shut down with
+        ``wait=False`` so the call returns promptly; threads still
+        running at the deadline are warn-logged so abandoned work is
+        visible in ops rather than silently dropped.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._semantic_cache_executor.shutdown(
+            wait=False, cancel_futures=True
+        )
+        # Best-effort drain: join worker threads with a deadline so the
+        # caller is not blocked indefinitely on a hung embedding call.
+        deadline = time.monotonic() + max(0.0, drain_timeout_seconds)
+        executor_threads = getattr(
+            self._semantic_cache_executor, "_threads", set()
+        )
+        for thread in list(executor_threads):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        still_alive = [t for t in executor_threads if t.is_alive()]
+        if still_alive:
+            _redis_logger.warning(
+                "Semantic cache drain timeout: %d worker(s) still active",
+                len(still_alive),
+            )
+        # Release the L2 Redis connection pool if the backend supports
+        # it. Without this, recycling a CachedAgentRuntime (e.g. on
+        # config reload) leaks file descriptors until GC eventually
+        # runs.
+        l2_cache = getattr(self, "l2_cache", None)
+        if l2_cache is None:
+            cache_manager = getattr(self, "cache_manager", None)
+            backend = getattr(cache_manager, "backend", None)
+            l2_cache = getattr(backend, "l2", None)
+        if l2_cache is not None and hasattr(l2_cache, "close"):
+            try:
+                l2_cache.close()
+            except _CACHE_CLOSE_EXCEPTIONS as exc:
+                _redis_logger.warning("L2 cache close failed: %s", exc)
+
+    async def aclose(self) -> None:
+        self.close()
+
+    def __enter__(self) -> "CachedAgentRuntime":
+        if self._closed:
+            raise RuntimeError("CachedAgentRuntime is closed")
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "CachedAgentRuntime":
+        if self._closed:
+            raise RuntimeError("CachedAgentRuntime is closed")
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("CachedAgentRuntime is closed")
+
     async def process_query(
         self, query: str, context: Optional[dict] = None
     ) -> str:
         """
         Process a user query with caching at every layer.
         """
+        self._ensure_open()
         start_time = time.time()
 
-        # 1. Check semantic cache first
-        semantic_result = self.semantic_cache.get(query)
+        # 1. Check semantic cache first. FAISS/embedding work is sync,
+        # so isolate it from the event loop and bound the wait.
+        semantic_result = await self._semantic_cache_get(query)
         if semantic_result.hit:
             self.metrics.record_cache_hit(
                 "semantic",
@@ -2992,9 +3529,55 @@ class CachedAgentRuntime:
         response = await self._run_agent_with_cache(query, context)
 
         # 3. Store in semantic cache for future similar queries
-        self.semantic_cache.set(query, response)
+        await self._semantic_cache_set(query, response)
 
         return response
+
+    async def _semantic_cache_get(self, query: str) -> SemanticCacheResult:
+        try:
+            loop = asyncio.get_running_loop()
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._semantic_cache_executor,
+                    self.semantic_cache.get,
+                    query,
+                ),
+                timeout=self.semantic_cache_timeout_seconds,
+            )
+        except (
+            asyncio.TimeoutError,
+            RuntimeError,
+            OSError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            logging.getLogger(__name__).warning(
+                "semantic cache lookup skipped: %s", exc
+            )
+            return SemanticCacheResult(False, None, 0.0, None)
+
+    async def _semantic_cache_set(self, query: str, response: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._semantic_cache_executor,
+                    self.semantic_cache.set,
+                    query,
+                    response,
+                ),
+                timeout=self.semantic_cache_timeout_seconds,
+            )
+        except (
+            asyncio.TimeoutError,
+            RuntimeError,
+            OSError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            logging.getLogger(__name__).warning(
+                "semantic cache write skipped: %s", exc
+            )
 
     async def _run_agent_with_cache(
         self, query: str, context: Optional[dict]
@@ -3054,7 +3637,9 @@ class CachedAgentRuntime:
             return response.text
 
         # Create cached tool wrapper
-        async def cached_tool_call(tool_name: str, arguments: dict) -> Any:
+        async def cached_tool_call(
+            tool_name: str, arguments: dict[str, Any]
+        ) -> Any:
             # Check cache
             cached = self.tool_cache.get(tool_name, arguments)
             if cached is not None:

@@ -29,10 +29,20 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import total_ordering
 from typing import Any, Optional, TypeVar, Generic
-import redis
-from redis.asyncio import Redis as AsyncRedis
-from redis.exceptions import RedisError, WatchError
+try:
+    from redis.asyncio import Redis as AsyncRedis
+    from redis.exceptions import RedisError, WatchError
+except ImportError:  # Optional backend dependency.
+    class RedisError(Exception):
+        pass
+
+    class WatchError(RedisError):
+        pass
+
+    class AsyncRedis:  # type: ignore[no-redef]
+        pass
 
 T = TypeVar("T")
 
@@ -117,9 +127,13 @@ class RedisStateStore(StateStore[dict[str, Any]]):
         default_ttl: int = 3600,
         max_retries: int = 3,
         retry_backoff: float = 0.05,
-    ):
+    ) -> None:
+        if default_ttl < 1:
+            raise ValueError("default_ttl must be >= 1")
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
+        if retry_backoff < 0:
+            raise ValueError("retry_backoff must be >= 0")
         self._redis = redis_client
         self._prefix = key_prefix
         self._default_ttl = default_ttl
@@ -132,10 +146,23 @@ class RedisStateStore(StateStore[dict[str, Any]]):
     def _make_meta_key(self, key: str) -> str:
         return f"{self._prefix}meta:{key}"
 
+    @staticmethod
+    def _coerce_tags(parsed: dict[str, Any]) -> dict[str, str]:
+        raw_tags = parsed.get("tags", {})
+        if not isinstance(raw_tags, dict):
+            raise ValueError("metadata tags must be an object")
+        return {str(k): str(v) for k, v in raw_tags.items()}
+
     async def _with_redis_retry(
         self, label: str, operation: Callable[[], Awaitable[Any]]
     ) -> Any:
-        """Run a Redis operation with bounded transient retry/backoff."""
+        """Run a Redis operation with bounded transient retry/backoff.
+
+        On final failure we re-raise the original exception so that
+        callers can discriminate by error class (e.g., RedisError vs
+        ConnectionError vs TimeoutError) rather than catching a generic
+        RuntimeError and inspecting __cause__.
+        """
         last_error: Optional[BaseException] = None
         for attempt in range(self._max_retries):
             try:
@@ -147,10 +174,18 @@ class RedisStateStore(StateStore[dict[str, Any]]):
                 if attempt == self._max_retries - 1:
                     break
                 await asyncio.sleep(self._retry_backoff * (2**attempt))
-        logging.getLogger(__name__).exception(
-            "Redis %s failed after %s attempts", label, self._max_retries
+        if last_error is None:
+            raise RuntimeError(
+                "redis retry loop exited without attempting any call"
+            )
+        logging.getLogger(__name__).error(
+            "Redis %s failed after %s attempts: %s",
+            label,
+            self._max_retries,
+            last_error,
         )
-        raise RuntimeError(f"Redis {label} failed after retries") from last_error
+        # Preserve the original exception class so callers can pattern-match.
+        raise last_error
 
     async def get(self, key: str) -> Optional[dict[str, Any]]:
         data = await self._with_redis_retry(
@@ -186,6 +221,7 @@ class RedisStateStore(StateStore[dict[str, Any]]):
                 updated_at=now,
                 version=existing_meta.version + 1,
                 ttl_seconds=ttl,
+                tags=dict(existing_meta.tags),
             )
         else:
             meta = StateMetadata(
@@ -204,6 +240,7 @@ class RedisStateStore(StateStore[dict[str, Any]]):
                         "updated_at": meta.updated_at.isoformat(),
                         "version": meta.version,
                         "ttl_seconds": meta.ttl_seconds,
+                        "tags": meta.tags,
                     }
                 ),
             )
@@ -236,13 +273,33 @@ class RedisStateStore(StateStore[dict[str, Any]]):
                             return False
                         created_at = now
                         next_version = 1
+                        tags = {}
                     else:
-                        parsed = json.loads(raw_meta)
-                        current_version = int(parsed["version"])
+                        try:
+                            parsed = json.loads(raw_meta)
+                            current_version = int(parsed["version"])
+                            created_at = datetime.fromisoformat(
+                                parsed["created_at"]
+                            )
+                            tags = self._coerce_tags(parsed)
+                        except (
+                            json.JSONDecodeError,
+                            KeyError,
+                            TypeError,
+                            ValueError,
+                        ) as exc:
+                            await pipe.unwatch()
+                            logging.getLogger(__name__).warning(
+                                "Corrupt Redis state metadata key=%s: %s",
+                                meta_key,
+                                exc,
+                            )
+                            raise ValueError(
+                                f"Corrupt metadata in state key {key}"
+                            ) from exc
                         if current_version != expected_version:
                             await pipe.unwatch()
                             return False
-                        created_at = datetime.fromisoformat(parsed["created_at"])
                         next_version = current_version + 1
 
                     pipe.multi()
@@ -256,6 +313,7 @@ class RedisStateStore(StateStore[dict[str, Any]]):
                                 "updated_at": now.isoformat(),
                                 "version": next_version,
                                 "ttl_seconds": ttl,
+                                "tags": tags,
                             }
                         ),
                     )
@@ -290,13 +348,29 @@ class RedisStateStore(StateStore[dict[str, Any]]):
         )
         if data is None:
             return None
-        parsed = json.loads(data)
-        return StateMetadata(
-            created_at=datetime.fromisoformat(parsed["created_at"]),
-            updated_at=datetime.fromisoformat(parsed["updated_at"]),
-            version=parsed["version"],
-            ttl_seconds=parsed.get("ttl_seconds"),
-        )
+        try:
+            parsed = json.loads(data)
+            return StateMetadata(
+                created_at=datetime.fromisoformat(parsed["created_at"]),
+                updated_at=datetime.fromisoformat(parsed["updated_at"]),
+                version=int(parsed["version"]),
+                ttl_seconds=parsed.get("ttl_seconds"),
+                tags=self._coerce_tags(parsed),
+            )
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            logging.getLogger(__name__).warning(
+                "Corrupt Redis state metadata key=%s: %s",
+                self._make_meta_key(key),
+                exc,
+            )
+            raise ValueError(
+                f"Corrupt metadata in state key {key}"
+            ) from exc
 
     # ----- Low-level helpers used by coordination primitives -----
     # These public methods give cooperating components (e.g. lock
@@ -381,16 +455,26 @@ class RedisStateStore(StateStore[dict[str, Any]]):
     async def scan(
         self, key_pattern: str, batch_size: int = 100
     ) -> AsyncIterator[str]:
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
         match = self._make_key(key_pattern)
-        async for full_key in self._redis.scan_iter(
-            match=match, count=batch_size
-        ):
-            key = (
-                full_key.decode("utf-8")
-                if isinstance(full_key, bytes)
-                else str(full_key)
+        cursor: int | str | bytes = 0
+        while True:
+            cursor, keys = await self._with_redis_retry(
+                "scan",
+                lambda c=cursor: self._redis.scan(
+                    cursor=c, match=match, count=batch_size
+                ),
             )
-            yield key[len(self._prefix):] if key.startswith(self._prefix) else key
+            for full_key in keys:
+                key = (
+                    full_key.decode("utf-8")
+                    if isinstance(full_key, bytes)
+                    else str(full_key)
+                )
+                yield key[len(self._prefix):] if key.startswith(self._prefix) else key
+            if cursor in (0, "0", b"0"):
+                break
 
 
 # ============================================================================
@@ -399,7 +483,30 @@ class RedisStateStore(StateStore[dict[str, Any]]):
 
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
-import asyncpg
+try:
+    import asyncpg
+except ImportError:  # Optional backend dependency.
+    class _MissingAsyncpg:
+        class PostgresError(Exception):
+            pass
+
+        class Pool:
+            pass
+
+        class Record(dict):
+            pass
+
+        async def create_pool(self, *args: Any, **kwargs: Any) -> Any:
+            raise ImportError(
+                "asyncpg is required for PostgresTaskStore"
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            raise ImportError(
+                "asyncpg is required for PostgresTaskStore"
+            )
+
+    asyncpg = _MissingAsyncpg()
 from dataclasses import dataclass
 from enum import Enum
 
@@ -426,6 +533,10 @@ class TaskState:
     updated_at: datetime
     completed_at: Optional[datetime]
     error_message: Optional[str]
+
+
+class StateStoreTransientError(RuntimeError):
+    """Storage operation failed after bounded transient retries."""
 
 
 class PostgresTaskStore:
@@ -468,12 +579,16 @@ class PostgresTaskStore:
         pool: asyncpg.Pool,
         max_retries: int = 3,
         retry_backoff: float = 0.05,
-    ):
+        max_claim_batch: int = 100,
+    ) -> None:
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
+        if max_claim_batch < 1:
+            raise ValueError("max_claim_batch must be >= 1")
         self._pool = pool
         self._max_retries = max_retries
         self._retry_backoff = retry_backoff
+        self._max_claim_batch = max_claim_batch
 
     async def _with_pg_retry(
         self, label: str, operation: Callable[[], Awaitable[Any]]
@@ -492,20 +607,43 @@ class PostgresTaskStore:
                 if attempt == self._max_retries - 1:
                     break
                 await asyncio.sleep(self._retry_backoff * (2**attempt))
-        raise RuntimeError(f"Postgres {label} failed after retries") from last_error
+        raise StateStoreTransientError(
+            f"Postgres {label} failed after retries"
+        ) from last_error
 
     @classmethod
-    async def create(cls, dsn: str) -> "PostgresTaskStore":
-        """Factory method that initializes the schema."""
-        # Explicit pool sizing + per-command timeout. Defaults give
-        # an unbounded pool with no statement timeout, which can let
-        # a single slow query hold a connection forever and starve
-        # the rest of the agent under load.
+    async def create(
+        cls,
+        dsn: str,
+        min_size: Optional[int] = None,
+        max_size: Optional[int] = None,
+        command_timeout: Optional[float] = None,
+    ) -> "PostgresTaskStore":
+        """Factory method that initializes the schema.
+
+        Pool sizing and per-command timeout are configurable per
+        environment. When kwargs are omitted, values fall back to the
+        environment variables ``PG_POOL_MIN`` (default 5),
+        ``PG_POOL_MAX`` (default 20) and ``PG_CMD_TIMEOUT_S``
+        (default 10). Example: ``PG_POOL_MAX=50 PG_CMD_TIMEOUT_S=30``.
+        Defaults give an unbounded pool with no statement timeout,
+        which can let a single slow query hold a connection forever
+        and starve the rest of the agent under load.
+        """
+        import os
+        if min_size is None:
+            min_size = int(os.environ.get("PG_POOL_MIN", "5"))
+        if max_size is None:
+            max_size = int(os.environ.get("PG_POOL_MAX", "20"))
+        if command_timeout is None:
+            command_timeout = float(
+                os.environ.get("PG_CMD_TIMEOUT_S", "10")
+            )
         pool = await asyncpg.create_pool(
             dsn,
-            min_size=5,
-            max_size=20,
-            command_timeout=10,
+            min_size=min_size,
+            max_size=max_size,
+            command_timeout=command_timeout,
         )
         async with pool.acquire() as conn:
             await conn.execute(cls.SCHEMA)
@@ -634,6 +772,10 @@ class PostgresTaskStore:
         Uses SELECT FOR UPDATE SKIP LOCKED to enable multiple
         workers to claim tasks without conflicts.
         """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        limit = min(limit, self._max_claim_batch)
+
         async def claim() -> list[TaskState]:
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
@@ -663,8 +805,11 @@ class PostgresTaskStore:
         self,
         task_types: Optional[list[str]],
         stale_after: timedelta,
+        limit: int = 100,
     ) -> list[TaskState]:
         """Find running tasks older than the stale threshold."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
         async def fetch_stale() -> list[TaskState]:
             async with self._pool.acquire() as conn:
                 if task_types:
@@ -675,9 +820,11 @@ class PostgresTaskStore:
                         AND task_type = ANY($1)
                         AND updated_at < NOW() - $2::interval
                         ORDER BY updated_at
+                        LIMIT $3
                         """,
                         task_types,
                         stale_after,
+                        limit,
                     )
                 else:
                     rows = await conn.fetch(
@@ -686,8 +833,10 @@ class PostgresTaskStore:
                         WHERE status = 'running'
                         AND updated_at < NOW() - $1::interval
                         ORDER BY updated_at
+                        LIMIT $2
                         """,
                         stale_after,
+                        limit,
                     )
                 return [self._row_to_task(row) for row in rows]
 
@@ -715,9 +864,36 @@ class PostgresTaskStore:
 
 import asyncio
 
-import boto3
-from boto3.dynamodb.conditions import Key, Attr
-from botocore.exceptions import ClientError
+try:
+    import boto3
+    from boto3.dynamodb.conditions import Key, Attr
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:  # Optional backend dependency.
+    boto3 = None  # type: ignore[assignment]
+
+    class BotoCoreError(Exception):
+        pass
+
+    class ClientError(Exception):
+        def __init__(self, response: dict[str, Any], operation_name: str) -> None:
+            super().__init__(operation_name)
+            self.response = response
+
+    class _MissingCondition:
+        def exists(self) -> "_MissingCondition":
+            return self
+
+        def not_exists(self) -> "_MissingCondition":
+            return self
+
+        def eq(self, value: Any) -> "_MissingCondition":
+            return self
+
+    def Key(name: str) -> _MissingCondition:
+        return _MissingCondition()
+
+    def Attr(name: str) -> _MissingCondition:
+        return _MissingCondition()
 from decimal import Decimal
 
 
@@ -741,8 +917,34 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
         table_name: str,
         region: str = "us-east-1",
         endpoint_url: Optional[str] = None,
-    ):
+        max_retries: int = 3,
+        retry_backoff: float = 0.05,
+        connect_timeout: float = 2.0,
+        read_timeout: float = 5.0,
+        max_pool_connections: int = 50,
+        sdk_max_attempts: int = 4,
+        sdk_retry_mode: str = "adaptive",
+        boto_config: Optional[Any] = None,
+    ) -> None:
+        if boto3 is None:
+            raise ImportError("boto3 and botocore are required for DynamoDBStateStore")
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
+        if retry_backoff < 0:
+            raise ValueError("retry_backoff must be >= 0")
+        if connect_timeout <= 0:
+            raise ValueError("connect_timeout must be > 0")
+        if read_timeout <= 0:
+            raise ValueError("read_timeout must be > 0")
+        if max_pool_connections < 1:
+            raise ValueError("max_pool_connections must be >= 1")
+        if sdk_max_attempts < 1:
+            raise ValueError("sdk_max_attempts must be >= 1")
+        if not sdk_retry_mode:
+            raise ValueError("sdk_retry_mode must be non-empty")
         self._table_name = table_name
+        self._max_retries = max_retries
+        self._retry_backoff = retry_backoff
         # Explicit production config: bound the per-request budget,
         # cap the connection pool, and use the SDK's adaptive retry
         # mode (exponential backoff with throttling-aware
@@ -750,12 +952,16 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
         # read and unbounded pooling, which silently lets a flaky
         # DynamoDB partition consume every async worker.
         from botocore.config import Config as BotoConfig
-        boto_config = BotoConfig(
-            connect_timeout=2,
-            read_timeout=5,
-            max_pool_connections=50,
-            retries={"max_attempts": 4, "mode": "adaptive"},
-        )
+        if boto_config is None:
+            boto_config = BotoConfig(
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                max_pool_connections=max_pool_connections,
+                retries={
+                    "max_attempts": sdk_max_attempts,
+                    "mode": sdk_retry_mode,
+                },
+            )
         self._dynamodb = boto3.resource(
             "dynamodb",
             region_name=region,
@@ -764,10 +970,44 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
         )
         self._table = self._dynamodb.Table(table_name)
 
+    def _is_retryable_dynamodb_error(self, exc: ClientError) -> bool:
+        code = exc.response.get("Error", {}).get("Code", "")
+        return code in {
+            "InternalServerError",
+            "LimitExceededException",
+            "ProvisionedThroughputExceededException",
+            "RequestLimitExceeded",
+            "ServiceUnavailable",
+            "ThrottlingException",
+            "Throttling",
+            "TooManyRequestsException",
+            "TransactionConflictException",
+        }
+
+    async def _with_dynamodb_retry(
+        self, label: str, operation: Callable[[], Any]
+    ) -> Any:
+        last_error: Optional[BaseException] = None
+        for attempt in range(self._max_retries):
+            try:
+                return await asyncio.to_thread(operation)
+            except ClientError as exc:
+                if not self._is_retryable_dynamodb_error(exc):
+                    raise
+                last_error = exc
+            except (BotoCoreError, TimeoutError, ConnectionError, OSError) as exc:
+                last_error = exc
+            if attempt == self._max_retries - 1:
+                break
+            await asyncio.sleep(self._retry_backoff * (2**attempt))
+        raise StateStoreTransientError(
+            f"DynamoDB {label} failed after retries"
+        ) from last_error
+
     async def get(self, key: str) -> Optional[dict[str, Any]]:
         try:
-            response = await asyncio.to_thread(
-                self._table.get_item, Key={"pk": key}
+            response = await self._with_dynamodb_retry(
+                "get_item", lambda: self._table.get_item(Key={"pk": key})
             )
         except ClientError as exc:
             # Distinguish "not found" (legitimate cache miss) from
@@ -792,34 +1032,115 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
         value: dict[str, Any],
         ttl_seconds: Optional[int] = None,
     ) -> None:
+        last_error: Optional[BaseException] = None
+        for attempt in range(self._max_retries):
+            existing = await self.get_metadata(key)
+            now = datetime.now(timezone.utc)
+            item = {
+                "pk": key,
+                "data": self._serialize(value),
+                "updated_at": now.isoformat(),
+                "version": (existing.version + 1) if existing else 1,
+                "created_at": (
+                    existing.created_at.isoformat()
+                    if existing
+                    else now.isoformat()
+                ),
+            }
+
+            if ttl_seconds:
+                item["ttl_seconds"] = ttl_seconds
+                item["ttl"] = (
+                    int(datetime.now(timezone.utc).timestamp())
+                    + ttl_seconds
+                )
+
+            condition = (
+                Attr("version").eq(existing.version)
+                if existing
+                else Attr("pk").not_exists()
+            )
+            try:
+                await self._with_dynamodb_retry(
+                    "conditional_put_item",
+                    lambda item=item, condition=condition: (
+                        self._table.put_item(
+                            Item=item, ConditionExpression=condition
+                        )
+                    ),
+                )
+                return
+            except ClientError as exc:
+                if (
+                    exc.response["Error"]["Code"]
+                    != "ConditionalCheckFailedException"
+                ):
+                    raise
+                last_error = exc
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(self._retry_backoff * (2**attempt))
+        raise StateStoreTransientError(
+            "DynamoDB conditional set failed after retries"
+        ) from last_error
+
+    async def compare_and_set(
+        self,
+        key: str,
+        value: dict[str, Any],
+        expected_version: Optional[int],
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
+        """Optimistic write using DynamoDB conditional expressions."""
+        now = datetime.now(timezone.utc)
+        existing = await self.get_metadata(key)
+        if expected_version is None:
+            if existing is not None:
+                return False
+            next_version = 1
+            created_at = now
+            condition = Attr("pk").not_exists()
+        else:
+            if existing is None or existing.version != expected_version:
+                return False
+            next_version = expected_version + 1
+            created_at = existing.created_at
+            condition = Attr("version").eq(expected_version)
+
         item = {
             "pk": key,
             "data": self._serialize(value),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": now.isoformat(),
+            "version": next_version,
+            "created_at": created_at.isoformat(),
         }
-
-        # Get existing item for version tracking
-        existing = await self.get_metadata(key)
-        item["version"] = (existing.version + 1) if existing else 1
-        item["created_at"] = (
-            existing.created_at.isoformat()
-            if existing
-            else datetime.now(timezone.utc).isoformat()
-        )
-
         if ttl_seconds:
-            item["ttl"] = (
-                int(datetime.now(timezone.utc).timestamp()) + ttl_seconds
-            )
+            item["ttl_seconds"] = ttl_seconds
+            item["ttl"] = int(now.timestamp()) + ttl_seconds
 
-        await asyncio.to_thread(self._table.put_item, Item=item)
+        try:
+            await self._with_dynamodb_retry(
+                "compare_and_set",
+                lambda: self._table.put_item(
+                    Item=item, ConditionExpression=condition
+                ),
+            )
+            return True
+        except ClientError as exc:
+            if (
+                exc.response["Error"]["Code"]
+                == "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
 
     async def delete(self, key: str) -> bool:
         try:
-            await asyncio.to_thread(
-                self._table.delete_item,
-                Key={"pk": key},
-                ConditionExpression=Attr("pk").exists(),
+            await self._with_dynamodb_retry(
+                "delete_item",
+                lambda: self._table.delete_item(
+                    Key={"pk": key},
+                    ConditionExpression=Attr("pk").exists(),
+                ),
             )
             return True
         except ClientError as e:
@@ -831,30 +1152,45 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
             raise
 
     async def exists(self, key: str) -> bool:
-        response = await asyncio.to_thread(
-            self._table.get_item,
-            Key={"pk": key},
-            ProjectionExpression="pk",
+        response = await self._with_dynamodb_retry(
+            "exists",
+            lambda: self._table.get_item(
+                Key={"pk": key},
+                ProjectionExpression="pk",
+            ),
         )
         return "Item" in response
 
     async def get_metadata(self, key: str) -> Optional[StateMetadata]:
-        response = await asyncio.to_thread(
-            self._table.get_item,
-            Key={"pk": key},
-            ProjectionExpression="created_at, updated_at, version, ttl",
+        response = await self._with_dynamodb_retry(
+            "get_metadata",
+            lambda: self._table.get_item(
+                Key={"pk": key},
+                ProjectionExpression=(
+                    "created_at, updated_at, version, ttl, ttl_seconds"
+                ),
+            ),
         )
         item = response.get("Item")
         if not item:
             return None
+        ttl_seconds = item.get("ttl_seconds")
+        if ttl_seconds is None and item.get("ttl") is not None:
+            ttl_seconds = max(
+                0,
+                int(item["ttl"])
+                - int(datetime.now(timezone.utc).timestamp()),
+            )
+        elif ttl_seconds is not None:
+            ttl_seconds = int(ttl_seconds)
         return StateMetadata(
             created_at=datetime.fromisoformat(item["created_at"]),
             updated_at=datetime.fromisoformat(item["updated_at"]),
             version=int(item["version"]),
-            ttl_seconds=item.get("ttl"),
+            ttl_seconds=ttl_seconds,
         )
 
-    def _serialize(self, data: dict) -> dict:
+    def _serialize(self, data: Any) -> Any:
         """Convert floats to Decimal for DynamoDB compatibility."""
         if isinstance(data, dict):
             return {k: self._serialize(v) for k, v in data.items()}
@@ -864,7 +1200,7 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
             return Decimal(str(data))
         return data
 
-    def _deserialize(self, data: dict) -> dict:
+    def _deserialize(self, data: Any) -> Any:
         """Convert Decimals back to native Python types."""
         if isinstance(data, dict):
             return {k: self._deserialize(v) for k, v in data.items()}
@@ -882,7 +1218,18 @@ class DynamoDBStateStore(StateStore[dict[str, Any]]):
 
 from dataclasses import dataclass
 from typing import Protocol
-import tiktoken
+try:
+    import tiktoken
+except ImportError:  # Optional dependency for token-accurate examples.
+    class _FallbackEncoding:
+        def encode(self, text: str) -> list[str]:
+            return text.split()
+
+    class _FallbackTiktoken:
+        def get_encoding(self, name: str) -> _FallbackEncoding:
+            return _FallbackEncoding()
+
+    tiktoken = _FallbackTiktoken()
 
 
 @dataclass
@@ -895,7 +1242,7 @@ class Message:
     metadata: dict[str, Any] = field(default_factory=dict)
     token_count: Optional[int] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.token_count is None:
             # Lazy token counting
             encoder = tiktoken.get_encoding("cl100k_base")
@@ -936,8 +1283,17 @@ class ConversationManager:
         summary_threshold: int = 4000,
         min_recent_messages: int = 10,
         max_messages_per_conversation: int = 5000,
+        max_cas_retries: int = 5,
+        cas_retry_backoff: float = 0.05,
+        cas_retry_backoff_max: float = 0.5,
         allow_non_transactional_store: bool = False,
-    ):
+        summarizer_timeout_seconds: float = 10.0,
+        summarizer_max_retries: int = 2,
+        summarizer_retry_backoff_seconds: float = 0.1,
+        summarizer_circuit_breaker_failures: int = 3,
+        summarizer_circuit_open_seconds: float = 30.0,
+        summary_buffer_tokens: int = 50,
+    ) -> None:
         """
         Initialize conversation manager.
 
@@ -948,7 +1304,16 @@ class ConversationManager:
             summary_threshold: Trigger summarization above this
             min_recent_messages: Always keep this many recent messages
             max_messages_per_conversation: Absolute in-memory message cap
+            max_cas_retries: Compare-and-set retries for write conflicts
+            cas_retry_backoff: Initial CAS retry sleep in seconds
+            cas_retry_backoff_max: Maximum CAS retry sleep in seconds
         """
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+        if summary_threshold < 1:
+            raise ValueError("summary_threshold must be >= 1")
+        if summary_threshold > max_tokens:
+            raise ValueError("summary_threshold cannot exceed max_tokens")
         if max_messages_per_conversation < 1:
             raise ValueError("max_messages_per_conversation must be >= 1")
         if min_recent_messages < 0:
@@ -958,14 +1323,51 @@ class ConversationManager:
                 "min_recent_messages cannot exceed "
                 "max_messages_per_conversation"
             )
+        if max_cas_retries < 1:
+            raise ValueError("max_cas_retries must be >= 1")
+        if cas_retry_backoff < 0:
+            raise ValueError("cas_retry_backoff must be >= 0")
+        if cas_retry_backoff_max < cas_retry_backoff:
+            raise ValueError("cas_retry_backoff_max must be >= cas_retry_backoff")
+        if summarizer_timeout_seconds <= 0:
+            raise ValueError("summarizer_timeout_seconds must be > 0")
+        if summarizer_max_retries < 1:
+            raise ValueError("summarizer_max_retries must be >= 1")
+        if summarizer_retry_backoff_seconds < 0:
+            raise ValueError("summarizer_retry_backoff_seconds must be >= 0")
+        if summarizer_circuit_breaker_failures < 1:
+            raise ValueError(
+                "summarizer_circuit_breaker_failures must be >= 1"
+            )
+        if summary_buffer_tokens < 0:
+            raise ValueError("summary_buffer_tokens must be >= 0")
         self._store = state_store
         self._summarizer = summarizer
         self._max_tokens = max_tokens
         self._summary_threshold = summary_threshold
         self._min_recent = min_recent_messages
         self._max_messages = max_messages_per_conversation
+        self._max_cas_retries = max_cas_retries
+        self._cas_retry_backoff = cas_retry_backoff
+        self._cas_retry_backoff_max = cas_retry_backoff_max
         self._allow_non_transactional_store = allow_non_transactional_store
+        self._summarizer_timeout_seconds = summarizer_timeout_seconds
+        self._summarizer_max_retries = summarizer_max_retries
+        self._summarizer_retry_backoff_seconds = summarizer_retry_backoff_seconds
+        self._summarizer_circuit_breaker_failures = (
+            summarizer_circuit_breaker_failures
+        )
+        self._summarizer_circuit_open_seconds = (
+            summarizer_circuit_open_seconds
+        )
+        self._summarizer_failures = 0
+        self._summarizer_open_until: Optional[datetime] = None
+        self._summary_buffer_tokens = summary_buffer_tokens
         self._encoder = tiktoken.get_encoding("cl100k_base")
+        # Serializes circuit-breaker state mutations in
+        # _summarize_with_resilience so concurrent compaction calls
+        # cannot interleave failure-count updates.
+        self._summary_lock = asyncio.Lock()
 
     async def add_message(
         self, conversation_id: str, message: Message
@@ -973,7 +1375,7 @@ class ConversationManager:
         """Add a message and trigger compaction if needed."""
         key = f"conversation:{conversation_id}"
 
-        for attempt in range(5):
+        for attempt in range(self._max_cas_retries):
             state = await self._load_state(conversation_id)
             metadata = await self._store.get_metadata(key)
             expected_version = metadata.version if metadata else None
@@ -1006,7 +1408,12 @@ class ConversationManager:
             if saved:
                 return
 
-            await asyncio.sleep(min(0.05 * (2**attempt), 0.5))
+            await asyncio.sleep(
+                min(
+                    self._cas_retry_backoff * (2**attempt),
+                    self._cas_retry_backoff_max,
+                )
+            )
 
         raise RuntimeError(
             f"Could not append message to {conversation_id}: concurrent updates"
@@ -1021,7 +1428,9 @@ class ConversationManager:
         Returns a window containing recent messages and optionally
         a summary of older context, fitted within token budget.
         """
-        budget = max_tokens or self._max_tokens
+        budget = max_tokens if max_tokens is not None else self._max_tokens
+        if budget < 1:
+            raise ValueError("max_tokens must be >= 1")
         state = await self._load_state(conversation_id)
 
         messages = [self._dict_to_message(m) for m in state["messages"]]
@@ -1030,7 +1439,10 @@ class ConversationManager:
         # Calculate tokens for summary
         summary_tokens = 0
         if summary:
-            summary_tokens = len(self._encoder.encode(summary)) + 50  # Buffer
+            summary_tokens = (
+                len(self._encoder.encode(summary))
+                + self._summary_buffer_tokens
+            )
 
         available_for_messages = budget - summary_tokens
 
@@ -1054,7 +1466,7 @@ class ConversationManager:
             truncated=len(selected) < len(messages),
         )
 
-    async def _compact(self, state: dict) -> dict:
+    async def _compact(self, state: dict[str, Any]) -> dict[str, Any]:
         """Compact conversation by summarizing older messages."""
         messages = [self._dict_to_message(m) for m in state["messages"]]
 
@@ -1077,7 +1489,28 @@ class ConversationManager:
             )
             to_summarize = [summary_message] + to_summarize
 
-        new_summary = await self._summarizer.summarize(to_summarize)
+        try:
+            new_summary = await self._summarize_with_resilience(
+                to_summarize
+            )
+        except (
+            asyncio.TimeoutError,
+            TimeoutError,
+            RuntimeError,
+            OSError,
+            ValueError,
+        ) as exc:
+            logging.getLogger(__name__).warning(
+                "conversation summarizer unavailable; keeping recent "
+                "messages only: %s",
+                exc,
+            )
+            return {
+                "messages": [self._message_to_dict(m) for m in to_keep],
+                "summary": state.get("summary"),
+                "total_tokens": sum(m.token_count for m in to_keep),
+                "compaction_count": state.get("compaction_count", 0) + 1,
+            }
 
         return {
             "messages": [self._message_to_dict(m) for m in to_keep],
@@ -1086,7 +1519,54 @@ class ConversationManager:
             "compaction_count": state.get("compaction_count", 0) + 1,
         }
 
-    async def _load_state(self, conversation_id: str) -> dict:
+    async def _summarize_with_resilience(
+        self, messages: list[Message]
+    ) -> str:
+        async with self._summary_lock:
+            now = datetime.now(timezone.utc)
+            if (
+                self._summarizer_open_until
+                and now < self._summarizer_open_until
+            ):
+                raise RuntimeError("summarizer circuit breaker is open")
+
+            last_error: Optional[BaseException] = None
+            for attempt in range(self._summarizer_max_retries):
+                try:
+                    summary = await asyncio.wait_for(
+                        self._summarizer.summarize(messages),
+                        timeout=self._summarizer_timeout_seconds,
+                    )
+                    self._summarizer_failures = 0
+                    self._summarizer_open_until = None
+                    return summary
+                except (
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    RuntimeError,
+                    OSError,
+                    ValueError,
+                ) as exc:
+                    last_error = exc
+                    if attempt < self._summarizer_max_retries - 1:
+                        await asyncio.sleep(
+                            self._summarizer_retry_backoff_seconds
+                            * (2**attempt)
+                        )
+
+            self._summarizer_failures += 1
+            if (
+                self._summarizer_failures
+                >= self._summarizer_circuit_breaker_failures
+            ):
+                self._summarizer_open_until = datetime.now(
+                    timezone.utc
+                ) + timedelta(seconds=self._summarizer_circuit_open_seconds)
+            raise RuntimeError(
+                "summarizer failed after retries"
+            ) from last_error
+
+    async def _load_state(self, conversation_id: str) -> dict[str, Any]:
         state = await self._store.get(f"conversation:{conversation_id}")
         if state is None:
             return {
@@ -1097,7 +1577,7 @@ class ConversationManager:
             }
         return state
 
-    def _message_to_dict(self, msg: Message) -> dict:
+    def _message_to_dict(self, msg: Message) -> dict[str, Any]:
         return {
             "role": msg.role,
             "content": msg.content,
@@ -1106,7 +1586,7 @@ class ConversationManager:
             "token_count": msg.token_count,
         }
 
-    def _dict_to_message(self, data: dict) -> Message:
+    def _dict_to_message(self, data: dict[str, Any]) -> Message:
         return Message(
             role=data["role"],
             content=data["content"],
@@ -1122,7 +1602,7 @@ class ConversationManager:
 class ImportanceScorer:
     """Score messages by importance for retention decisions."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._high_importance_patterns = [
             r"(?i)important",
             r"(?i)remember",
@@ -1254,7 +1734,14 @@ class TaskCheckpointer:
         checkpoint_interval: int = 30,  # seconds
         max_checkpoints_per_task: int = 10,
         max_pending: int = 1000,
-    ):
+        metrics_client: Optional[Any] = None,
+    ) -> None:
+        if checkpoint_interval < 1:
+            raise ValueError("checkpoint_interval must be >= 1")
+        if max_checkpoints_per_task < 1:
+            raise ValueError("max_checkpoints_per_task must be >= 1")
+        if max_pending < 1:
+            raise ValueError("max_pending must be >= 1")
         self._store = task_store
         self._interval = checkpoint_interval
         self._max_checkpoints = max_checkpoints_per_task
@@ -1264,6 +1751,10 @@ class TaskCheckpointer:
         self._max_pending = max_pending
         self._pending_checkpoints: dict[str, Checkpoint] = {}
         self._checkpoint_task: Optional[asyncio.Task] = None
+        # Optional metrics client; emits ``checkpoint.buffer.full``
+        # counter increments so dashboards / autoscalers can see
+        # backpressure before callers start seeing 500s.
+        self._metrics = metrics_client
 
     async def start(self) -> None:
         """Start background checkpoint flushing."""
@@ -1326,12 +1817,11 @@ class TaskCheckpointer:
             await self._store.transition_status(task_id, TaskStatus.COMPLETED)
         except (
             StateCorruptionError,
+            StateStoreTransientError,
             asyncpg.PostgresError,
             TimeoutError,
             ConnectionError,
             OSError,
-            RuntimeError,
-            ValueError,
         ) as e:
             await self._flush_task(task_id)  # Ensure last checkpoint saved
             await self._store.transition_status(
@@ -1361,6 +1851,16 @@ class TaskCheckpointer:
             task_id not in self._pending_checkpoints
             and len(self._pending_checkpoints) >= self._max_pending
         ):
+            # Surface backpressure to ops *before* raising so that
+            # dashboards/alerts see the saturation signal rather than
+            # only the resulting 5xx wave from upstream callers.
+            if self._metrics is not None:
+                try:
+                    self._metrics.increment("checkpoint.buffer.full")
+                except (RuntimeError, ValueError, TypeError, OSError):
+                    logging.getLogger(__name__).debug(
+                        "metrics increment failed", exc_info=True
+                    )
             raise RuntimeError(
                 "Pending checkpoint buffer is full; apply backpressure "
                 "or increase max_pending"
@@ -1385,9 +1885,16 @@ class TaskCheckpointer:
         the task is cancelled.
         """
         _log = __import__("logging").getLogger(__name__)
+        first_iteration = True
         while True:
             try:
-                await asyncio.sleep(self._interval)
+                # Run the first flush immediately on start; sleeping
+                # first delays the very first checkpoint write by a
+                # full interval, which is the worst case for crash
+                # recovery right after the agent comes up.
+                if not first_iteration:
+                    await asyncio.sleep(self._interval)
+                first_iteration = False
                 await self._flush_all()
             except asyncio.CancelledError:
                 # Cooperative shutdown: re-raise so the caller's
@@ -1486,7 +1993,9 @@ class CheckpointStrategy(ABC):
 class TimeBasedStrategy(CheckpointStrategy):
     """Checkpoint at fixed time intervals."""
 
-    def __init__(self, interval_seconds: int = 60):
+    def __init__(self, interval_seconds: int = 60) -> None:
+        if interval_seconds < 1:
+            raise ValueError("interval_seconds must be >= 1")
         self._interval = timedelta(seconds=interval_seconds)
 
     def should_checkpoint(
@@ -1503,7 +2012,9 @@ class TimeBasedStrategy(CheckpointStrategy):
 class CountBasedStrategy(CheckpointStrategy):
     """Checkpoint after processing N items."""
 
-    def __init__(self, item_count: int = 100):
+    def __init__(self, item_count: int = 100) -> None:
+        if item_count < 1:
+            raise ValueError("item_count must be >= 1")
         self._count = item_count
         self._since_last = 0
 
@@ -1535,7 +2046,15 @@ class AdaptiveStrategy(CheckpointStrategy):
         max_interval: int = 300,
         cost_threshold: float = 1.0,
         recent_cost_window: int = 100,
-    ):
+    ) -> None:
+        if min_interval < 1:
+            raise ValueError("min_interval must be >= 1")
+        if max_interval < min_interval:
+            raise ValueError("max_interval must be >= min_interval")
+        if cost_threshold < 0:
+            raise ValueError("cost_threshold must be >= 0")
+        if recent_cost_window < 1:
+            raise ValueError("recent_cost_window must be >= 1")
         self._min = timedelta(seconds=min_interval)
         self._max = timedelta(seconds=max_interval)
         self._threshold = cost_threshold
@@ -1604,7 +2123,7 @@ class RecoveryCoordinator:
         conversation_manager: ConversationManager,
         max_recovery_attempts: int = 3,
         stale_task_after: timedelta = timedelta(minutes=5),
-    ):
+    ) -> None:
         self._tasks = task_store
         self._conversations = conversation_manager
         self._max_attempts = max_recovery_attempts
@@ -1666,8 +2185,16 @@ class RecoveryCoordinator:
             )
 
             if not checkpoint.verify():
-                # Checkpoint corrupted - try to recover from backup
-                backup = await self._find_backup_checkpoint(task.task_id)
+                # Checkpoint corrupted - try to recover from backup.
+                # If no backup path is wired in (stub), surface a
+                # data-loss result explicitly instead of silently
+                # treating the absence of a backup as ``None``.
+                try:
+                    backup = await self._find_backup_checkpoint(
+                        task.task_id
+                    )
+                except NotImplementedError:
+                    backup = None
                 if backup:
                     task.checkpoint = backup
                 else:
@@ -1699,9 +2226,12 @@ class RecoveryCoordinator:
         In production, this might check a separate backup table,
         a different storage backend, or transaction logs.
         """
-        # This is a simplified implementation
-        # Production would have more sophisticated backup mechanisms
-        return None
+        # Explicitly raise rather than returning ``None`` silently;
+        # a quiet ``None`` here lets recovery fall through into a
+        # data-loss path without any operator signal.
+        raise NotImplementedError(
+            "Backup checkpoint lookup not implemented; see ch07"
+        )
 
 # ============================================================================
 # Block 9 (chapter listing #9)
@@ -1719,7 +2249,7 @@ class CorruptionHandler:
         primary_store: StateStore,
         backup_store: Optional[StateStore] = None,
         metrics_client: Optional[Any] = None,
-    ):
+    ) -> None:
         self._primary = primary_store
         self._backup = backup_store
         self._metrics = metrics_client
@@ -1783,9 +2313,11 @@ class CorruptionHandler:
         """
         metadata = await self._primary.get_metadata(key)
         if metadata and metadata.version > 1:
-            raise NotImplementedError(
-                "Version-aware rollback requires a history-backed store; "
-                "override _rollback_state in a subclass."
+            logging.getLogger(__name__).warning(
+                "Rollback requested for key=%s at version=%s, but no "
+                "history-backed store is configured",
+                key,
+                metadata.version,
             )
         return None
 
@@ -1855,7 +2387,7 @@ class CorruptionHandler:
 
 import random
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 
 @dataclass
@@ -1885,10 +2417,14 @@ class SharedStateCoordinator:
         state_store: RedisStateStore,
         lock_timeout: int = 30,
         retry_delay: float = 0.1,
-    ):
+        callback_timeout_seconds: float = 2.0,
+    ) -> None:
+        if callback_timeout_seconds <= 0:
+            raise ValueError("callback_timeout_seconds must be > 0")
         self._store = state_store
         self._lock_timeout = lock_timeout
         self._retry_delay = retry_delay
+        self._callback_timeout_seconds = callback_timeout_seconds
         self._agent_id = str(uuid.uuid4())
 
     @asynccontextmanager
@@ -1906,9 +2442,52 @@ class SharedStateCoordinator:
                 await coordinator.write("resource:123", state)
         """
         lock = await self.acquire_lock(resource_id, timeout)
+        lock_timeout = timeout or self._lock_timeout
+        holder_task = asyncio.current_task()
+        renewal_task = asyncio.create_task(
+            self._renew_lock_until_released(
+                resource_id, lock.owner_id, lock_timeout
+            )
+        )
+
+        def _abort_on_lost_lock(task: "asyncio.Task[Any]") -> None:
+            # If the renewer raised (lock lease lost) while the critical
+            # section is still running, cancel the holder so it raises
+            # CancelledError instead of continuing to write under a lock
+            # we no longer own. A clean cancel (we cancel the renewer at
+            # exit) is ignored.
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is None:
+                return
+            logging.getLogger(__name__).error(
+                "Lock lease lost for %s owner=%s; aborting critical section: %s",
+                resource_id,
+                lock.owner_id,
+                exc,
+            )
+            if holder_task is not None and not holder_task.done():
+                holder_task.cancel()
+
+        renewal_task.add_done_callback(_abort_on_lost_lock)
+
         try:
             yield
         finally:
+            if not renewal_task.done():
+                renewal_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await renewal_task
+            elif not renewal_task.cancelled():
+                renew_error = renewal_task.exception()
+                if renew_error is not None:
+                    logging.getLogger(__name__).warning(
+                        "Lock renewal stopped for %s owner=%s: %s",
+                        resource_id,
+                        lock.owner_id,
+                        renew_error,
+                    )
             await self.release_lock(resource_id, lock.owner_id)
 
     async def acquire_lock(
@@ -1957,13 +2536,33 @@ class SharedStateCoordinator:
             # Check if existing lock is expired
             existing = await self._store.get_raw(lock_key)
             if existing:
-                lock_data = json.loads(existing)
-                existing_expires = datetime.fromisoformat(
-                    lock_data["expires_at"]
-                )
+                try:
+                    lock_data = json.loads(existing)
+                    existing_expires = datetime.fromisoformat(
+                        lock_data["expires_at"]
+                    )
+                except (
+                    json.JSONDecodeError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    logging.getLogger(__name__).warning(
+                        "Corrupt lock value for %s: %s", lock_key, exc
+                    )
+                    await self._store.compare_and_delete_raw(
+                        lock_key, existing
+                    )
+                    continue
                 if datetime.now(timezone.utc) > existing_expires:
                     # Lock expired, try to take over without deleting a
                     # new owner that acquired between our read and delete.
+                    _incr_metric = getattr(
+                        getattr(self, "_metrics", None),
+                        "increment",
+                        lambda *_: None,
+                    )
+                    _incr_metric("lock.acquire.takeover")
                     await self._store.compare_and_delete_raw(
                         lock_key, existing
                     )
@@ -1979,8 +2578,21 @@ class SharedStateCoordinator:
                     f"after {max_wait}s"
                 )
 
-            # Exponential backoff with jitter
-            await asyncio.sleep(wait_time + random.uniform(0, wait_time))
+            # Exponential backoff with equal-jitter: half the wait is
+            # deterministic and half is uniform. This reduces thundering
+            # herd more predictably than pure full-jitter while still
+            # spreading retries. The RNG does not need to be
+            # cryptographically secure here (non-adversarial scheduling),
+            # so ``random.uniform`` is sufficient.
+            _incr_metric = getattr(
+                getattr(self, "_metrics", None),
+                "increment",
+                lambda *_: None,
+            )
+            _incr_metric("lock.acquire.retry")
+            await asyncio.sleep(
+                wait_time / 2 + random.uniform(0, wait_time / 2)
+            )
             wait_time = min(wait_time * 2, 1.0)
 
     async def release_lock(self, resource_id: str, owner_id: str) -> bool:
@@ -2016,6 +2628,56 @@ class SharedStateCoordinator:
                 resource_id, owner_id,
             )
         return released
+
+    async def refresh_lock(
+        self, resource_id: str, owner_id: str, timeout: int
+    ) -> bool:
+        """Extend a lock lease only if the caller still owns it."""
+        if timeout < 1:
+            raise ValueError("timeout must be >= 1 second")
+        lock_key = f"lock:{resource_id}"
+        expires = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+        # Persist ``expires_at`` as numeric epoch seconds so the field
+        # type matches the EX argument used to set the Redis TTL. The
+        # previous version stored an ISO 8601 string for ``expires_at``
+        # while sending an integer for EX, which made the helper read
+        # back two different types for the same conceptual quantity.
+        script = """
+        local lock_data = redis.call('GET', KEYS[1])
+        if not lock_data then
+            return 0
+        end
+        local ok, data = pcall(cjson.decode, lock_data)
+        if (not ok) or data.owner_id ~= ARGV[1] then
+            return 0
+        end
+        data.expires_at = tonumber(ARGV[2])
+        redis.call('SET', KEYS[1], cjson.encode(data), 'EX', tonumber(ARGV[3]))
+        return 1
+        """
+        return (
+            await self._store.eval_raw(
+                script,
+                1,
+                lock_key,
+                owner_id,
+                str(expires.timestamp()),
+                str(timeout),
+            )
+        ) == 1
+
+    async def _renew_lock_until_released(
+        self, resource_id: str, owner_id: str, timeout: int
+    ) -> None:
+        """Keep a lease alive for long critical sections."""
+        interval = max(0.5, min(timeout / 3, max(timeout - 1, 0.5)))
+        while True:
+            await asyncio.sleep(interval)
+            renewed = await self.refresh_lock(resource_id, owner_id, timeout)
+            if not renewed:
+                raise LockTimeout(
+                    f"Lost lock lease for {resource_id} owner={owner_id}"
+                )
 
     async def read(self, resource_id: str) -> Optional[dict[str, Any]]:
         """Read shared state."""
@@ -2068,7 +2730,23 @@ class SharedStateCoordinator:
                     continue
                 if message.get("type") == "message":
                     data = json.loads(message["data"])
-                    await callback(data)
+                    try:
+                        await asyncio.wait_for(
+                            callback(data),
+                            timeout=self._callback_timeout_seconds,
+                        )
+                    except (
+                        asyncio.TimeoutError,
+                        RuntimeError,
+                        OSError,
+                        ValueError,
+                        TypeError,
+                    ) as exc:
+                        logging.getLogger(__name__).warning(
+                            "change callback failed for %s: %s",
+                            resource_id,
+                            exc,
+                        )
         except asyncio.CancelledError:
             raise
         finally:
@@ -2123,7 +2801,9 @@ class ConflictResolver:
         """
         Merge states by combining values additively.
 
-        Suitable for counters, lists, and other additive structures.
+        Suitable for numeric deltas or CRDT-style counters, lists, and
+        other additive structures. Do not sum full replicated counter
+        values; use a per-writer G-counter/PN-counter for that case.
         """
         merged = {}
         all_keys = set(state_a.keys()) | set(state_b.keys())
@@ -2138,7 +2818,7 @@ class ConflictResolver:
                 if isinstance(val_a, (int, float)) and isinstance(
                     val_b, (int, float)
                 ):
-                    # Sum numeric values
+                    # Sum numeric deltas, not full-state counters.
                     merged[key] = val_a + val_b
                 elif isinstance(val_a, list) and isinstance(val_b, list):
                     # Concatenate and deduplicate lists
@@ -2168,9 +2848,16 @@ class ConflictResolver:
         clock_a = state_a.get("_vclock", {})
         clock_b = state_b.get("_vclock", {})
 
-        # Check if one dominates the other
-        a_dominates = all(clock_a.get(k, 0) >= v for k, v in clock_b.items())
-        b_dominates = all(clock_b.get(k, 0) >= v for k, v in clock_a.items())
+        # Check if one dominates the other across the full clock union.
+        # Missing entries are zero; comparing only the other's keys
+        # incorrectly treats {"A": 1} and {} as identical.
+        clock_keys = set(clock_a.keys()) | set(clock_b.keys())
+        a_dominates = all(
+            clock_a.get(k, 0) >= clock_b.get(k, 0) for k in clock_keys
+        )
+        b_dominates = all(
+            clock_b.get(k, 0) >= clock_a.get(k, 0) for k in clock_keys
+        )
 
         # Identical clocks: same causal version. Returning either
         # (without merging) is correct; merging would double-count
@@ -2200,6 +2887,7 @@ class ConflictResolver:
 from abc import ABC, abstractmethod
 
 
+@total_ordering
 @dataclass
 class StateVersion:
     """Tracks state schema version."""
@@ -2267,12 +2955,30 @@ class StateMigrator:
     migrations to bring state up to current schema version.
     """
 
-    def __init__(self, current_version: StateVersion):
+    def __init__(
+        self,
+        current_version: StateVersion,
+        metrics_callback: Optional[
+            Callable[[str, dict[str, Any]], None]
+        ] = None,
+        max_migrations: int = 512,
+    ) -> None:
+        if max_migrations < 1:
+            raise ValueError("max_migrations must be >= 1")
         self._current_version = current_version
         self._migrations: list[StateMigration] = []
+        self._max_migrations = max_migrations
+        self._metrics_callback = metrics_callback
+        self._logger = logging.getLogger(__name__)
 
     def register_migration(self, migration: StateMigration) -> None:
         """Register a migration."""
+        if len(self._migrations) >= self._max_migrations:
+            raise MigrationError("migration registry is at capacity")
+        if any(m.from_version == migration.from_version for m in self._migrations):
+            raise MigrationError(
+                f"migration from version {migration.from_version} is already registered"
+            )
         self._migrations.append(migration)
         # Keep migrations sorted by from_version
         self._migrations.sort(key=lambda m: m.from_version)
@@ -2353,8 +3059,28 @@ class StateMigrator:
                     stats["migrated"] += 1
                 else:
                     stats["already_current"] += 1
-            except (MigrationError, ValueError, KeyError, TypeError):
+            except (MigrationError, ValueError, KeyError, TypeError) as exc:
                 stats["failed"] += 1
+                failure = {
+                    "key": key,
+                    "from_version": state.get("_schema_version", "1.0"),
+                    "target_version": str(self._current_version),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                self._logger.warning(
+                    "state migration failed",
+                    extra=failure,
+                    exc_info=True,
+                )
+                if self._metrics_callback is not None:
+                    try:
+                        self._metrics_callback("state_migration_failed", failure)
+                    except (RuntimeError, ValueError, TypeError, OSError):
+                        self._logger.exception(
+                            "state migration metrics callback failed",
+                            extra={"key": key},
+                        )
 
         return stats
 
@@ -2456,11 +3182,19 @@ class ConversationRecoveryPipeline:
         backup_store: RedisStateStore,
         audit_log: PostgresTaskStore,
         llm_client: _LLMClient,
-    ):
+        max_reconstruction_events: int = 5_000,
+        max_reconstruction_messages: int = 1_000,
+    ) -> None:
+        if max_reconstruction_events < 1:
+            raise ValueError("max_reconstruction_events must be >= 1")
+        if max_reconstruction_messages < 1:
+            raise ValueError("max_reconstruction_messages must be >= 1")
         self._primary = primary_store
         self._backup = backup_store
         self._audit = audit_log
         self._llm = llm_client
+        self.max_reconstruction_events = max_reconstruction_events
+        self.max_reconstruction_messages = max_reconstruction_messages
 
     async def recover_conversation(
         self, conversation_id: str
@@ -2649,7 +3383,7 @@ class ConversationRecoveryPipeline:
         return True
 
     async def _query_audit_events(
-        self, conversation_id: str
+        self, conversation_id: str, limit: Optional[int] = None
     ) -> list[dict]:
         """Return ordered audit events for a conversation.
 
@@ -2660,30 +3394,59 @@ class ConversationRecoveryPipeline:
         keeps the example runnable without that wiring.
         """
         store = getattr(self, "_audit", None)
-        if store is not None and hasattr(store, "events_for"):
-            events = await store.events_for(conversation_id)
-            return list(events) if events else []
+        events_for = getattr(store, "events_for", None)
+        if callable(events_for):
+            accepts_limit = False
+            if limit is not None:
+                import inspect
+
+                try:
+                    signature = inspect.signature(events_for)
+                except (TypeError, ValueError):
+                    signature = None
+                if signature is not None:
+                    accepts_limit = "limit" in signature.parameters or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+            if limit is not None and accepts_limit:
+                events = await events_for(conversation_id, limit=limit)
+            else:
+                events = await events_for(conversation_id)
+            if not events:
+                return []
+            if limit is None:
+                return list(events)
+            bounded = []
+            for event in events:
+                bounded.append(event)
+                if len(bounded) >= limit:
+                    break
+            return bounded
         return []
 
     async def _reconstruct_from_audit(
         self, conversation_id: str
     ) -> Optional[dict]:
         """Reconstruct conversation from audit log entries."""
-        # Query audit log for all events related to this conversation
-        # This is a simplified representation
-        events = await self._query_audit_events(conversation_id)
+        events = await self._query_audit_events(
+            conversation_id, limit=self.max_reconstruction_events
+        )
 
         if not events:
             return None
 
         messages = []
         for event in events:
-            if event["type"] == "message_added":
+            if len(messages) >= self.max_reconstruction_messages:
+                break
+            if event.get("type") == "message_added":
+                data = event.get("data", {})
                 messages.append(
                     {
-                        "role": event["data"]["role"],
-                        "content": event["data"]["content"],
-                        "timestamp": event["timestamp"],
+                        "role": data.get("role", "user"),
+                        "content": data.get("content", ""),
+                        "timestamp": event.get("timestamp"),
                     }
                 )
 

@@ -20,17 +20,16 @@ provide the surrounding context (imports, dependencies) as needed.
 # Block 1 (chapter listing #1)
 # ============================================================================
 
-"""
-Core data models for the customer service platform.
-These models define the contract between components.
-"""
+# Core data models for the customer service platform.
+# These models define the contract between components.
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Any, Optional
 import inspect
+import textwrap
 import uuid
 
 
@@ -159,7 +158,7 @@ class ConversationContext:
     escalation_reason: Optional[str] = None
     sentiment_score: float = 0.0  # -1 to 1
 
-    def add_tool_result(self, tool_name: str, result: dict[str, Any]):
+    def add_tool_result(self, tool_name: str, result: dict[str, Any]) -> None:
         """Record a tool execution result."""
         self.tool_results.append(
             {
@@ -180,7 +179,7 @@ class Conversation:
     channel: ConversationChannel
     status: ConversationStatus
     context: ConversationContext
-    messages: list[Message] = field(default_factory=list)
+    messages: deque[Message] = field(default_factory=deque)
     created_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -190,6 +189,11 @@ class Conversation:
     resolved_at: Optional[datetime] = None
     quality_score: Optional[float] = None
     turn_count: int = 0
+
+    def __post_init__(self) -> None:
+        self.messages = deque(
+            self.messages, maxlen=self.MAX_IN_MEMORY_MESSAGES
+        )
 
     @classmethod
     def create(
@@ -210,14 +214,16 @@ class Conversation:
             self.conversation_id, role, content, agent_type
         )
         self.messages.append(message)
-        if len(self.messages) > self.MAX_IN_MEMORY_MESSAGES:
-            del self.messages[: -self.MAX_IN_MEMORY_MESSAGES]
         self.updated_at = datetime.now(timezone.utc)
         return message
 
-    def get_history_for_llm(self, max_messages: int = 20) -> list[dict]:
+    def get_history_for_llm(
+        self, max_messages: int = 20
+    ) -> list[dict[str, str]]:
         """Format conversation history for LLM context."""
-        recent = self.messages[-max_messages:]
+        if max_messages < 1:
+            raise ValueError("max_messages must be >= 1")
+        recent = list(self.messages)[-max_messages:]
         return [{"role": m.role, "content": m.content} for m in recent]
 
 
@@ -261,25 +267,24 @@ class EscalationRequest:
     def _summarize_context(conversation: Conversation) -> str:
         """Create a summary for human agents."""
         ctx = conversation.context
-        return f"""
-Customer: {ctx.customer.name} ({ctx.customer.tier} tier)
-Intent: {ctx.intent}
-Sentiment: {"Negative" if ctx.sentiment_score < -0.3 else "Neutral" if ctx.sentiment_score < 0.3 else "Positive"}
-Previous agents: {", ".join(a.value for a in ctx.previous_agents)}
-Key entities: {ctx.extracted_entities}
-        """.strip()
+        return textwrap.dedent(f"""\
+            Customer: {ctx.customer.name} ({ctx.customer.tier} tier)
+            Intent: {ctx.intent}
+            Sentiment: {"Negative" if ctx.sentiment_score < -0.3 else "Neutral" if ctx.sentiment_score < 0.3 else "Positive"}
+            Previous agents: {", ".join(a.value for a in ctx.previous_agents)}
+            Key entities: {ctx.extracted_entities}
+            """).strip()
 
 # ============================================================================
 # Block 2 (chapter listing #2)
 # ============================================================================
 
-"""
-Configuration management for the customer service platform.
-Uses environment-based configuration with sensible defaults.
-"""
+# Configuration management for the customer service platform.
+# Uses environment-based configuration with sensible defaults.
 
 from dataclasses import dataclass, field
 from typing import Optional
+import json
 import os
 
 
@@ -292,6 +297,14 @@ class LLMConfig:
     max_tokens: int = 4096
     temperature: float = 0.3
     timeout_seconds: int = 30
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        if self.max_tokens <= 0:
+            raise ValueError("max_tokens must be > 0")
+        if not 0.0 <= self.temperature <= 2.0:
+            raise ValueError("temperature must be between 0.0 and 2.0")
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
@@ -314,12 +327,24 @@ class AgentConfig:
     confidence_threshold: float = 0.7
     escalation_threshold: int = 3  # Failed attempts before escalation
     timeout_seconds: float = 30.0
+    model: str = "claude-sonnet-4-20250514"
+    max_tokens: int = 2048
     max_transient_retries: int = 1
     llm_retry_backoff_seconds: float = 1.5
     tools: list[str] = field(default_factory=list)
     system_prompt_template: str = ""
 
     def __post_init__(self) -> None:
+        if self.max_turns < 1:
+            raise ValueError("max_turns must be >= 1")
+        if not 0 <= self.confidence_threshold <= 1:
+            raise ValueError("confidence_threshold must be between 0 and 1")
+        if self.escalation_threshold < 0:
+            raise ValueError("escalation_threshold must be >= 0")
+        if self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        if self.max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
         if self.max_transient_retries < 0:
             raise ValueError("max_transient_retries must be >= 0")
         if self.llm_retry_backoff_seconds < 0:
@@ -358,14 +383,64 @@ class IntegrationConfig:
 
 
 @dataclass
+class HTTPClientConfig:
+    """Shared HTTP client settings for platform integrations."""
+
+    timeout_seconds: float = 10.0
+    connect_timeout_seconds: float = 2.0
+    read_timeout_seconds: float = 10.0
+    write_timeout_seconds: float = 5.0
+    max_connections: int = 50
+    max_keepalive_connections: int = 20
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        if self.connect_timeout_seconds <= 0:
+            raise ValueError("connect_timeout_seconds must be > 0")
+        if self.read_timeout_seconds <= 0:
+            raise ValueError("read_timeout_seconds must be > 0")
+        if self.write_timeout_seconds <= 0:
+            raise ValueError("write_timeout_seconds must be > 0")
+        if self.max_connections < 1:
+            raise ValueError("max_connections must be >= 1")
+        if self.max_keepalive_connections < 0:
+            raise ValueError("max_keepalive_connections must be >= 0")
+        if self.max_keepalive_connections > self.max_connections:
+            raise ValueError(
+                "max_keepalive_connections must be <= max_connections"
+            )
+
+    @classmethod
+    def from_env(cls) -> "HTTPClientConfig":
+        return cls(
+            timeout_seconds=float(os.getenv("HTTP_TIMEOUT_SECONDS", "10")),
+            connect_timeout_seconds=float(
+                os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "2")
+            ),
+            read_timeout_seconds=float(os.getenv("HTTP_READ_TIMEOUT_SECONDS", "10")),
+            write_timeout_seconds=float(os.getenv("HTTP_WRITE_TIMEOUT_SECONDS", "5")),
+            max_connections=int(os.getenv("HTTP_MAX_CONNECTIONS", "50")),
+            max_keepalive_connections=int(
+                os.getenv("HTTP_MAX_KEEPALIVE_CONNECTIONS", "20")
+            ),
+        )
+
+
+@dataclass
 class QualityConfig:
     """Configuration for quality assurance."""
 
     min_satisfaction_score: float = 4.0
     max_handle_time_seconds: int = 480
+    max_first_response_ms: int = 30_000
+    min_automation_rate: float = 70.0
+    max_escalation_rate: float = 15.0
     sample_rate_for_review: float = 0.1
     sentiment_alert_threshold: float = -0.5
     assessment_timeout_seconds: float = 30.0
+    assessment_model: str = "claude-sonnet-4-20250514"
+    assessment_max_tokens: int = 200
 
     @classmethod
     def from_env(cls) -> "QualityConfig":
@@ -374,12 +449,23 @@ class QualityConfig:
                 os.getenv("MIN_SATISFACTION", "4.0")
             ),
             max_handle_time_seconds=int(os.getenv("MAX_HANDLE_TIME", "480")),
+            max_first_response_ms=int(
+                os.getenv("MAX_FIRST_RESPONSE_MS", "30000")
+            ),
+            min_automation_rate=float(os.getenv("MIN_AUTOMATION_RATE", "70")),
+            max_escalation_rate=float(os.getenv("MAX_ESCALATION_RATE", "15")),
             sample_rate_for_review=float(os.getenv("SAMPLE_RATE", "0.1")),
             sentiment_alert_threshold=float(
                 os.getenv("SENTIMENT_ALERT", "-0.5")
             ),
             assessment_timeout_seconds=float(
                 os.getenv("QA_ASSESSMENT_TIMEOUT", "30")
+            ),
+            assessment_model=os.getenv(
+                "QA_ASSESSMENT_MODEL", "claude-sonnet-4-20250514"
+            ),
+            assessment_max_tokens=int(
+                os.getenv("QA_ASSESSMENT_MAX_TOKENS", "200")
             ),
         )
 
@@ -392,6 +478,7 @@ class PlatformConfig:
     integrations: IntegrationConfig = field(
         default_factory=IntegrationConfig.from_env
     )
+    http: HTTPClientConfig = field(default_factory=HTTPClientConfig.from_env)
     quality: QualityConfig = field(default_factory=QualityConfig.from_env)
     agents: dict[str, AgentConfig] = field(default_factory=dict)
 
@@ -399,6 +486,35 @@ class PlatformConfig:
     def load(cls, config_path: Optional[str] = None) -> "PlatformConfig":
         """Load configuration from environment and optional file."""
         config = cls()
+        file_config = {}
+        if config_path:
+            with open(config_path, encoding="utf-8") as f:
+                file_config = json.load(f)
+
+            def merge(instance: Any, values: dict[str, Any]) -> Any:
+                allowed = instance.__dataclass_fields__
+                merged = {
+                    **instance.__dict__,
+                    **{
+                        key: value
+                        for key, value in values.items()
+                        if key in allowed
+                    },
+                }
+                return type(instance)(**merged)
+
+            if "llm" in file_config:
+                config.llm = merge(config.llm, file_config["llm"])
+            if "integrations" in file_config:
+                config.integrations = merge(
+                    config.integrations, file_config["integrations"]
+                )
+            if "http" in file_config:
+                config.http = merge(config.http, file_config["http"])
+            if "quality" in file_config:
+                config.quality = merge(
+                    config.quality, file_config["quality"]
+                )
 
         # Define default agent configurations
         config.agents = {
@@ -406,11 +522,15 @@ class PlatformConfig:
                 agent_type="triage",
                 max_turns=3,
                 confidence_threshold=0.8,
+                model=config.llm.model,
+                max_tokens=config.llm.max_tokens,
                 tools=["identify_customer", "classify_intent"],
             ),
             "order": AgentConfig(
                 agent_type="order",
                 max_turns=10,
+                model=config.llm.model,
+                max_tokens=config.llm.max_tokens,
                 tools=[
                     "get_order_status",
                     "get_order_details",
@@ -422,6 +542,8 @@ class PlatformConfig:
             "technical": AgentConfig(
                 agent_type="technical",
                 max_turns=15,
+                model=config.llm.model,
+                max_tokens=config.llm.max_tokens,
                 tools=[
                     "search_knowledge_base",
                     "run_diagnostic",
@@ -432,6 +554,8 @@ class PlatformConfig:
             "billing": AgentConfig(
                 agent_type="billing",
                 max_turns=10,
+                model=config.llm.model,
+                max_tokens=config.llm.max_tokens,
                 tools=[
                     "get_account_balance",
                     "get_payment_history",
@@ -442,6 +566,8 @@ class PlatformConfig:
             "escalation": AgentConfig(
                 agent_type="escalation",
                 max_turns=5,
+                model=config.llm.model,
+                max_tokens=config.llm.max_tokens,
                 tools=[
                     "create_escalation_ticket",
                     "find_available_agent",
@@ -450,16 +576,23 @@ class PlatformConfig:
             ),
         }
 
+        for name, values in file_config.get("agents", {}).items():
+            base = config.agents.get(name, AgentConfig(agent_type=name))
+            allowed = base.__dataclass_fields__
+            merged = {
+                **base.__dict__,
+                **{key: value for key, value in values.items() if key in allowed},
+            }
+            config.agents[name] = AgentConfig(**merged)
+
         return config
 
 # ============================================================================
 # Block 3 (chapter listing #3)
 # ============================================================================
 
-"""
-Tool framework for customer service agents.
-Provides a consistent interface for all tool implementations.
-"""
+# Tool framework for customer service agents.
+# Provides a consistent interface for all tool implementations.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -486,7 +619,7 @@ class ToolParameter:
     description: str
     required: bool = True
     default: Any = None
-    enum: Optional[list] = None
+    enum: Optional[list[str | int | float | bool]] = None
 
 
 @dataclass
@@ -499,7 +632,7 @@ class ToolDefinition:
     requires_confirmation: bool = False
     audit_level: str = "standard"  # minimal, standard, detailed
 
-    def to_anthropic_schema(self) -> dict:
+    def to_anthropic_schema(self) -> dict[str, Any]:
         """Convert to Anthropic tool schema format."""
         properties = {}
         required = []
@@ -533,7 +666,7 @@ class ToolResult:
     data: Any
     error: Optional[str] = None
     execution_time_ms: float = 0.0
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_llm_response(self) -> str:
         """Format result for LLM consumption."""
@@ -542,6 +675,38 @@ class ToolResult:
                 return json.dumps(self.data, indent=2, default=str)
             return str(self.data)
         return f"Error: {self.error}"
+
+
+@dataclass(frozen=True)
+class ToolExecutionSettings:
+    """Shared retry and timeout settings for HTTP/LLM-backed tools."""
+
+    max_attempts: int = 3
+    timeout_seconds: float = 10.0
+    retry_backoff_seconds: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        if self.retry_backoff_seconds < 0:
+            raise ValueError("retry_backoff_seconds must be >= 0")
+
+
+ORDER_MUTATION_TOOL_SETTINGS = ToolExecutionSettings(timeout_seconds=15.0)
+RETURN_TOOL_SETTINGS = ToolExecutionSettings(timeout_seconds=20.0)
+TRACKING_TOOL_SETTINGS = ToolExecutionSettings(
+    max_attempts=2, retry_backoff_seconds=1.0
+)
+BILLING_READ_TOOL_SETTINGS = ToolExecutionSettings()
+REFUND_TOOL_SETTINGS = ToolExecutionSettings(
+    timeout_seconds=30.0, retry_backoff_seconds=0.5
+)
+SUPPORT_SEARCH_TOOL_SETTINGS = ToolExecutionSettings()
+DIAGNOSTIC_TOOL_SETTINGS = ToolExecutionSettings(timeout_seconds=60.0)
+CRM_LOOKUP_TOOL_SETTINGS = ToolExecutionSettings()
+INTENT_CLASSIFIER_TOOL_SETTINGS = ToolExecutionSettings()
 
 
 class Tool(ABC):
@@ -554,11 +719,11 @@ class Tool(ABC):
         pass
 
     @abstractmethod
-    async def execute(self, **kwargs) -> ToolResult:
+    async def execute(self, **kwargs: Any) -> ToolResult:
         """Execute the tool with given parameters."""
         pass
 
-    def validate_params(self, **kwargs) -> Optional[str]:
+    def validate_params(self, **kwargs: Any) -> Optional[str]:
         """Validate parameters against definition. Returns error message if invalid."""
         type_checks = {
             "string": lambda value: isinstance(value, str),
@@ -600,6 +765,8 @@ def with_retry(
 
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
+    if backoff_seconds < 0:
+        raise ValueError("backoff_seconds must be >= 0")
 
     # Errors that are worth retrying. httpx raises ReadTimeout /
     # ConnectTimeout / ConnectError; non-2xx responses surface as
@@ -614,40 +781,100 @@ def with_retry(
         httpx.RemoteProtocolError,
     )
 
+    def _provider_retryable_classes() -> tuple[type[BaseException], ...]:
+        provider = globals().get("anthropic")
+        if provider is None:
+            return ()
+        classes: list[type[BaseException]] = []
+        for name in (
+            "APITimeoutError",
+            "RateLimitError",
+            "APIConnectionError",
+        ):
+            cls = getattr(provider, name, None)
+            if isinstance(cls, type) and issubclass(cls, BaseException):
+                classes.append(cls)
+        return tuple(classes)
+
+    # Resolve provider-specific retryable classes once at decorator
+    # construction time; the SDK module cannot appear mid-process, so
+    # there is no value in re-probing the global on every exception.
+    _cached_provider_retryable: tuple[type[BaseException], ...] = (
+        _provider_retryable_classes()
+    )
+
     def _is_retryable(exc: Exception) -> bool:
-        if isinstance(exc, _retryable_classes):
+        if isinstance(exc, _retryable_classes + _cached_provider_retryable):
             return True
         if isinstance(exc, httpx.HTTPStatusError):
-            # 5xx is server-side transient; 4xx is client-side
-            # permanent (auth, validation, rate-limit-shape).
-            return 500 <= exc.response.status_code < 600
+            # 429 is explicit backpressure. Retry it with backoff (and
+            # Retry-After when present); other 4xx statuses are permanent
+            # caller-side failures.
+            return (
+                exc.response.status_code == 429
+                or 500 <= exc.response.status_code < 600
+            )
         return False
+
+    def _retry_delay_seconds(exc: BaseException, attempt: int) -> float:
+        if isinstance(exc, httpx.HTTPStatusError):
+            retry_after = exc.response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return max(0.0, float(retry_after))
+                except ValueError:
+                    from email.utils import parsedate_to_datetime
+
+                    try:
+                        retry_at = parsedate_to_datetime(retry_after)
+                    except (TypeError, ValueError, IndexError, OverflowError):
+                        pass
+                    else:
+                        if retry_at.tzinfo is None:
+                            retry_at = retry_at.replace(tzinfo=timezone.utc)
+                        return max(
+                            0.0,
+                            (
+                                retry_at
+                                - datetime.now(timezone.utc)
+                            ).total_seconds(),
+                        )
+        return backoff_seconds * (2**attempt)
 
     def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         @functools.wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-            last_error = None
+            last_error: Optional[BaseException] = None
             for attempt in range(max_attempts):
+                handled_classes = (
+                    _retryable_classes
+                    + _cached_provider_retryable
+                    + (httpx.HTTPStatusError,)
+                )
                 try:
                     return await func(*args, **kwargs)
-                except (*_retryable_classes, httpx.HTTPStatusError) as e:
+                except handled_classes as e:
                     last_error = e
                     if not _is_retryable(e):
                         # Permanent: don't waste retries on it.
                         raise
                     if attempt < max_attempts - 1:
-                        await asyncio.sleep(backoff_seconds * (2**attempt))
+                        await asyncio.sleep(_retry_delay_seconds(e, attempt))
                         logger.warning(
                             f"Retry {attempt + 1} for {func.__name__}: {e}"
                         )
-            raise last_error
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("retry loop exited without an exception")
 
         return wrapper
 
     return decorator
 
 
-def with_timeout(seconds: float):
+def with_timeout(
+    seconds: float,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
     """Decorator for adding a timeout to tool executions.
 
     Raises ``asyncio.TimeoutError`` on expiry so that an outer
@@ -655,10 +882,12 @@ def with_timeout(seconds: float):
     ToolResult-on-timeout instead of an exception should wrap the
     decorated function and convert.
     """
+    if seconds <= 0:
+        raise ValueError("seconds must be > 0")
 
-    def decorator(func: Callable):
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             return await asyncio.wait_for(
                 func(*args, **kwargs), timeout=seconds
             )
@@ -671,10 +900,8 @@ def with_timeout(seconds: float):
 # Block 4 (chapter listing #4)
 # ============================================================================
 
-"""
-Tools for order-related operations.
-Integrates with the order management system.
-"""
+# Tools for order-related operations.
+# Integrates with the order management system.
 
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -684,8 +911,23 @@ import httpx
 class OrderStatusTool(Tool):
     """Get the current status of an order."""
 
-    def __init__(self, orders_client: httpx.AsyncClient):
+    def __init__(
+        self,
+        orders_client: httpx.AsyncClient,
+        max_attempts: int = 3,
+        timeout_seconds: float = 10.0,
+        retry_backoff_seconds: float = 1.0,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        if retry_backoff_seconds < 0:
+            raise ValueError("retry_backoff_seconds must be >= 0")
         self.client = orders_client
+        self.max_attempts = max_attempts
+        self.timeout_seconds = timeout_seconds
+        self.retry_backoff_seconds = retry_backoff_seconds
 
     @property
     def definition(self) -> ToolDefinition:
@@ -702,11 +944,14 @@ class OrderStatusTool(Tool):
             audit_level="standard",
         )
 
-    # Retry outer, timeout per-attempt: each retry gets a fresh 10 s budget
-    # rather than sharing one budget across all attempts.
-    @with_retry(max_attempts=3)
-    @with_timeout(10.0)
     async def execute(self, order_id: str) -> ToolResult:
+        operation = with_retry(
+            max_attempts=self.max_attempts,
+            backoff_seconds=self.retry_backoff_seconds,
+        )(with_timeout(self.timeout_seconds)(self._execute_once))
+        return await operation(order_id=order_id)
+
+    async def _execute_once(self, order_id: str) -> ToolResult:
         start = datetime.now(timezone.utc)
 
         validation_error = self.validate_params(order_id=order_id)
@@ -719,6 +964,23 @@ class OrderStatusTool(Tool):
             response = await self.client.get(f"/orders/{order_id}")
             response.raise_for_status()
             order_data = response.json()
+            if not isinstance(order_data, dict):
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error="Order service returned a non-object payload",
+                )
+            required = {"id", "status", "total", "created_at"}
+            missing = sorted(required - set(order_data))
+            if missing:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=(
+                        "Order service response missing fields: "
+                        + ", ".join(missing)
+                    ),
+                )
 
             # Transform to customer-friendly format
             result = {
@@ -773,7 +1035,9 @@ class OrderStatusTool(Tool):
 class ModifyOrderTool(Tool):
     """Modify an existing order."""
 
-    def __init__(self, orders_client: httpx.AsyncClient):
+    def __init__(self, orders_client: httpx.AsyncClient) -> None:
+        if orders_client is None:
+            raise ValueError("orders_client is required")
         self.client = orders_client
 
     @property
@@ -803,10 +1067,13 @@ class ModifyOrderTool(Tool):
             audit_level="detailed",
         )
 
-    @with_retry(max_attempts=3, backoff_seconds=0.25)
-    @with_timeout(15.0)
+    @with_retry(
+        max_attempts=ORDER_MUTATION_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=ORDER_MUTATION_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(ORDER_MUTATION_TOOL_SETTINGS.timeout_seconds)
     async def execute(
-        self, order_id: str, action: str, details: dict
+        self, order_id: str, action: str, details: dict[str, Any]
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
         if not isinstance(details, dict):
@@ -849,6 +1116,12 @@ class ModifyOrderTool(Tool):
             check_response.raise_for_status()
 
             order = check_response.json()
+            if not isinstance(order, dict) or "status" not in order:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error="Order service response missing status",
+                )
             if order["status"] in ["shipped", "in_transit", "delivered"]:
                 return ToolResult(
                     success=False,
@@ -905,7 +1178,9 @@ class ModifyOrderTool(Tool):
 class InitiateReturnTool(Tool):
     """Start the return process for an order."""
 
-    def __init__(self, orders_client: httpx.AsyncClient):
+    def __init__(self, orders_client: httpx.AsyncClient) -> None:
+        if orders_client is None:
+            raise ValueError("orders_client is required")
         self.client = orders_client
 
     @property
@@ -954,14 +1229,17 @@ class InitiateReturnTool(Tool):
             audit_level="detailed",
         )
 
-    @with_retry(max_attempts=3, backoff_seconds=0.25)
-    @with_timeout(20.0)
+    @with_retry(
+        max_attempts=RETURN_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=RETURN_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(RETURN_TOOL_SETTINGS.timeout_seconds)
     async def execute(
         self,
         order_id: str,
         reason: str,
-        item_ids: list = None,
-        reason_details: str = None,
+        item_ids: Optional[list] = None,
+        reason_details: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
@@ -1049,7 +1327,9 @@ class InitiateReturnTool(Tool):
 class TrackShipmentTool(Tool):
     """Track shipment status with carrier."""
 
-    def __init__(self, shipping_client: httpx.AsyncClient):
+    def __init__(self, shipping_client: httpx.AsyncClient) -> None:
+        if shipping_client is None:
+            raise ValueError("shipping_client is required")
         self.client = shipping_client
 
     @property
@@ -1074,10 +1354,13 @@ class TrackShipmentTool(Tool):
             audit_level="minimal",
         )
 
-    @with_retry(max_attempts=2)
-    @with_timeout(10.0)
+    @with_retry(
+        max_attempts=TRACKING_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=TRACKING_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(TRACKING_TOOL_SETTINGS.timeout_seconds)
     async def execute(
-        self, tracking_number: str, carrier: str = None
+        self, tracking_number: str, carrier: Optional[str] = None
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
 
@@ -1136,17 +1419,15 @@ class TrackShipmentTool(Tool):
 # Block 5 (chapter listing #5)
 # ============================================================================
 
-"""
-Tools for billing and payment operations.
-Implements patterns that support PCI-DSS compliance requirements.
-Note: Full PCI-DSS compliance requires organizational controls beyond code.
-"""
+# Tools for billing and payment operations.
+# Implements patterns that support PCI-DSS compliance requirements.
+# Note: Full PCI-DSS compliance requires organizational controls beyond code.
 
 
 class GetAccountBalanceTool(Tool):
     """Get customer account balance and payment status."""
 
-    def __init__(self, billing_client: httpx.AsyncClient):
+    def __init__(self, billing_client: httpx.AsyncClient) -> None:
         self.client = billing_client
 
     @property
@@ -1164,8 +1445,11 @@ class GetAccountBalanceTool(Tool):
             audit_level="standard",
         )
 
-    @with_retry(max_attempts=3, backoff_seconds=0.25)
-    @with_timeout(10.0)
+    @with_retry(
+        max_attempts=BILLING_READ_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=BILLING_READ_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(BILLING_READ_TOOL_SETTINGS.timeout_seconds)
     async def execute(self, customer_id: str) -> ToolResult:
         start = datetime.now(timezone.utc)
 
@@ -1211,7 +1495,7 @@ class GetAccountBalanceTool(Tool):
 class ProcessRefundTool(Tool):
     """Process a refund for a customer."""
 
-    def __init__(self, billing_client: httpx.AsyncClient):
+    def __init__(self, billing_client: httpx.AsyncClient) -> None:
         self.client = billing_client
 
     @property
@@ -1259,8 +1543,11 @@ class ProcessRefundTool(Tool):
             audit_level="detailed",
         )
 
-    @with_retry(max_attempts=3, backoff_seconds=0.5)
-    @with_timeout(30.0)
+    @with_retry(
+        max_attempts=REFUND_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=REFUND_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(REFUND_TOOL_SETTINGS.timeout_seconds)
     async def execute(
         self,
         customer_id: str,
@@ -1271,35 +1558,40 @@ class ProcessRefundTool(Tool):
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
 
-        # Validate refund amount against order
-        order_response = await self.client.get(f"/orders/{order_id}")
-        if order_response.status_code == 404:
-            return ToolResult(
-                success=False, data=None, error=f"Order {order_id} not found"
-            )
-        order_response.raise_for_status()
-
-        order = order_response.json()
-        max_refundable = order["total"] - order.get("refunded_amount", 0)
-
-        if amount > max_refundable:
-            return ToolResult(
-                success=False,
-                data=None,
-                error=f"Refund amount ({amount}) exceeds maximum refundable ({max_refundable})",
-            )
-
-        if not idempotency_key:
-            return ToolResult(
-                success=False,
-                data=None,
-                error=(
-                    "idempotency_key is required for refund side effects; "
-                    "derive it from the conversation action id"
-                ),
-            )
-
         try:
+            # Validate refund amount against order
+            order_response = await self.client.get(f"/orders/{order_id}")
+            if order_response.status_code == 404:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=f"Order {order_id} not found",
+                )
+            order_response.raise_for_status()
+
+            order = order_response.json()
+            max_refundable = order["total"] - order.get("refunded_amount", 0)
+
+            if amount > max_refundable:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=(
+                        f"Refund amount ({amount}) exceeds maximum "
+                        f"refundable ({max_refundable})"
+                    ),
+                )
+
+            if not idempotency_key:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=(
+                        "idempotency_key is required for refund side effects; "
+                        "derive it from the conversation action id"
+                    ),
+                )
+
             refund_request = {
                 "customer_id": customer_id,
                 "order_id": order_id,
@@ -1341,7 +1633,7 @@ class ProcessRefundTool(Tool):
 class GetPaymentHistoryTool(Tool):
     """Get customer payment history."""
 
-    def __init__(self, billing_client: httpx.AsyncClient):
+    def __init__(self, billing_client: httpx.AsyncClient) -> None:
         self.client = billing_client
 
     @property
@@ -1365,8 +1657,11 @@ class GetPaymentHistoryTool(Tool):
             audit_level="standard",
         )
 
-    @with_retry(max_attempts=3, backoff_seconds=0.25)
-    @with_timeout(10.0)
+    @with_retry(
+        max_attempts=BILLING_READ_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=BILLING_READ_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(BILLING_READ_TOOL_SETTINGS.timeout_seconds)
     async def execute(self, customer_id: str, limit: int = 10) -> ToolResult:
         start = datetime.now(timezone.utc)
 
@@ -1423,17 +1718,22 @@ class GetPaymentHistoryTool(Tool):
 # Block 6 (chapter listing #6)
 # ============================================================================
 
-"""
-Tools for technical support operations.
-Integrates with knowledge base and diagnostic systems.
-"""
+# Tools for technical support operations.
+# Integrates with knowledge base and diagnostic systems.
 
 
 class SearchKnowledgeBaseTool(Tool):
     """Search the product knowledge base."""
 
-    def __init__(self, kb_client: httpx.AsyncClient):
+    def __init__(
+        self, kb_client: httpx.AsyncClient, max_results: int = 5
+    ) -> None:
+        if kb_client is None:
+            raise ValueError("kb_client is required")
+        if max_results < 1:
+            raise ValueError("max_results must be >= 1")
         self.client = kb_client
+        self.max_results = max_results
 
     @property
     def definition(self) -> ToolDefinition:
@@ -1468,18 +1768,21 @@ class SearchKnowledgeBaseTool(Tool):
             audit_level="minimal",
         )
 
-    @with_retry(max_attempts=3, backoff_seconds=0.25)
-    @with_timeout(10.0)
+    @with_retry(
+        max_attempts=SUPPORT_SEARCH_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=SUPPORT_SEARCH_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(SUPPORT_SEARCH_TOOL_SETTINGS.timeout_seconds)
     async def execute(
         self,
         query: str,
-        product_category: str = None,
-        article_type: str = None,
+        product_category: Optional[str] = None,
+        article_type: Optional[str] = None,
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
 
         try:
-            params = {"q": query, "limit": 5}
+            params = {"q": query, "limit": self.max_results}
             if product_category:
                 params["category"] = product_category
             if article_type:
@@ -1530,7 +1833,7 @@ class SearchKnowledgeBaseTool(Tool):
 class RunDiagnosticTool(Tool):
     """Run automated diagnostics for a customer's product."""
 
-    def __init__(self, diagnostic_client: httpx.AsyncClient):
+    def __init__(self, diagnostic_client: httpx.AsyncClient) -> None:
         self.client = diagnostic_client
 
     @property
@@ -1566,9 +1869,16 @@ class RunDiagnosticTool(Tool):
             audit_level="standard",
         )
 
-    @with_timeout(60.0)  # Diagnostics can take longer
+    @with_retry(
+        max_attempts=DIAGNOSTIC_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=DIAGNOSTIC_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(DIAGNOSTIC_TOOL_SETTINGS.timeout_seconds)
     async def execute(
-        self, customer_id: str, diagnostic_type: str, product_id: str = None
+        self,
+        customer_id: str,
+        diagnostic_type: str,
+        product_id: Optional[str] = None,
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
 
@@ -1629,16 +1939,16 @@ class RunDiagnosticTool(Tool):
 # Block 7 (chapter listing #7)
 # ============================================================================
 
-"""
-Tools for CRM operations.
-Used by all agents for customer context.
-"""
+# Tools for CRM operations.
+# Used by all agents for customer context.
 
 
 class IdentifyCustomerTool(Tool):
     """Identify and authenticate a customer."""
 
-    def __init__(self, crm_client: httpx.AsyncClient):
+    def __init__(self, crm_client: httpx.AsyncClient) -> None:
+        if crm_client is None:
+            raise ValueError("crm_client is required")
         self.client = crm_client
 
     @property
@@ -1663,10 +1973,13 @@ class IdentifyCustomerTool(Tool):
             audit_level="detailed",
         )
 
-    @with_retry(max_attempts=3, backoff_seconds=0.25)
-    @with_timeout(10.0)
+    @with_retry(
+        max_attempts=CRM_LOOKUP_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=CRM_LOOKUP_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(CRM_LOOKUP_TOOL_SETTINGS.timeout_seconds)
     async def execute(
-        self, identifier: str, identifier_type: str = None
+        self, identifier: str, identifier_type: Optional[str] = None
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
 
@@ -1728,8 +2041,19 @@ class IdentifyCustomerTool(Tool):
 class ClassifyIntentTool(Tool):
     """Classify customer intent from their message."""
 
-    def __init__(self, llm_client):
+    def __init__(
+        self,
+        llm_client: "anthropic.AsyncAnthropic",
+        model: str = "claude-sonnet-4-20250514",
+        max_tokens: int = 200,
+    ) -> None:
+        if not model:
+            raise ValueError("model must be non-empty")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
         self.llm_client = llm_client
+        self.model = model
+        self.max_tokens = max_tokens
 
     @property
     def definition(self) -> ToolDefinition:
@@ -1752,10 +2076,13 @@ class ClassifyIntentTool(Tool):
             audit_level="standard",
         )
 
-    @with_retry(max_attempts=3, backoff_seconds=0.25)
-    @with_timeout(10.0)
+    @with_retry(
+        max_attempts=INTENT_CLASSIFIER_TOOL_SETTINGS.max_attempts,
+        backoff_seconds=INTENT_CLASSIFIER_TOOL_SETTINGS.retry_backoff_seconds,
+    )
+    @with_timeout(INTENT_CLASSIFIER_TOOL_SETTINGS.timeout_seconds)
     async def execute(
-        self, message: str, conversation_context: str = None
+        self, message: str, conversation_context: Optional[str] = None
     ) -> ToolResult:
         start = datetime.now(timezone.utc)
 
@@ -1781,8 +2108,8 @@ Respond with JSON only:
 
         try:
             response = await self.llm_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=200,
+                model=self.model,
+                max_tokens=self.max_tokens,
                 messages=[{"role": "user", "content": classification_prompt}],
             )
 
@@ -1844,18 +2171,64 @@ Respond with JSON only:
 # Block 8 (chapter listing #8)
 # ============================================================================
 
-"""
-Base agent implementation providing common capabilities.
-All specialized agents inherit from this class.
-"""
+# Base agent implementation providing common capabilities.
+# All specialized agents inherit from this class.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+import asyncio
 import json
 import logging
-import anthropic
+import textwrap
+import threading
+
+try:  # Optional provider SDK; keep this module importable without it.
+    import anthropic  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - dependency not required for examples
+    class _AnthropicStub:
+        """Fallback shim so ``except anthropic.*`` clauses still resolve.
+
+        When the real ``anthropic`` SDK is not installed, code paths that
+        catch provider exceptions would otherwise raise ``NameError`` at
+        except-evaluation time and skip their fallback (e.g., returning a
+        neutral quality score). The stub exposes the exception names this
+        module references; the stub classes never actually fire because no
+        real call site can raise them.
+        """
+
+        class APITimeoutError(Exception):
+            pass
+
+        class RateLimitError(Exception):
+            pass
+
+        class APIConnectionError(Exception):
+            pass
+
+        class APIError(Exception):
+            pass
+
+        class AuthenticationError(Exception):
+            pass
+
+        class BadRequestError(Exception):
+            pass
+
+        class _MissingClient:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                raise ImportError(
+                    "anthropic package is required for LLM client creation"
+                )
+
+        class AsyncAnthropic(_MissingClient):
+            pass
+
+        class Anthropic(_MissingClient):
+            pass
+
+    anthropic = _AnthropicStub  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -1866,14 +2239,65 @@ class AgentResponse:
 
     message: str
     agent_type: AgentType
-    tool_calls: list[dict] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
     should_transfer: bool = False
     transfer_to: Optional[AgentType] = None
     transfer_reason: Optional[str] = None
     should_escalate: bool = False
     escalation_reason: Optional[str] = None
     confidence: float = 1.0
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class ProviderCircuitBreaker:
+    """Small fail-fast circuit breaker for provider outages.
+
+    Dual-context concurrency contract: state mutations (_failures,
+    _open_until) are guarded by a ``threading.Lock`` so synchronous
+    callers running on worker threads see a consistent view. An
+    ``asyncio.Lock`` is exposed via ``async_lock`` for cooperative
+    callers that want to serialize their own check-then-act sequences
+    around ``allow_request``/``record_failure``. Both locks must be
+    held by the same logical caller; do not interleave sync and async
+    mutators on the same instance from different threads without
+    additional coordination at the call site.
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        open_seconds: float = 30.0,
+    ) -> None:
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be >= 1")
+        if open_seconds <= 0:
+            raise ValueError("open_seconds must be > 0")
+        self.failure_threshold = failure_threshold
+        self.open_seconds = open_seconds
+        self._failures = 0
+        self._open_until: Optional[datetime] = None
+        self._lock = threading.Lock()
+        self.async_lock = asyncio.Lock()
+
+    def allow_request(self) -> bool:
+        with self._lock:
+            return (
+                self._open_until is None
+                or datetime.now(timezone.utc) >= self._open_until
+            )
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._open_until = None
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self.failure_threshold:
+                self._open_until = datetime.now(timezone.utc) + timedelta(
+                    seconds=self.open_seconds
+                )
 
 
 class BaseAgent(ABC):
@@ -1891,10 +2315,11 @@ class BaseAgent(ABC):
         config: AgentConfig,
         tools: list[Tool],
         llm_client: anthropic.AsyncAnthropic,
-    ):
+    ) -> None:
         self.config = config
         self.tools = {tool.definition.name: tool for tool in tools}
         self.llm_client = llm_client
+        self._llm_circuit = ProviderCircuitBreaker()
 
     @property
     @abstractmethod
@@ -1908,12 +2333,32 @@ class BaseAgent(ABC):
         """Return the agent's system prompt."""
         pass
 
-    def get_tool_schemas(self) -> list[dict]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Get tool schemas for LLM."""
         return [
             tool.definition.to_anthropic_schema()
             for tool in self.tools.values()
         ]
+
+    async def _create_llm_message(self, **kwargs: Any) -> Any:
+        """Call the provider through timeout, retry, and circuit controls."""
+        if not self._llm_circuit.allow_request():
+            raise RuntimeError("LLM provider circuit breaker is open")
+        try:
+            response = await asyncio.wait_for(
+                self.llm_client.messages.create(**kwargs),
+                timeout=self.config.timeout_seconds,
+            )
+            self._llm_circuit.record_success()
+            return response
+        except (
+            anthropic.APITimeoutError,
+            anthropic.RateLimitError,
+            anthropic.APIConnectionError,
+            asyncio.TimeoutError,
+        ):
+            self._llm_circuit.record_failure()
+            raise
 
     async def process_message(
         self, conversation: Conversation, user_message: str
@@ -1948,19 +2393,12 @@ class BaseAgent(ABC):
         response = None
         for attempt in range(max_transient_retries + 1):
             try:
-                response = await asyncio.wait_for(
-                    self.llm_client.messages.create(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=(
-                            self.config.max_tokens
-                            if hasattr(self.config, "max_tokens")
-                            else 2048
-                        ),
-                        system=self.system_prompt,
-                        tools=self.get_tool_schemas(),
-                        messages=messages,
-                        timeout=self.config.timeout_seconds,
-                    ),
+                response = await self._create_llm_message(
+                    model=self.config.model,
+                    max_tokens=self.config.max_tokens,
+                    system=self.system_prompt,
+                    tools=self.get_tool_schemas(),
+                    messages=messages,
                     timeout=self.config.timeout_seconds,
                 )
                 break
@@ -2034,8 +2472,6 @@ class BaseAgent(ABC):
                 TimeoutError,
                 ConnectionError,
                 OSError,
-                RuntimeError,
-                ValueError,
             ) as exc:
                 # Known non-retryable runtime failure: log the stack
                 # trace and escalate generically.
@@ -2090,8 +2526,6 @@ class BaseAgent(ABC):
             TimeoutError,
             ConnectionError,
             OSError,
-            RuntimeError,
-            ValueError,
         ) as exc:
             logger.exception(
                 "Unhandled post-tool error in %s: %s", self.agent_type, exc,
@@ -2120,7 +2554,7 @@ class BaseAgent(ABC):
 
     async def _build_messages(
         self, conversation: Conversation, user_message: str
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Build message history for LLM.
 
         Production deployments should plug in the ``ConversationManager``
@@ -2156,7 +2590,7 @@ class BaseAgent(ABC):
         else:
             # Fallback: last 10 turns. Documented limitation -- long
             # conversations will lose context before the window.
-            for msg in conversation.messages[-10:]:
+            for msg in list(conversation.messages)[-10:]:
                 role = "user" if msg.role == "customer" else "assistant"
                 messages.append({"role": role, "content": msg.content})
 
@@ -2166,7 +2600,7 @@ class BaseAgent(ABC):
         return messages
 
     async def _process_response(
-        self, response, conversation: Conversation
+        self, response: Any, conversation: Conversation
     ) -> AgentResponse:
         """Process LLM response and execute tool calls."""
         tool_calls = []
@@ -2214,7 +2648,10 @@ class BaseAgent(ABC):
         )
 
     async def _execute_tool(
-        self, tool_name: str, tool_input: dict, conversation: Conversation
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        conversation: Conversation,
     ) -> ToolResult:
         """Execute a tool and record the result."""
         if tool_name not in self.tools:
@@ -2230,7 +2667,64 @@ class BaseAgent(ABC):
                 f"Tool {tool_name} requires confirmation: {tool_input}"
             )
 
-        result = await tool.execute(**tool_input)
+        if not isinstance(tool_input, dict):
+            result = ToolResult(
+                success=False,
+                data=None,
+                error=f"Invalid input for tool {tool_name}",
+            )
+        else:
+            validation_error = tool.validate_params(**tool_input)
+            if validation_error is not None:
+                result = ToolResult(
+                    success=False,
+                    data=None,
+                    error=validation_error,
+                )
+            else:
+                result = None
+
+        try:
+            if result is None:
+                result = await asyncio.wait_for(
+                    tool.execute(**tool_input),
+                    timeout=self.config.timeout_seconds,
+                )
+        except asyncio.TimeoutError:
+            result = ToolResult(
+                success=False,
+                data=None,
+                error=f"Tool {tool_name} timed out",
+            )
+        except (
+            httpx.HTTPError,
+            KeyError,
+            TypeError,
+            json.JSONDecodeError,
+        ) as exc:
+            logger.exception(
+                "Tool %s failed with %s", tool_name, type(exc).__name__
+            )
+            result = ToolResult(
+                success=False,
+                data=None,
+                error=f"Tool {tool_name} failed: {type(exc).__name__}",
+            )
+        except Exception as exc:
+            # Generic fallback: an unexpected tool bug should degrade
+            # the agent turn to a failed ToolResult rather than crash
+            # the whole conversation loop. Stack trace is preserved
+            # via logger.exception for triage.
+            logger.exception(
+                "Tool %s raised unhandled %s",
+                tool_name,
+                type(exc).__name__,
+            )
+            result = ToolResult(
+                success=False,
+                data=None,
+                error=str(exc),
+            )
 
         # Record in conversation context
         conversation.context.add_tool_result(
@@ -2247,10 +2741,17 @@ class BaseAgent(ABC):
     async def _get_final_response(
         self,
         conversation: Conversation,
-        tool_calls: list[dict],
+        tool_calls: list[dict[str, Any]],
         preamble: str = "",
     ) -> str:
-        """Get final response after tool execution."""
+        """Get final response after tool execution.
+
+        Note: ``BadRequestError`` (permanent error from a malformed
+        prompt or schema) is NOT caught here; callers should
+        pre-validate inputs or wrap this method in their own
+        try/except so a permanent 4xx becomes a degraded
+        ``AgentResponse`` rather than crashing the agent loop.
+        """
         # Build tool results message
         tool_results_text = "\n".join(
             [
@@ -2259,7 +2760,18 @@ class BaseAgent(ABC):
             ]
         )
 
-        messages = conversation.get_history_for_llm()
+        messages = []
+        for msg in conversation.get_history_for_llm():
+            source_role = msg.get("role")
+            if source_role in ("customer", "user"):
+                role = "user"
+            elif source_role in ("agent", "assistant"):
+                role = "assistant"
+            else:
+                continue
+            content = msg.get("content")
+            if content:
+                messages.append({"role": role, "content": content})
         prompt = "Based on these tool results, provide a helpful response to the customer:"
         if preamble:
             prompt += f"\n\nModel preamble before tool execution:\n{preamble}"
@@ -2274,14 +2786,11 @@ class BaseAgent(ABC):
         backoff_seconds = self.config.llm_retry_backoff_seconds
         for attempt in range(max_transient_retries + 1):
             try:
-                response = await asyncio.wait_for(
-                    self.llm_client.messages.create(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=1024,
-                        system=self.system_prompt,
-                        messages=messages,
-                        timeout=self.config.timeout_seconds,
-                    ),
+                response = await self._create_llm_message(
+                    model=self.config.model,
+                    max_tokens=self.config.max_tokens,
+                    system=self.system_prompt,
+                    messages=messages,
                     timeout=self.config.timeout_seconds,
                 )
                 return response.content[0].text
@@ -2334,22 +2843,34 @@ class BaseAgent(ABC):
     def _check_escalation(
         self, message: str, conversation: Conversation
     ) -> tuple[bool, Optional[str]]:
-        """Check if escalation to human is needed."""
+        """Check if escalation to human is needed.
+
+        Heuristic: word-boundary matches for unambiguous escalation
+        keywords (``supervisor``, ``escalate``) plus a verb+target
+        context pattern (``speak``/``talk``/... within 20 characters of
+        ``supervisor``/``manager``/``human``). Avoids false positives
+        on substrings like "my manager said ...". This is a
+        deterministic backstop only, not a replacement for LLM intent
+        classification.
+        """
+        import re
+
         # Check sentiment
         if conversation.context.sentiment_score < -0.7:
             return True, "Customer sentiment very negative"
 
-        # Check for explicit escalation requests
-        escalation_phrases = [
-            "speak to human",
-            "real person",
-            "supervisor",
-            "manager",
-        ]
-        message_lower = message.lower()
-        for phrase in escalation_phrases:
-            if phrase in message_lower:
-                return True, "Customer requested human agent"
+        keyword_re = re.compile(
+            r"\b(supervisor|escalate|escalation)\b", re.IGNORECASE
+        )
+        request_re = re.compile(
+            r"\b(speak|talk|connect|transfer|escalate)\b"
+            r".{0,20}\b(supervisor|manager|human|agent|person)\b",
+            re.IGNORECASE | re.DOTALL,
+        )
+        if keyword_re.search(message):
+            return True, "Customer requested human agent"
+        if request_re.search(message):
+            return True, "Customer requested human agent"
 
         return False, None
 
@@ -2357,10 +2878,8 @@ class BaseAgent(ABC):
 # Block 9 (chapter listing #9)
 # ============================================================================
 
-"""
-Triage agent - the front door of customer service.
-Routes customers to appropriate specialized agents.
-"""
+# Triage agent - the front door of customer service.
+# Routes customers to appropriate specialized agents.
 
 
 class TriageAgent(BaseAgent):
@@ -2376,39 +2895,43 @@ class TriageAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return """You are a customer service triage agent. Your role is to:
+        return textwrap.dedent(
+            """\
+            You are a customer service triage agent. Your role is to:
 
-1. GREET the customer warmly and professionally
-2. IDENTIFY the customer (ask for email or account number if not already known)
-3. UNDERSTAND their issue by asking clarifying questions if needed
-4. ROUTE them to the appropriate specialist agent
+            1. GREET the customer warmly and professionally
+            2. IDENTIFY the customer (ask for email or account number if not already known)
+            3. UNDERSTAND their issue by asking clarifying questions if needed
+            4. ROUTE them to the appropriate specialist agent
 
-You have access to these tools:
-- identify_customer: Look up customer by email, phone, or account number
-- classify_intent: Analyze the customer's message to determine their needs
+            You have access to these tools:
+            - identify_customer: Look up customer by email, phone, or account number
+            - classify_intent: Analyze the customer's message to determine their needs
 
-ROUTING GUIDELINES:
-- Order issues (status, modifications, returns) -> Order Agent
-- Technical problems (product issues, troubleshooting) -> Technical Support Agent
-- Payment/billing questions -> Billing Agent
-- Complaints or requests for human -> Escalation Agent
+            ROUTING GUIDELINES:
+            - Order issues (status, modifications, returns) -> Order Agent
+            - Technical problems (product issues, troubleshooting) -> Technical Support Agent
+            - Payment/billing questions -> Billing Agent
+            - Complaints or requests for human -> Escalation Agent
 
-IMPORTANT RULES:
-- Be concise but friendly
-- Never attempt to solve issues yourself - route to specialists
-- If the customer's intent is unclear, ask ONE clarifying question
-- Always confirm the customer's identity before routing
-- If you cannot identify the customer after 2 attempts, escalate
+            IMPORTANT RULES:
+            - Be concise but friendly
+            - Never attempt to solve issues yourself - route to specialists
+            - If the customer's intent is unclear, ask ONE clarifying question
+            - Always confirm the customer's identity before routing
+            - If you cannot identify the customer after 2 attempts, escalate
 
-Example interaction:
-Customer: "My order hasn't arrived"
-You: "I'd be happy to help you track that order. Could you please provide your email address or account number so I can look up your information?"
-Customer: "john@example.com"
-[Use identify_customer tool]
-[Use classify_intent tool]
-You: "Thank you, John. I can see you're asking about an order delivery. Let me connect you with our order specialist who can provide detailed tracking information."
+            Example interaction:
+            Customer: "My order hasn't arrived"
+            You: "I'd be happy to help you track that order. Could you please provide your email address or account number so I can look up your information?"
+            Customer: "john@example.com"
+            [Use identify_customer tool]
+            [Use classify_intent tool]
+            You: "Thank you, John. I can see you're asking about an order delivery. Let me connect you with our order specialist who can provide detailed tracking information."
 
-Remember: Your job is to route efficiently, not to resolve issues."""
+            Remember: Your job is to route efficiently, not to resolve issues.
+            """
+        ).rstrip("\n")
 
     async def process_message(
         self, conversation: Conversation, user_message: str
@@ -2458,7 +2981,9 @@ Remember: Your job is to route efficiently, not to resolve issues."""
         if not tool:
             return None
 
-        context = "\n".join([m.content for m in conversation.messages[-3:]])
+        context = "\n".join(
+            [m.content for m in list(conversation.messages)[-3:]]
+        )
         result = await tool.execute(
             message=message, conversation_context=context
         )
@@ -2467,12 +2992,40 @@ Remember: Your job is to route efficiently, not to resolve issues."""
             return None
 
         intent_data = result.data
-        conversation.context.intent = intent_data["intent"]
-        conversation.context.intent_confidence = intent_data["confidence"]
-        conversation.context.sentiment_score = intent_data["sentiment"]
+        if not isinstance(intent_data, dict):
+            logger.warning("Intent classifier returned non-object payload")
+            return None
+        required_fields = {
+            "intent",
+            "confidence",
+            "sentiment",
+            "recommended_agent",
+        }
+        if not required_fields.issubset(intent_data):
+            logger.warning(
+                "Intent classifier missing fields: %s",
+                sorted(required_fields - set(intent_data)),
+            )
+            return None
+        recommended_agent = intent_data["recommended_agent"]
+        try:
+            target_agent = AgentType(recommended_agent)
+        except ValueError:
+            logger.warning(
+                "Intent classifier recommended invalid agent: %s",
+                recommended_agent,
+            )
+            return None
+        try:
+            confidence = float(intent_data["confidence"])
+            sentiment = float(intent_data["sentiment"])
+        except (TypeError, ValueError):
+            logger.warning("Intent classifier returned invalid scores")
+            return None
 
-        # Determine target agent
-        target_agent = AgentType(intent_data["recommended_agent"])
+        conversation.context.intent = intent_data["intent"]
+        conversation.context.intent_confidence = confidence
+        conversation.context.sentiment_score = sentiment
 
         # Generate handoff message
         handoff_messages = {
@@ -2499,9 +3052,7 @@ Remember: Your job is to route efficiently, not to resolve issues."""
 # Block 10 (chapter listing #10)
 # ============================================================================
 
-"""
-Order agent - handles order-related inquiries and actions.
-"""
+# Order agent - handles order-related inquiries and actions.
 
 
 class OrderAgent(BaseAgent):
@@ -2516,47 +3067,51 @@ class OrderAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return """You are a customer service specialist for order management. You help customers with:
+        return textwrap.dedent(
+            """\
+            You are a customer service specialist for order management. You help customers with:
 
-1. Order status and tracking
-2. Order modifications (before shipping)
-3. Order cancellations
-4. Returns and exchanges
+            1. Order status and tracking
+            2. Order modifications (before shipping)
+            3. Order cancellations
+            4. Returns and exchanges
 
-You have access to these tools:
-- get_order_status: Check order status and shipping info
-- modify_order: Change shipping address, cancel items, or cancel order
-- initiate_return: Start return process for delivered items
-- track_shipment: Get detailed tracking information
+            You have access to these tools:
+            - get_order_status: Check order status and shipping info
+            - modify_order: Change shipping address, cancel items, or cancel order
+            - initiate_return: Start return process for delivered items
+            - track_shipment: Get detailed tracking information
 
-GUIDELINES:
+            GUIDELINES:
 
-For ORDER STATUS:
-- Always provide the current status clearly
-- If shipped, include tracking information
-- Give estimated delivery dates when available
+            For ORDER STATUS:
+            - Always provide the current status clearly
+            - If shipped, include tracking information
+            - Give estimated delivery dates when available
 
-For ORDER MODIFICATIONS:
-- Check if the order can be modified (not shipped yet)
-- Confirm changes before making them
-- Explain any impacts (refunds, timing)
+            For ORDER MODIFICATIONS:
+            - Check if the order can be modified (not shipped yet)
+            - Confirm changes before making them
+            - Explain any impacts (refunds, timing)
 
-For RETURNS:
-- Verify the item is within the return window (30 days)
-- Ask for the reason to set expectations
-- Provide clear return instructions and timeline
+            For RETURNS:
+            - Verify the item is within the return window (30 days)
+            - Ask for the reason to set expectations
+            - Provide clear return instructions and timeline
 
-For TRACKING:
-- Provide the most recent tracking events
-- Explain any delays if visible
-- Set realistic delivery expectations
+            For TRACKING:
+            - Provide the most recent tracking events
+            - Explain any delays if visible
+            - Set realistic delivery expectations
 
-TONE:
-- Be empathetic if there are delivery issues
-- Be proactive in offering solutions
-- Never make promises you cannot keep
+            TONE:
+            - Be empathetic if there are delivery issues
+            - Be proactive in offering solutions
+            - Never make promises you cannot keep
 
-If the customer's issue requires billing help or technical support, acknowledge their need and indicate you'll transfer them to the right specialist."""
+            If the customer's issue requires billing help or technical support, acknowledge their need and indicate you'll transfer them to the right specialist.
+            """
+        ).rstrip("\n")
 
     async def process_message(
         self, conversation: Conversation, user_message: str
@@ -2577,9 +3132,7 @@ If the customer's issue requires billing help or technical support, acknowledge 
 # Block 11 (chapter listing #11)
 # ============================================================================
 
-"""
-Technical support agent - handles product issues and troubleshooting.
-"""
+# Technical support agent - handles product issues and troubleshooting.
 
 
 class TechnicalSupportAgent(BaseAgent):
@@ -2594,44 +3147,48 @@ class TechnicalSupportAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return """You are a technical support specialist. You help customers with:
+        return textwrap.dedent(
+            """\
+            You are a technical support specialist. You help customers with:
 
-1. Product troubleshooting
-2. Setup and configuration guidance
-3. Feature explanations
-4. Technical issue diagnosis
+            1. Product troubleshooting
+            2. Setup and configuration guidance
+            3. Feature explanations
+            4. Technical issue diagnosis
 
-You have access to these tools:
-- search_knowledge_base: Find relevant documentation and guides
-- run_diagnostic: Run automated diagnostics on customer's product/account
-- get_product_info: Get product specifications and compatibility info
-- create_ticket: Create a support ticket for issues requiring engineering
+            You have access to these tools:
+            - search_knowledge_base: Find relevant documentation and guides
+            - run_diagnostic: Run automated diagnostics on customer's product/account
+            - get_product_info: Get product specifications and compatibility info
+            - create_ticket: Create a support ticket for issues requiring engineering
 
-TROUBLESHOOTING APPROACH:
+            TROUBLESHOOTING APPROACH:
 
-1. UNDERSTAND the issue
-   - Ask clarifying questions about symptoms
-   - Understand when the issue started
-   - Check if anything changed recently
+            1. UNDERSTAND the issue
+               - Ask clarifying questions about symptoms
+               - Understand when the issue started
+               - Check if anything changed recently
 
-2. DIAGNOSE systematically
-   - Search knowledge base for similar issues
-   - Run relevant diagnostics
-   - Identify root cause if possible
+            2. DIAGNOSE systematically
+               - Search knowledge base for similar issues
+               - Run relevant diagnostics
+               - Identify root cause if possible
 
-3. RESOLVE or ESCALATE
-   - Provide step-by-step guidance for resolvable issues
-   - Create a ticket for issues requiring engineering
-   - Escalate to human for complex or sensitive issues
+            3. RESOLVE or ESCALATE
+               - Provide step-by-step guidance for resolvable issues
+               - Create a ticket for issues requiring engineering
+               - Escalate to human for complex or sensitive issues
 
-GUIDELINES:
-- Be patient and avoid jargon
-- Provide numbered steps for instructions
-- Confirm each step before moving to the next
-- If an issue persists after 3 attempts, create a ticket or escalate
-- Never ask customers to do anything that could harm their data
+            GUIDELINES:
+            - Be patient and avoid jargon
+            - Provide numbered steps for instructions
+            - Confirm each step before moving to the next
+            - If an issue persists after 3 attempts, create a ticket or escalate
+            - Never ask customers to do anything that could harm their data
 
-For billing or order issues, acknowledge and indicate transfer to appropriate specialist."""
+            For billing or order issues, acknowledge and indicate transfer to appropriate specialist.
+            """
+        ).rstrip("\n")
 
 
 class BillingAgent(BaseAgent):
@@ -2646,51 +3203,53 @@ class BillingAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return """You are a billing specialist. You help customers with:
+        return textwrap.dedent(
+            """\
+            You are a billing specialist. You help customers with:
 
-1. Account balance inquiries
-2. Payment history review
-3. Refund processing
-4. Payment method updates
+            1. Account balance inquiries
+            2. Payment history review
+            3. Refund processing
+            4. Payment method updates
 
-You have access to these tools:
-- get_account_balance: Check current balance and outstanding invoices
-- get_payment_history: View recent transactions
-- process_refund: Issue refunds for eligible orders
-- update_payment_method: Help update payment information
+            You have access to these tools:
+            - get_account_balance: Check current balance and outstanding invoices
+            - get_payment_history: View recent transactions
+            - process_refund: Issue refunds for eligible orders
+            - update_payment_method: Help update payment information
 
-IMPORTANT SECURITY RULES:
-- NEVER ask for full credit card numbers
-- NEVER display full card numbers (only last 4 digits)
-- Always verify customer identity before discussing account details
-- Refunds require customer confirmation
+            IMPORTANT SECURITY RULES:
+            - NEVER ask for full credit card numbers
+            - NEVER display full card numbers (only last 4 digits)
+            - Always verify customer identity before discussing account details
+            - Refunds require customer confirmation
 
-REFUND GUIDELINES:
-- Verify the order is eligible for refund
-- Check refund hasn't already been processed
-- Explain the refund timeline (3-5 business days)
-- Provide confirmation number
+            REFUND GUIDELINES:
+            - Verify the order is eligible for refund
+            - Check refund hasn't already been processed
+            - Explain the refund timeline (3-5 business days)
+            - Provide confirmation number
 
-DISPUTE HANDLING:
-- Listen to the customer's concern fully
-- Review the transaction details
-- If valid, process appropriate refund
-- If unclear, escalate to human for review
+            DISPUTE HANDLING:
+            - Listen to the customer's concern fully
+            - Review the transaction details
+            - If valid, process appropriate refund
+            - If unclear, escalate to human for review
 
-TONE:
-- Be precise with financial information
-- Show empathy for billing frustrations
-- Be transparent about timelines and limitations
+            TONE:
+            - Be precise with financial information
+            - Show empathy for billing frustrations
+            - Be transparent about timelines and limitations
 
-For technical or order issues, acknowledge and indicate transfer."""
+            For technical or order issues, acknowledge and indicate transfer.
+            """
+        ).rstrip("\n")
 
 # ============================================================================
 # Block 12 (chapter listing #12)
 # ============================================================================
 
-"""
-Escalation agent - handles human handoff.
-"""
+# Escalation agent - handles human handoff.
 
 
 class EscalationAgent(BaseAgent):
@@ -2705,46 +3264,50 @@ class EscalationAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return """You are the escalation specialist. Your role is to:
-
-1. Acknowledge the customer's need for human assistance
-2. Gather any final context needed for the human agent
-3. Set expectations about wait times
-4. Execute a smooth handoff
-
-You have access to these tools:
-- create_escalation_ticket: Create a prioritized ticket for human review
-- find_available_agent: Check human agent availability
-- transfer_conversation: Execute the transfer to a human
-
-ESCALATION PROCESS:
-
-1. ACKNOWLEDGE
-   - Thank the customer for their patience
-   - Validate their concern/frustration
-   - Confirm they'll be connected to a human
-
-2. PREPARE
-   - Summarize the issue briefly
-   - Note any attempted resolutions
-   - Capture any additional context needed
-
-3. SET EXPECTATIONS
-   - Provide estimated wait time
-   - Explain what happens next
-   - Offer callback option if wait is long
-
-4. EXECUTE
-   - Create escalation ticket with full context
-   - Transfer to appropriate human agent
-   - Ensure warm handoff (context preserved)
-
-PRIORITIZATION:
-- Critical: VIP customers, safety concerns, legal issues
-- High: Very frustrated customers, repeated failures
-- Normal: Standard escalation requests
-
-Always be empathetic and professional. The customer has likely already had a frustrating experience."""
+        return (
+            "You are the escalation specialist. Your role is to:\n"
+            "\n"
+            "1. Acknowledge the customer's need for human assistance\n"
+            "2. Gather any final context needed for the human agent\n"
+            "3. Set expectations about wait times\n"
+            "4. Execute a smooth handoff\n"
+            "\n"
+            "You have access to these tools:\n"
+            "- create_escalation_ticket: Create a prioritized ticket"
+            " for human review\n"
+            "- find_available_agent: Check human agent availability\n"
+            "- transfer_conversation: Execute the transfer to a human\n"
+            "\n"
+            "ESCALATION PROCESS:\n"
+            "\n"
+            "1. ACKNOWLEDGE\n"
+            "   - Thank the customer for their patience\n"
+            "   - Validate their concern/frustration\n"
+            "   - Confirm they'll be connected to a human\n"
+            "\n"
+            "2. PREPARE\n"
+            "   - Summarize the issue briefly\n"
+            "   - Note any attempted resolutions\n"
+            "   - Capture any additional context needed\n"
+            "\n"
+            "3. SET EXPECTATIONS\n"
+            "   - Provide estimated wait time\n"
+            "   - Explain what happens next\n"
+            "   - Offer callback option if wait is long\n"
+            "\n"
+            "4. EXECUTE\n"
+            "   - Create escalation ticket with full context\n"
+            "   - Transfer to appropriate human agent\n"
+            "   - Ensure warm handoff (context preserved)\n"
+            "\n"
+            "PRIORITIZATION:\n"
+            "- Critical: VIP customers, safety concerns, legal issues\n"
+            "- High: Very frustrated customers, repeated failures\n"
+            "- Normal: Standard escalation requests\n"
+            "\n"
+            "Always be empathetic and professional. The customer has"
+            " likely already had a frustrating experience."
+        )
 
     async def process_message(
         self, conversation: Conversation, user_message: str
@@ -2816,12 +3379,10 @@ A specialist will have full context of our conversation and the steps we've alre
 # Block 13 (chapter listing #13)
 # ============================================================================
 
-"""
-Conversation manager - orchestrates the multi-agent system.
-"""
+# Conversation manager - orchestrates the multi-agent system.
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 import logging
@@ -2842,7 +3403,37 @@ class ConversationMetrics:
     escalated: bool = False
     resolved: bool = False
     resolution_time_seconds: Optional[float] = None
-    agents_involved: list[AgentType] = field(default_factory=list)
+    agents_involved: set[AgentType] = field(default_factory=set)
+
+
+class InMemoryConversationStore:
+    """Demo persistence boundary for live conversations.
+
+    Production deployments should provide a Redis/Postgres-backed store
+    and treat ``ConversationManager.active_conversations`` as a bounded
+    hot cache for currently active turns.
+    """
+
+    def __init__(self, max_records: int = 100_000) -> None:
+        if max_records < 1:
+            raise ValueError("max_records must be >= 1")
+        self._records: "OrderedDict[str, Conversation]" = OrderedDict()
+        self._max_records = max_records
+        self._lock = asyncio.Lock()
+
+    async def save(self, conversation: Conversation) -> None:
+        async with self._lock:
+            self._records[conversation.conversation_id] = conversation
+            self._records.move_to_end(conversation.conversation_id)
+            while len(self._records) > self._max_records:
+                self._records.popitem(last=False)
+
+    async def load(self, conversation_id: str) -> Optional[Conversation]:
+        async with self._lock:
+            conversation = self._records.get(conversation_id)
+            if conversation is not None:
+                self._records.move_to_end(conversation_id)
+            return conversation
 
 
 class ConversationManager:
@@ -2861,12 +3452,16 @@ class ConversationManager:
         config: PlatformConfig,
         agents: dict[AgentType, BaseAgent],
         max_active_conversations: int = MAX_ACTIVE_CONVERSATIONS,
-    ):
+        conversation_store: Optional[InMemoryConversationStore] = None,
+    ) -> None:
         if max_active_conversations < 1:
             raise ValueError("max_active_conversations must be >= 1")
         self.config = config
         self.agents = agents
         self.max_active_conversations = max_active_conversations
+        self.conversation_store = (
+            conversation_store or InMemoryConversationStore()
+        )
         self.active_conversations: "OrderedDict[str, Conversation]" = (
             OrderedDict()
         )
@@ -2876,8 +3471,14 @@ class ConversationManager:
         self._conversation_locks: "OrderedDict[str, asyncio.Lock]" = (
             OrderedDict()
         )
+        self.shutting_down = False
 
-    def _record_active(self, conv_id: str, conversation, metrics) -> None:
+    def _record_active(
+        self,
+        conv_id: str,
+        conversation: Conversation,
+        metrics: ConversationMetrics,
+    ) -> None:
         """Insert (or refresh LRU position for) a conversation."""
         self.active_conversations[conv_id] = conversation
         self.active_conversations.move_to_end(conv_id)
@@ -2886,7 +3487,29 @@ class ConversationManager:
         self._conversation_locks.setdefault(conv_id, asyncio.Lock())
         self._conversation_locks.move_to_end(conv_id)
         while len(self.active_conversations) > self.max_active_conversations:
-            evicted_id, _ = self.active_conversations.popitem(last=False)
+            evicted_id = None
+            for candidate_id in list(self.active_conversations.keys()):
+                if candidate_id == conv_id:
+                    continue
+                lock = self._conversation_locks.get(candidate_id)
+                if lock is not None and lock.locked():
+                    self.active_conversations.move_to_end(candidate_id)
+                    self.conversation_metrics.move_to_end(candidate_id)
+                    self._conversation_locks.move_to_end(candidate_id)
+                    continue
+                evicted_id = candidate_id
+                break
+
+            if evicted_id is None:
+                self.active_conversations.pop(conv_id, None)
+                self.conversation_metrics.pop(conv_id, None)
+                self._conversation_locks.pop(conv_id, None)
+                raise RuntimeError(
+                    "active conversation cap reached; all existing "
+                    "conversations are currently in flight"
+                )
+
+            self.active_conversations.pop(evicted_id, None)
             self.conversation_metrics.pop(evicted_id, None)
             self._conversation_locks.pop(evicted_id, None)
 
@@ -2894,12 +3517,15 @@ class ConversationManager:
         self, customer: Customer, channel: ConversationChannel
     ) -> Conversation:
         """Start a new conversation."""
+        if self.shutting_down:
+            raise RuntimeError("ConversationManager is shutting down")
         conversation = Conversation.create(customer, channel)
         self._record_active(
             conversation.conversation_id,
             conversation,
             ConversationMetrics(start_time=datetime.now(timezone.utc)),
         )
+        await self.conversation_store.save(conversation)
 
         logger.info(
             f"Started conversation {conversation.conversation_id} "
@@ -2912,15 +3538,71 @@ class ConversationManager:
         self, conversation_id: str, message: str
     ) -> AgentResponse:
         """Process an incoming customer message."""
-        lock = self._conversation_locks.get(conversation_id)
-        if lock is None:
-            if conversation_id not in self.active_conversations:
-                raise ValueError(f"Conversation {conversation_id} not found")
-            lock = asyncio.Lock()
-            self._conversation_locks[conversation_id] = lock
+        if self.shutting_down:
+            raise RuntimeError("ConversationManager is shutting down")
+        # ``setdefault`` is atomic under the single-threaded asyncio
+        # event loop: two coroutines reaching this path concurrently
+        # would otherwise both fall through the ``get is None`` branch
+        # and install two distinct locks, defeating the per-conversation
+        # serialization. ``setdefault`` reuses the existing lock object
+        # when one is already present.
+        lock = self._conversation_locks.setdefault(
+            conversation_id, asyncio.Lock()
+        )
         self._conversation_locks.move_to_end(conversation_id)
         async with lock:
-            return await self._process_message_locked(conversation_id, message)
+            if conversation_id not in self.active_conversations:
+                stored = await self.conversation_store.load(conversation_id)
+                if stored is None:
+                    raise ValueError(
+                        f"Conversation {conversation_id} not found"
+                    )
+                self._record_active(
+                    conversation_id,
+                    stored,
+                    self.conversation_metrics.get(
+                        conversation_id,
+                        ConversationMetrics(start_time=stored.created_at),
+                    ),
+                )
+
+            response = await self._process_message_locked(
+                conversation_id, message
+            )
+            await self.conversation_store.save(
+                self.active_conversations[conversation_id]
+            )
+            return response
+
+    async def drain_active_conversations(
+        self, drain_timeout_seconds: float = 30.0
+    ) -> None:
+        """Wait for currently locked conversations to finish.
+
+        ``drain_timeout_seconds`` caps how long we will block waiting
+        for outstanding per-conversation locks. If the deadline elapses
+        the still-locked conversations are logged so a stuck handler is
+        visible to ops, and the method returns rather than blocking
+        shutdown forever.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(0.0, drain_timeout_seconds)
+        while any(lock.locked() for lock in self._conversation_locks.values()):
+            if loop.time() >= deadline:
+                stuck = [
+                    cid
+                    for cid, lock in self._conversation_locks.items()
+                    if lock.locked()
+                ]
+                logger.warning(
+                    "drain_active_conversations timeout after %.1fs; "
+                    "%d conversation(s) still locked: %s",
+                    drain_timeout_seconds,
+                    len(stuck),
+                    stuck[:10],
+                )
+                return
+            await asyncio.sleep(0.05)
 
     async def _process_message_locked(
         self, conversation_id: str, message: str
@@ -2947,8 +3629,7 @@ class ConversationManager:
 
         # Record metrics
         metrics.tool_calls += len(response.tool_calls)
-        if current_agent.agent_type not in metrics.agents_involved:
-            metrics.agents_involved.append(current_agent.agent_type)
+        metrics.agents_involved.add(current_agent.agent_type)
 
         # Add agent response to history
         conversation.add_message(
@@ -2984,7 +3665,7 @@ class ConversationManager:
 
     async def _handle_transfer(
         self, conversation: Conversation, target: AgentType, reason: str
-    ):
+    ) -> None:
         """Handle agent-to-agent transfer."""
         previous = conversation.context.current_agent
 
@@ -3000,7 +3681,7 @@ class ConversationManager:
 
     async def _handle_escalation(
         self, conversation: Conversation, reason: str
-    ):
+    ) -> None:
         """Handle escalation to human agent."""
         conversation.status = ConversationStatus.ESCALATED
         conversation.context.escalation_reason = reason
@@ -3017,7 +3698,7 @@ class ConversationManager:
 
     async def resolve_conversation(
         self, conversation_id: str, resolution: str = "resolved"
-    ):
+    ) -> None:
         """Mark a conversation as resolved."""
         conversation = self.active_conversations.get(conversation_id)
         if not conversation:
@@ -3037,8 +3718,9 @@ class ConversationManager:
             f"Conversation {conversation_id} resolved in "
             f"{metrics.resolution_time_seconds:.1f}s"
         )
+        await self.conversation_store.save(conversation)
 
-    def get_conversation_summary(self, conversation_id: str) -> dict:
+    def get_conversation_summary(self, conversation_id: str) -> dict[str, Any]:
         """Get a summary of a conversation for reporting."""
         conversation = self.active_conversations.get(conversation_id)
         metrics = self.conversation_metrics.get(conversation_id)
@@ -3057,7 +3739,11 @@ class ConversationManager:
             "message_count": metrics.message_count,
             "agent_transfers": metrics.agent_transfers,
             "tool_calls": metrics.tool_calls,
-            "agents_involved": [a.value for a in metrics.agents_involved],
+            "agents_involved": [
+                a.value for a in sorted(
+                    metrics.agents_involved, key=lambda agent: agent.value
+                )
+            ],
             "escalated": metrics.escalated,
             "resolved": metrics.resolved,
             "duration_seconds": metrics.resolution_time_seconds,
@@ -3071,17 +3757,25 @@ class ConversationManager:
 # Block 14 (chapter listing #14)
 # ============================================================================
 
-"""
-Quality assurance system for customer service conversations.
-"""
+# Quality assurance system for customer service conversations.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Protocol
 import json
 import logging
+import textwrap
 
 logger = logging.getLogger(__name__)
+
+
+class _QualityLLMMessages(Protocol):
+    async def create(self, **kwargs: Any) -> Any:
+        ...
+
+
+class _QualityLLMClient(Protocol):
+    messages: _QualityLLMMessages
 
 
 @dataclass
@@ -3103,9 +3797,12 @@ class QualityAssessment:
     Evaluates multiple dimensions and flags issues.
     """
 
-    def __init__(self, config: QualityConfig, llm_client):
+    def __init__(self, config: QualityConfig, llm_client: _QualityLLMClient) -> None:
         self.config = config
         self.llm_client = llm_client
+        # Counter for malformed-JSON assessment responses so operators can
+        # alert on a rising rate instead of only inspecting logs.
+        self._malformed_json_count = 0
 
     async def assess_conversation(
         self, conversation: Conversation, metrics: ConversationMetrics
@@ -3209,26 +3906,30 @@ class QualityAssessment:
 
         sample = agent_messages[-3:]  # Last 3 responses
 
-        assessment_prompt = f"""Evaluate these customer service responses for quality.
+        responses_json = json.dumps(
+            [{"content": m.content} for m in sample], indent=2
+        )
+        assessment_prompt = textwrap.dedent("""\
+            Evaluate these customer service responses for quality.
 
-Responses:
-{json.dumps([{"content": m.content} for m in sample], indent=2)}
+            Responses:
+            __RESPONSES__
 
-Score each dimension 0-100:
-1. Clarity: Is the response clear and easy to understand?
-2. Helpfulness: Does it address the customer's need?
-3. Professionalism: Is the tone appropriate?
-4. Accuracy: Does it provide correct information?
+            Score each dimension 0-100:
+            1. Clarity: Is the response clear and easy to understand?
+            2. Helpfulness: Does it address the customer's need?
+            3. Professionalism: Is the tone appropriate?
+            4. Accuracy: Does it provide correct information?
 
-Return JSON: {{"clarity": X, "helpfulness": X, "professionalism": X, "accuracy": X}}"""
+            Return JSON: {"clarity": X, "helpfulness": X, "professionalism": X, "accuracy": X}""").replace("__RESPONSES__", responses_json)
 
         try:
             for attempt in range(2):
                 try:
                     response = await asyncio.wait_for(
                         self.llm_client.messages.create(
-                            model="claude-sonnet-4-20250514",
-                            max_tokens=200,
+                            model=self.config.assessment_model,
+                            max_tokens=self.config.assessment_max_tokens,
                             messages=[
                                 {"role": "user", "content": assessment_prompt}
                             ],
@@ -3260,6 +3961,7 @@ Return JSON: {{"clarity": X, "helpfulness": X, "professionalism": X, "accuracy":
             return sum(numeric_scores) / len(numeric_scores)
 
         except json.JSONDecodeError as e:
+            self._malformed_json_count += 1
             logger.warning("Response quality assessment returned non-JSON: %s", e)
             return 50.0
         except (KeyError, TypeError, ValueError) as e:
@@ -3288,9 +3990,12 @@ Return JSON: {{"clarity": X, "helpfulness": X, "professionalism": X, "accuracy":
             if metrics.resolution_time_seconds > 900:  # 15 minutes
                 score -= 20
 
-        # Penalize excessive messages
+        # Penalize excessive messages; clamp the penalty so a single
+        # runaway transcript cannot drive the composite score below the
+        # other dimensions' contribution floor.
         if metrics.message_count > 15:
-            score -= (metrics.message_count - 15) * 2
+            penalty = min(100, max(0, (metrics.message_count - 15) * 2))
+            score -= penalty
 
         # Penalize failed tool calls (would need to track this)
 
@@ -3358,12 +4063,12 @@ class FeedbackCollector:
     Collects and processes customer feedback.
     """
 
-    def __init__(self, storage_client: "FeedbackStorage"):
+    def __init__(self, storage_client: "FeedbackStorage") -> None:
         self.storage: "FeedbackStorage" = storage_client
 
     async def collect_csat(
         self, conversation_id: str, score: int, comment: Optional[str] = None
-    ):
+    ) -> None:
         """Collect customer satisfaction score."""
         feedback = {
             "conversation_id": conversation_id,
@@ -3386,7 +4091,7 @@ class FeedbackCollector:
         conversation_id: str,
         resolved: bool,
         reason: Optional[str] = None,
-    ):
+    ) -> None:
         """Collect feedback on whether issue was resolved."""
         feedback = {
             "conversation_id": conversation_id,
@@ -3400,7 +4105,7 @@ class FeedbackCollector:
 
     async def _trigger_low_score_alert(
         self, conversation_id: str, score: int, comment: Optional[str]
-    ):
+    ) -> None:
         """Alert on low satisfaction scores."""
         logger.warning(
             f"Low CSAT score ({score}) for conversation {conversation_id}"
@@ -3411,17 +4116,15 @@ class FeedbackCollector:
 # Block 15 (chapter listing #15)
 # ============================================================================
 
-"""
-Metrics collection and reporting for customer service platform.
+# Metrics collection and reporting for customer service platform.
+#
+# Includes structural Protocols for the two storage backends the
+# collectors talk to. These document the actual surface used; any
+# implementation that quacks the same way (in-memory ring buffer,
+# Prometheus pushgateway, CloudWatch, OTel Collector, custom feedback
+# sink) can be passed in.
 
-Includes structural Protocols for the two storage backends the
-collectors talk to. These document the actual surface used; any
-implementation that quacks the same way (in-memory ring buffer,
-Prometheus pushgateway, CloudWatch, OTel Collector, custom feedback
-sink) can be passed in.
-"""
-
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -3462,7 +4165,9 @@ class PlatformMetrics:
 
     # Time metrics
     avg_first_response_ms: float = 0.0
+    p95_first_response_ms: float = 0.0
     avg_resolution_time_seconds: float = 0.0
+    p95_resolution_time_seconds: float = 0.0
     avg_handle_time_seconds: float = 0.0
 
     # Quality metrics
@@ -3472,6 +4177,7 @@ class PlatformMetrics:
     # Agent metrics
     transfers_by_agent: dict[str, int] = field(default_factory=dict)
     tool_usage: dict[str, int] = field(default_factory=dict)
+    tool_failures: dict[str, int] = field(default_factory=dict)
 
     @property
     def automation_rate(self) -> float:
@@ -3502,17 +4208,62 @@ class MetricsCollector:
     MAX_HOURLY_BUCKETS = 24
     MAX_TIMING_SAMPLES = 10_000
     MAX_TIMING_KEYS = 1_000
+    MAX_COUNTER_KEYS_PER_BUCKET = 1_000
+    MAX_REPORT_HOURS = 24 * 31
 
-    def __init__(self, storage_client: "MetricsStorage"):
+    def __init__(self, storage_client: "MetricsStorage") -> None:
         self.storage: "MetricsStorage" = storage_client
-        self._current_metrics = defaultdict(lambda: defaultdict(int))
+        self._current_metrics: "OrderedDict[str, OrderedDict[str, int]]" = (
+            OrderedDict()
+        )
         # Use bounded deques instead of unbounded lists.
         self._timing_samples = defaultdict(
             lambda: deque(maxlen=self.MAX_TIMING_SAMPLES)
         )
+        # Track the most recently observed hour bucket so eviction only
+        # runs when the hour rolls over rather than on every hot-path
+        # record_* call.
+        self._last_hour_key: Optional[str] = None
+
+    def _metric_component(self, value: str) -> str:
+        safe = "".join(
+            ch if ch.isalnum() or ch in ("_", "-", ".") else "_"
+            for ch in str(value)
+        )
+        return safe[:80] or "unknown"
+
+    def _counter_bucket(self, hour_key: str) -> "OrderedDict[str, int]":
+        bucket = self._current_metrics.get(hour_key)
+        if bucket is None:
+            bucket = OrderedDict()
+            self._current_metrics[hour_key] = bucket
+        self._current_metrics.move_to_end(hour_key)
+        return bucket
+
+    def _increment_counter(
+        self, hour_key: str, metric_name: str, by: int = 1
+    ) -> None:
+        bucket = self._counter_bucket(hour_key)
+        if metric_name not in bucket and len(bucket) >= self.MAX_COUNTER_KEYS_PER_BUCKET:
+            bucket.popitem(last=False)
+        bucket[metric_name] = bucket.get(metric_name, 0) + by
+        bucket.move_to_end(metric_name)
 
     def _evict_old_buckets(self) -> None:
-        """Drop the oldest hourly buckets once we exceed the cap."""
+        """Drop the oldest hourly buckets once we exceed the cap.
+
+        Only does work when the current hour bucket differs from the
+        last one we saw. ``record_*`` methods call into this on every
+        event, so without the rollover guard we would sort the bucket
+        keys on every hot-path call even though eviction can only
+        change state once per hour.
+        """
+        if not self._current_metrics:
+            return
+        current_hour = next(reversed(self._current_metrics))
+        if current_hour == self._last_hour_key:
+            return
+        self._last_hour_key = current_hour
         if len(self._current_metrics) > self.MAX_HOURLY_BUCKETS:
             # Buckets are keyed by ISO hour string, so lexicographic
             # ordering matches chronological ordering.
@@ -3536,20 +4287,20 @@ class MetricsCollector:
         for key in stale:
             self._timing_samples.pop(key, None)
 
-    async def record_conversation_start(self, conversation: Conversation):
+    async def record_conversation_start(self, conversation: Conversation) -> None:
         """Record a new conversation."""
         hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
 
-        self._current_metrics[hour_key]["total_conversations"] += 1
-        self._current_metrics[hour_key][
-            f"channel_{conversation.channel.value}"
-        ] += 1
+        self._increment_counter(hour_key, "total_conversations")
+        self._increment_counter(
+            hour_key, f"channel_{conversation.channel.value}"
+        )
         # Enforce the bucket retention cap on every new-hour write.
         self._evict_old_buckets()
 
     async def record_first_response(
         self, conversation_id: str, latency_ms: float
-    ):
+    ) -> None:
         """Record first response latency."""
         hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
         self._timing_samples[f"{hour_key}_first_response"].append(latency_ms)
@@ -3558,20 +4309,19 @@ class MetricsCollector:
 
     async def record_conversation_end(
         self, conversation: Conversation, metrics: ConversationMetrics
-    ):
+    ) -> None:
         """Record conversation completion."""
         hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
 
         if metrics.resolved and not metrics.escalated:
-            self._current_metrics[hour_key]["automated_resolutions"] += 1
+            self._increment_counter(hour_key, "automated_resolutions")
 
         if metrics.escalated:
-            self._current_metrics[hour_key]["escalations"] += 1
+            self._increment_counter(hour_key, "escalations")
 
         if conversation.context.intent:
-            self._current_metrics[hour_key][
-                f"intent_{conversation.context.intent}"
-            ] += 1
+            intent = self._metric_component(conversation.context.intent)
+            self._increment_counter(hour_key, f"intent_{intent}")
 
         if metrics.resolution_time_seconds:
             self._timing_samples[f"{hour_key}_resolution_time"].append(
@@ -3581,22 +4331,24 @@ class MetricsCollector:
         self._evict_timing_keys()
 
         # Record agent involvement
-        for agent in metrics.agents_involved:
-            self._current_metrics[hour_key][
-                f"agent_{agent.value}_involved"
-            ] += 1
+        for agent in sorted(metrics.agents_involved, key=lambda item: item.value):
+            agent_name = self._metric_component(agent.value)
+            self._increment_counter(hour_key, f"agent_{agent_name}_involved")
 
     async def record_tool_usage(
         self, tool_name: str, success: bool, latency_ms: float
-    ):
+    ) -> None:
         """Record tool execution."""
         hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
 
-        self._current_metrics[hour_key][f"tool_{tool_name}_calls"] += 1
+        tool = self._metric_component(tool_name)
+        self._increment_counter(hour_key, f"tool_{tool}_calls")
         if success:
-            self._current_metrics[hour_key][f"tool_{tool_name}_success"] += 1
+            self._increment_counter(hour_key, f"tool_{tool}_success")
+        else:
+            self._increment_counter(hour_key, f"tool_{tool}_failures")
 
-        self._timing_samples[f"{hour_key}_tool_{tool_name}_latency"].append(
+        self._timing_samples[f"{hour_key}_tool_{tool}_latency"].append(
             latency_ms
         )
         self._evict_old_buckets()
@@ -3606,6 +4358,13 @@ class MetricsCollector:
         self, start: datetime, end: datetime
     ) -> PlatformMetrics:
         """Get aggregated metrics for a time period."""
+        if end <= start:
+            raise ValueError("end must be after start")
+        report_hours = (end - start).total_seconds() / 3600
+        if report_hours > self.MAX_REPORT_HOURS:
+            raise ValueError(
+                f"metrics report window exceeds {self.MAX_REPORT_HOURS} hours"
+            )
         metrics = PlatformMetrics(period_start=start, period_end=end)
 
         # Aggregate hourly data
@@ -3640,6 +4399,13 @@ class MetricsCollector:
                     metrics.tool_usage[tool] = (
                         metrics.tool_usage.get(tool, 0) + value
                     )
+                elif key.startswith("tool_") and key.endswith("_failures"):
+                    tool = key.replace("tool_", "").replace(
+                        "_failures", ""
+                    )
+                    metrics.tool_failures[tool] = (
+                        metrics.tool_failures.get(tool, 0) + value
+                    )
 
             current += timedelta(hours=1)
 
@@ -3662,16 +4428,39 @@ class MetricsCollector:
             metrics.avg_first_response_ms = sum(all_first_response) / len(
                 all_first_response
             )
+            metrics.p95_first_response_ms = self._percentile(
+                all_first_response, 95
+            )
 
         if all_resolution_time:
             metrics.avg_resolution_time_seconds = sum(
                 all_resolution_time
             ) / len(all_resolution_time)
+            metrics.p95_resolution_time_seconds = self._percentile(
+                all_resolution_time, 95
+            )
 
         return metrics
 
-    async def get_real_time_stats(self) -> dict:
-        """Get real-time statistics for dashboards."""
+    def _percentile(self, values: list[float], percentile: int) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = min(
+            len(ordered) - 1,
+            max(0, round((percentile / 100) * (len(ordered) - 1))),
+        )
+        return ordered[index]
+
+    async def get_real_time_stats(self) -> dict[str, Any]:
+        """Get near-real-time statistics for dashboards.
+
+        Returned values reflect the current hour bucket; dashboards
+        polling every 5-30 seconds will see p95 staleness under
+        1 minute, which is the operational meaning of "near-real-time"
+        here. This is not streaming - sub-second freshness requires
+        a different pipeline (e.g. Kafka + a stream processor).
+        """
         hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
         current = self._current_metrics.get(hour_key, {})
 
@@ -3692,11 +4481,11 @@ class MetricsDashboard:
     Dashboard for monitoring platform health.
     """
 
-    def __init__(self, collector: MetricsCollector, config: QualityConfig):
+    def __init__(self, collector: MetricsCollector, config: QualityConfig) -> None:
         self.collector = collector
         self.config = config
 
-    async def generate_daily_report(self, date: datetime) -> dict:
+    async def generate_daily_report(self, date: datetime) -> dict[str, Any]:
         """Generate daily metrics report."""
         start = date.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
@@ -3706,11 +4495,15 @@ class MetricsDashboard:
         # Calculate SLA compliance
         sla_compliance = {
             "first_response": metrics.avg_first_response_ms
-            < 30000,  # 30 seconds
-            "resolution_rate": metrics.automation_rate >= 70,
-            "escalation_rate": metrics.escalation_rate <= 15,
+            < self.config.max_first_response_ms,
+            "resolution_rate": (
+                metrics.automation_rate >= self.config.min_automation_rate
+            ),
+            "escalation_rate": (
+                metrics.escalation_rate <= self.config.max_escalation_rate
+            ),
             "handle_time": metrics.avg_resolution_time_seconds
-            < 480,  # 8 minutes
+            < self.config.max_handle_time_seconds,
         }
 
         return {
@@ -3732,7 +4525,7 @@ class MetricsDashboard:
         }
 
     def _generate_recommendations(
-        self, metrics: PlatformMetrics, sla_compliance: dict
+        self, metrics: PlatformMetrics, sla_compliance: dict[str, bool]
     ) -> list[str]:
         """Generate actionable recommendations based on metrics."""
         recommendations = []
@@ -3755,10 +4548,17 @@ class MetricsDashboard:
                 "enhance agent training for common escalation scenarios."
             )
 
-        # Check for tool failures
+        # Check for tool failures: flag any tool whose recent failure
+        # rate exceeds ten percent so operators can investigate. The
+        # previous version had a placeholder loop that simply iterated
+        # without producing any recommendation.
         for tool, calls in metrics.tool_usage.items():
-            # In production, compare with success counts
-            pass
+            tool_failures = metrics.tool_failures.get(tool, 0)
+            if calls and tool_failures / calls > 0.1:
+                recommendations.append(
+                    f"Review {tool} (failure rate "
+                    f"{tool_failures / calls:.1%})"
+                )
 
         return recommendations
 
@@ -3766,12 +4566,9 @@ class MetricsDashboard:
 # Block 16 (chapter listing #16)
 # ============================================================================
 
-"""
-Complete customer service platform integration.
-"""
+# Complete customer service platform integration.
 
 import asyncio
-import anthropic
 import httpx
 import logging
 import os
@@ -3779,10 +4576,13 @@ import signal
 
 
 from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 
 @asynccontextmanager
-async def create_platform():
+async def create_platform() -> AsyncIterator[
+    tuple["ConversationManager", "MetricsCollector"]
+]:
     """Initialize the complete platform as an async context manager.
 
     Yields ``(manager, metrics_collector)``. The httpx clients live for
@@ -3798,15 +4598,40 @@ async def create_platform():
 
     # Initialize clients
     llm_client = anthropic.AsyncAnthropic()
+    http_timeout = httpx.Timeout(
+        config.http.timeout_seconds,
+        connect=config.http.connect_timeout_seconds,
+        read=config.http.read_timeout_seconds,
+        write=config.http.write_timeout_seconds,
+    )
+    http_limits = httpx.Limits(
+        max_connections=config.http.max_connections,
+        max_keepalive_connections=config.http.max_keepalive_connections,
+    )
+
+    def auth_headers(api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
     async with httpx.AsyncClient(
-        base_url=config.integrations.crm_base_url
+        base_url=config.integrations.crm_base_url,
+        headers=auth_headers(config.integrations.crm_api_key),
+        timeout=http_timeout,
+        limits=http_limits,
     ) as crm_client, httpx.AsyncClient(
-        base_url=config.integrations.orders_base_url
+        base_url=config.integrations.orders_base_url,
+        headers=auth_headers(config.integrations.orders_api_key),
+        timeout=http_timeout,
+        limits=http_limits,
     ) as orders_client, httpx.AsyncClient(
-        base_url=config.integrations.payments_base_url
+        base_url=config.integrations.payments_base_url,
+        headers=auth_headers(config.integrations.payments_api_key),
+        timeout=http_timeout,
+        limits=http_limits,
     ) as billing_client, httpx.AsyncClient(
-        base_url=config.integrations.knowledge_base_url
+        base_url=config.integrations.knowledge_base_url,
+        headers=auth_headers(config.integrations.knowledge_base_api_key),
+        timeout=http_timeout,
+        limits=http_limits,
     ) as knowledge_base_client:
 
         # Create tools
@@ -3890,7 +4715,7 @@ async def create_platform():
             shutdown_event.set()
 
         loop = asyncio.get_running_loop()
-        installed_signals: list = []
+        installed_signals: list[Any] = []
         for signame in ("SIGTERM", "SIGINT"):
             sig = getattr(signal, signame, None)
             if sig is None:
@@ -3941,17 +4766,19 @@ class InMemoryMetricsStorage:
     CloudWatch, OpenTelemetry collector) when deploying.
     """
 
-    def __init__(self, capacity: int = 10_000):
+    def __init__(self, capacity: int = 10_000) -> None:
+        if capacity < 1:
+            raise ValueError("capacity must be >= 1")
         self._buffer = deque(maxlen=capacity)
 
-    async def record(self, metric: dict) -> None:
+    async def record(self, metric: dict[str, Any]) -> None:
         self._buffer.append(metric)
 
     async def flush(self) -> None:
         # Real backends drain to remote storage here.
         return None
 
-    def recent(self, n: int = 100) -> list:
+    def recent(self, n: int = 100) -> list[dict[str, Any]]:
         return list(self._buffer)[-n:]
 
 
@@ -3988,7 +4815,7 @@ async def handle_customer_message(
     return response.message
 
 
-async def example_conversation():
+async def example_conversation() -> None:
     """Demonstrate a complete conversation flow.
 
     ``create_platform`` is an ``@asynccontextmanager`` (it yields
